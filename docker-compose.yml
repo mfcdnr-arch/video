@@ -1,0 +1,142 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: ds_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./server/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./server/migrations/002_admin_panel.sql:/docker-entrypoint-initdb.d/02_admin_panel.sql:ro
+      - ./server/migrations/003_reports.sql:/docker-entrypoint-initdb.d/03_reports.sql:ro
+      - ./server/migrations/004_users_roles.sql:/docker-entrypoint-initdb.d/04_users_roles.sql:ro
+      - ./server/migrations/005_rename_auditor.sql:/docker-entrypoint-initdb.d/05_rename_auditor.sql:ro
+      - ./server/migrations/006_superadmin_block.sql:/docker-entrypoint-initdb.d/06_superadmin_block.sql:ro
+      - ./server/migrations/007_media_validity.sql:/docker-entrypoint-initdb.d/07_media_validity.sql:ro
+      - ./server/migrations/008_custom_reports.sql:/docker-entrypoint-initdb.d/08_custom_reports.sql:ro
+      - ./server/migrations/009_fillers_hourly.sql:/docker-entrypoint-initdb.d/09_fillers_hourly.sql:ro
+      - ./server/migrations/010_version_monitor.sql:/docker-entrypoint-initdb.d/10_version_monitor.sql:ro
+      - ./server/migrations/011_advertiser_pricing.sql:/docker-entrypoint-initdb.d/11_advertiser_pricing.sql:ro
+      - ./server/migrations/012_ota_update.sql:/docker-entrypoint-initdb.d/12_ota_update.sql:ro
+      - ./server/migrations/013_ws_status.sql:/docker-entrypoint-initdb.d/13_ws_status.sql:ro
+      - ./server/migrations/014_restart_log.sql:/docker-entrypoint-initdb.d/14_restart_log.sql:ro
+      - ./server/migrations/015_users_name_backup.sql:/docker-entrypoint-initdb.d/15_users_name_backup.sql:ro
+      - ./server/migrations/016_overrides_unique.sql:/docker-entrypoint-initdb.d/16_overrides_unique.sql:ro
+      - ./server/migrations/017_billing.sql:/docker-entrypoint-initdb.d/17_billing.sql:ro
+      - ./server/migrations/018_power_volume.sql:/docker-entrypoint-initdb.d/18_power_volume.sql:ro
+      - ./server/migrations/019_ops_hardening.sql:/docker-entrypoint-initdb.d/19_ops_hardening.sql:ro
+      - ./server/migrations/020_ad_compliance.sql:/docker-entrypoint-initdb.d/20_ad_compliance.sql:ro
+      - ./server/migrations/021_schedule_levels_venue.sql:/docker-entrypoint-initdb.d/21_schedule_levels_venue.sql:ro
+      - ./server/migrations/022_campaigns.sql:/docker-entrypoint-initdb.d/22_campaigns.sql:ro
+      - ./server/migrations/023_notifications.sql:/docker-entrypoint-initdb.d/23_notifications.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  redis:
+    image: redis:7-alpine
+    container_name: ds_redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  minio:
+    image: minio/minio:latest
+    container_name: ds_minio
+    command: server /data --console-address ':9001'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+    volumes:
+      - minio_data:/data
+    restart: always
+
+  api:
+    build: ./server
+    container_name: ds_api
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379
+      MEDIA_PATH: /data/media
+      BACKUP_DIR: /data/backups
+      AGENT_UPDATE_PATH: /data/agent_updates
+    volumes:
+      - ./server:/app
+      - media_data:/data/media
+      - backup_data:/data/backups
+      - agent_updates_data:/data/agent_updates
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: always
+
+  celery:
+    build: ./server
+    container_name: ds_celery
+    command: celery -A tasks.celery_app worker -B -l info --concurrency=2
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379
+      MEDIA_PATH: /data/media
+      BACKUP_DIR: /data/backups
+      AGENT_UPDATE_PATH: /data/agent_updates
+    volumes:
+      - ./server:/app
+      - media_data:/data/media
+      - backup_data:/data/backups
+      - agent_updates_data:/data/agent_updates
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: always
+
+  ntp:
+    build: ./ntp
+    container_name: ds_ntp
+    ports:
+      - "123:123/udp"
+    restart: always
+
+  nginx:
+    image: nginx:alpine
+    container_name: ds_nginx
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - media_data:/data/media:ro
+      - nginx_logs:/var/log/nginx
+      - ./server/static:/usr/share/nginx/panel:ro
+    ports:
+      - "80:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: always
+
+volumes:
+  postgres_data:
+  minio_data:
+  media_data:
+  backup_data:
+  nginx_logs:
+  agent_updates_data:
+

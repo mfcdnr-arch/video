@@ -1,0 +1,32 @@
+[server]
+# IP-адрес или hostname сервера Digital Signage
+host = 10.0.119.100
+port = 80
+# Токен этого мини ПК (выдаётся при регистрации)
+token = ЗАМЕНИТЕ_НА_ТОКЕН
+
+[player]
+# Директория для хранения медиафайлов
+media_dir = /opt/ds-agent/media
+# Порт VLC RC-интерфейса
+vlc_rc_port = 4212
+# Путь к VLC
+vlc_bin = /usr/bin/vlc
+
+[schedule]
+# Как часто опрашивать расписание (секунды)
+poll_interval = 60
+# Как часто слать heartbeat (секунды)
+heartbeat_interval = 30
+# Как часто проверять команды (секунды)
+command_poll_interval = 5
+
+[sync]
+# Задержка перед синхронным стартом (секунды) — должна быть > latency сети
+sync_delay = 3
+
+[logging]
+level = INFO
+file = /var/log/ds-agent/ds-agent.log
+max_bytes = 10485760
+backup_count = 5

@@ -1,0 +1,371 @@
+#!/bin/bash
+# install.sh — установка ds-agent на мини ПК (Astra Linux 1.7 SE)
+# Использование: sudo bash install.sh <URL_СЕРВЕРА> <ТОКЕН> <SCREEN_ID> [ИМЯ_ПОЛЬЗОВАТЕЛЯ]
+# Пример:        sudo bash install.sh http://10.0.119.100 abc123 1 toor
+set -euo pipefail
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. АРГУМЕНТЫ
+# ══════════════════════════════════════════════════════════════════════════════
+
+SERVER_URL="${1:?Укажите URL сервера (первый аргумент). Пример: http://10.0.119.100}"
+TOKEN="${2:?Укажите токен устройства (второй аргумент)}"
+SCREEN_ID="${3:?Укажите ID экрана (третий аргумент, число)}"
+
+# Для твоего сценария пользователь по умолчанию — toor.
+REAL_USER="${4:-toor}"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. ВАЛИДАЦИЯ ВХОДНЫХ ПАРАМЕТРОВ
+# ══════════════════════════════════════════════════════════════════════════════
+
+if ! [[ "$SCREEN_ID" =~ ^[0-9]+$ ]]; then
+    echo "ОШИБКА: SCREEN_ID должен быть числом, получено: '$SCREEN_ID'"
+    exit 1
+fi
+
+if ! [[ "$SERVER_URL" =~ ^https?:// ]]; then
+    echo "ОШИБКА: SERVER_URL должен начинаться с http:// или https://"
+    echo "Пример: http://10.0.119.100"
+    exit 1
+fi
+
+if [ -z "$REAL_USER" ] || [ "$REAL_USER" = "root" ]; then
+    echo "ОШИБКА: Нужен реальный пользователь X-сессии, не root."
+    echo "Пример: sudo bash install.sh http://10.0.119.100 ТОКЕН ID toor"
+    exit 1
+fi
+
+if ! id "$REAL_USER" &>/dev/null; then
+    echo "ОШИБКА: пользователь '$REAL_USER' не найден в системе"
+    exit 1
+fi
+
+if [ "$EUID" -ne 0 ]; then
+    echo "ОШИБКА: скрипт нужно запускать от root:"
+    echo "  sudo bash install.sh http://10.0.119.100 ТОКЕН ID toor"
+    exit 1
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. ПЕРЕМЕННЫЕ
+# ══════════════════════════════════════════════════════════════════════════════
+
+INSTALL_DIR="/opt/ds-agent"
+CONFIG_DIR="/etc/ds-agent"
+LOG_DIR="/var/log/ds-agent"
+MEDIA_DIR="/opt/ds-agent/media"
+USER_HOME="$(eval echo "~$REAL_USER")"
+USER_GROUP="$(id -gn "$REAL_USER")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+SCHEME="$(echo "$SERVER_URL" | sed -E 's#^(https?)://.*#\1#')"
+HOST_ONLY="$(echo "$SERVER_URL" | sed -E 's#^https?://##' | sed -E 's#[:/].*$##')"
+PORT_ONLY="$(echo "$SERVER_URL" | sed -nE 's#^https?://[^/:]+:([0-9]+).*$#\1#p')"
+
+if [ -z "${PORT_ONLY:-}" ]; then
+    if [ "$SCHEME" = "https" ]; then
+        PORT_ONLY="443"
+    else
+        PORT_ONLY="80"
+    fi
+fi
+
+echo "=========================================="
+echo " Digital Signage Agent — установка"
+echo " Сервер:    $SERVER_URL"
+echo " Схема:     $SCHEME"
+echo " Хост:      $HOST_ONLY"
+echo " Порт:      $PORT_ONLY"
+echo " Screen ID: $SCREEN_ID"
+echo " Пользователь X-сессии: $REAL_USER (группа: $USER_GROUP)"
+echo "=========================================="
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ШАГ 0: Проверка наличия всех файлов агента
+# ══════════════════════════════════════════════════════════════════════════════
+echo "[0/10] Проверка файлов агента..."
+MISSING=0
+for f in \
+    ds_agent.py \
+    ds_downloader.py \
+    ds_player.py \
+    ds_sync.py \
+    ds_heartbeat.py \
+    ds_cleanup.py \
+    ds_ws_client.py \
+    ds_ota_updater.py \
+    requirements.txt \
+    ds-agent.service
+do
+    if [ ! -f "$SCRIPT_DIR/agent/$f" ]; then
+        echo "  ОШИБКА: файл не найден: $SCRIPT_DIR/agent/$f"
+        MISSING=1
+    fi
+done
+
+if [ "$MISSING" = "1" ]; then
+    echo ""
+    echo "Убедитесь что папка agent/ полностью скопирована на мини ПК."
+    exit 1
+fi
+
+echo "Все нужные файлы найдены."
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ШАГ 1: Системные пакеты
+# ══════════════════════════════════════════════════════════════════════════════
+echo "[1/10] Установка системных пакетов..."
+apt-get update -q
+DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+    python3 python3-pip python3-venv \
+    vlc chrony curl
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ШАГ 2: Директории
+# ══════════════════════════════════════════════════════════════════════════════
+echo "[2/10] Создание директорий..."
+mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$MEDIA_DIR"
+
+chown -R "$REAL_USER:$USER_GROUP" "$INSTALL_DIR" "$LOG_DIR"
+chown "$REAL_USER:$USER_GROUP" "$MEDIA_DIR"
+
+chmod 750 "$INSTALL_DIR"
+chmod 775 "$MEDIA_DIR"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ШАГ 3: Файлы агента
+# ══════════════════════════════════════════════════════════════════════════════
+echo "[3/10] Копирование файлов агента..."
+for f in \
+    ds_agent.py \
+    ds_downloader.py \
+    ds_player.py \
+    ds_sync.py \
+    ds_heartbeat.py \
+    ds_cleanup.py \
+    ds_ws_client.py \
+    ds_ota_updater.py \
+    requirements.txt
+do
+    cp "$SCRIPT_DIR/agent/$f" "$INSTALL_DIR/"
+done
+
+chown -R "$REAL_USER:$USER_GROUP" "$INSTALL_DIR"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ШАГ 4: Python virtual environment
+# ══════════════════════════════════════════════════════════════════════════════
+echo "[4/10] Установка Python-зависимостей..."
+sudo -u "$REAL_USER" python3 -m venv "$INSTALL_DIR/venv"
+sudo -u "$REAL_USER" "$INSTALL_DIR/venv/bin/pip" install --upgrade pip -q
+sudo -u "$REAL_USER" "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" -q
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ШАГ 5: Проверка доступности сервера
+# ══════════════════════════════════════════════════════════════════════════════
+echo "[5/10] Проверка доступности сервера..."
+HEALTH_URL="${SCHEME}://${HOST_ONLY}:${PORT_ONLY}/health"
+
+if curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null; then
+    echo "Сервер доступен: $HEALTH_URL"
+else
+    echo "ПРЕДУПРЕЖДЕНИЕ: сервер пока не ответил на $HEALTH_URL"
+    echo "Установка продолжится, но агент может не подключиться сразу."
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ШАГ 6: Конфигурация
+# ══════════════════════════════════════════════════════════════════════════════
+echo "[6/10] Создание конфига..."
+
+cat > "$CONFIG_DIR/config.ini" << INIEOF
+[server]
+host = $HOST_ONLY
+port = $PORT_ONLY
+token = $TOKEN
+
+[player]
+media_dir = $MEDIA_DIR
+vlc_rc_port = 4212
+vlc_bin = /usr/bin/vlc
+
+[schedule]
+poll_interval = 60
+heartbeat_interval = 30
+command_poll_interval = 5
+
+[sync]
+sync_delay = 3
+
+[logging]
+level = INFO
+file = $LOG_DIR/ds-agent.log
+max_bytes = 10485760
+backup_count = 5
+INIEOF
+
+chown "root:$USER_GROUP" "$CONFIG_DIR/config.ini"
+chmod 640 "$CONFIG_DIR/config.ini"
+
+echo "$SCREEN_ID" > "$CONFIG_DIR/screen_id"
+chown "root:$USER_GROUP" "$CONFIG_DIR/screen_id"
+chmod 644 "$CONFIG_DIR/screen_id"
+
+chown "root:$USER_GROUP" "$CONFIG_DIR"
+chmod 750 "$CONFIG_DIR"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ШАГ 7: sudoers для reboot и restart
+# ══════════════════════════════════════════════════════════════════════════════
+echo "[7/10] Настройка sudo для перезагрузки и рестарта..."
+
+SUDOERS_FILE="/etc/sudoers.d/ds-agent-reboot"
+SUDOERS_TMP="$(mktemp /tmp/ds-sudoers.XXXXXX)"
+
+printf '%s\n' \
+    "$REAL_USER ALL=(ALL) NOPASSWD: /sbin/reboot" \
+    "$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl restart ds-agent" \
+    > "$SUDOERS_TMP"
+
+if visudo -cf "$SUDOERS_TMP" &>/dev/null; then
+    cp "$SUDOERS_TMP" "$SUDOERS_FILE"
+    chmod 440 "$SUDOERS_FILE"
+    chown root:root "$SUDOERS_FILE"
+    echo "sudoers правило добавлено и синтаксис проверен."
+else
+    echo "ПРЕДУПРЕЖДЕНИЕ: visudo не принял синтаксис. Правило reboot/restart НЕ добавлено."
+fi
+
+rm -f "$SUDOERS_TMP"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ШАГ 8: NTP
+# ══════════════════════════════════════════════════════════════════════════════
+echo "[8/10] Настройка NTP..."
+
+# Источники времени:
+#  1) Российские серверы точного времени (ВНИИФТРИ — государственный
+#     эталон времени РФ, и MSK-IX) — основные, если есть выход в интернет;
+#  2) Сервер Digital Signage ($HOST_ONLY) — NTP-контейнер из docker-compose,
+#     единственный источник в изолированной сети (мини-ПК видит только его).
+# chrony сам выбирает лучший доступный источник и ПЛАВНО корректирует часы;
+# makestep разрешает разовый скачок при большом расхождении (первые 3 замера).
+cat > /etc/chrony/chrony.conf << NCONF
+server ntp1.vniiftri.ru iburst
+server ntp2.vniiftri.ru iburst
+server ntp.msk-ix.ru iburst
+server $HOST_ONLY iburst
+driftfile /var/lib/chrony/chrony.drift
+logdir /var/log/chrony
+makestep 1.0 3
+rtcsync
+NCONF
+
+# systemd-timesyncd конфликтует с chrony — выключаем, если есть.
+if systemctl list-unit-files systemd-timesyncd.service &>/dev/null; then
+    systemctl disable --now systemd-timesyncd 2>/dev/null || true
+fi
+
+CHRONY_SVC="chrony"
+if ! systemctl list-unit-files chrony.service &>/dev/null 2>&1; then
+    if systemctl list-unit-files chronyd.service &>/dev/null 2>&1; then
+        CHRONY_SVC="chronyd"
+    fi
+fi
+
+systemctl enable "$CHRONY_SVC"
+systemctl restart "$CHRONY_SVC"
+
+echo "Ожидание первичной NTP-синхронизации (15 секунд)..."
+sleep 15
+
+echo "--- NTP статус ---"
+if chronyc tracking; then
+    OFFSET="$(chronyc tracking 2>/dev/null | grep 'System time' | awk '{print $4}' | sed 's/-//')"
+    echo "Текущее смещение системного времени: ${OFFSET:-?} секунд"
+else
+    echo "NTP ещё не синхронизировался — подождите 1-2 минуты."
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ШАГ 9: Автологин и X-сессия
+# ══════════════════════════════════════════════════════════════════════════════
+echo "[9/10] Настройка автологина..."
+
+LIGHTDM_CONF="/etc/lightdm/lightdm.conf"
+if [ -f "$LIGHTDM_CONF" ]; then
+    cp "$LIGHTDM_CONF" "${LIGHTDM_CONF}.bak.$(date +%s)" 2>/dev/null || true
+
+    if grep -q "autologin-user=" "$LIGHTDM_CONF"; then
+        sed -i "s/^autologin-user=.*/autologin-user=$REAL_USER/" "$LIGHTDM_CONF"
+    elif grep -q "\\[Seat:\\\*\\]" "$LIGHTDM_CONF"; then
+        sed -i "/\\[Seat:\\\*\\]/a autologin-user=$REAL_USER\nautologin-user-timeout=0" "$LIGHTDM_CONF"
+    else
+        cat >> "$LIGHTDM_CONF" << LEOF
+
+[Seat:*]
+autologin-user=$REAL_USER
+autologin-user-timeout=0
+LEOF
+    fi
+
+    echo "Автологин настроен для пользователя $REAL_USER"
+else
+    echo "LightDM конфиг не найден — автологин не настроен."
+fi
+
+XINITRC="$USER_HOME/.xinitrc"
+if [ ! -f "$XINITRC" ]; then
+    cat > "$XINITRC" << XEOF
+#!/bin/sh
+if command -v startxfce4 &>/dev/null; then
+    exec startxfce4
+elif command -v openbox-session &>/dev/null; then
+    exec openbox-session
+else
+    exec xterm
+fi
+XEOF
+    chown "$REAL_USER:$USER_GROUP" "$XINITRC"
+    chmod 644 "$XINITRC"
+    echo ".xinitrc создан"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ШАГ 10: systemd сервис
+# ══════════════════════════════════════════════════════════════════════════════
+echo "[10/10] Регистрация systemd-сервиса..."
+
+sed "s|User=user|User=$REAL_USER|g;
+     s|Group=user|Group=$USER_GROUP|g;
+     s|/home/user|$USER_HOME|g" \
+    "$SCRIPT_DIR/agent/ds-agent.service" > /etc/systemd/system/ds-agent.service
+
+systemctl daemon-reload
+systemctl enable ds-agent
+systemctl restart ds-agent
+
+sleep 3
+
+if systemctl is-active --quiet ds-agent; then
+    echo "Сервис ds-agent успешно запущен."
+else
+    echo "ОШИБКА: сервис ds-agent не запустился."
+    systemctl status ds-agent --no-pager || true
+    journalctl -u ds-agent -n 50 --no-pager || true
+    exit 1
+fi
+
+echo ""
+echo "=========================================="
+echo " Установка завершена успешно!"
+echo "=========================================="
+echo " Проверка статуса: systemctl status ds-agent"
+echo " Логи в реальном времени: journalctl -u ds-agent -f"
+echo " Лог-файл: tail -f $LOG_DIR/ds-agent.log"
+echo ""
+echo " Пользователь сервиса: $REAL_USER (группа: $USER_GROUP)"
+echo " Сервер: $HOST_ONLY:$PORT_ONLY"
+echo "=========================================="
+

@@ -1,0 +1,32 @@
+# Секреты — НИКОГДА в репозиторий
+.env
+.env.stage
+.env.prod
+
+# Python-кэш и байткод
+__pycache__/
+*.pyc
+*.pyo
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Резервные копии и архивы проекта (хранятся вне репозитория)
+backups/
+
+# Временные и служебные файлы
+*.bak
+*.save
+*.tmp
+*.swp
+
+# Артефакты ОС
+.DS_Store
+Thumbs.db
+
+# Логи
+*.log
+
+# Служебные файлы Claude Code (локальные, не часть продукта)
+.claude/

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Digital Signage — Админ-панель</title>
+<link rel="stylesheet" href="css/style.css?v=20260705">
+
+</head>
+<body>
+<div id="app"></div>
+<div id="toast" class="toast"></div>
+
+<script src="js/core/api.js?v=20260705"></script>
+<script src="js/core/auth.js?v=20260705"></script>
+<script src="js/core/layout.js?v=20260707"></script>
+<script src="js/core/helpers.js?v=20260707d"></script>
+<script src="js/views/dashboard.js?v=20260707c"></script>
+<script src="js/views/screens.js?v=20260707b"></script>
+<script src="js/views/media.js?v=20260707c"></script>
+<script src="js/views/playlists.js?v=20260705"></script>
+<script src="js/views/broadcast.js?v=20260705"></script>
+<script src="js/views/ticker.js?v=20260705"></script>
+<script src="js/views/schedule.js?v=20260707d"></script>
+<script src="js/views/reports.js?v=20260707d"></script>
+<script src="js/views/campaigns.js?v=20260707"></script>
+<script src="js/views/moderation.js?v=20260707"></script>
+<script src="js/views/billing.js?v=20260706c"></script>
+<script src="js/views/ota.js?v=20260705"></script>
+<script src="js/views/settings.js?v=20260708"></script>
+<script>
+function val(id){ const e=document.getElementById(id); return e?e.value.trim():''; }
+
+// старт
+async function boot(){
+  try{
+    ME = await api('/me');
+  }catch(e){ /* токен невалиден — api() уже покажет логин */ return; }
+  renderApp(); nav('dash');
+  // отметка активности (для отчёта по сессиям): сразу и каждые 2 минуты
+  api('/session/ping',{method:'POST'}).catch(()=>{});
+  setInterval(()=>{ if(TOKEN) api('/session/ping',{method:'POST'}).catch(()=>{}); }, 120000);
+}
+if(TOKEN){ boot(); } else { renderLogin(); }
+</script>
+<!-- ═══ WebSocket Real-Time Дашборд -->
+<script src="js/core/ws-dashboard.js?v=20260705"></script>
+</body>
+</html>

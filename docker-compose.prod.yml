@@ -1,0 +1,61 @@
+# ============================================================
+# Production-надстройка к docker-compose.yml.
+# Накладывает эксплуатационные параметры, которые не нужны в dev:
+#   • ограничение роста логов (иначе диск сервера заполнят логи);
+#   • лимиты памяти на тяжёлые сервисы (защита от «съедания» ОЗУ);
+#   • restart: always (продублировано явно на случай правок базового файла).
+#
+# Запуск в production:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# Это НЕ отдельное окружение и НЕ CI/CD — только разумные
+# production-параметры ресурсов и логирования поверх базовой схемы.
+# ============================================================
+services:
+
+  postgres:
+    restart: always
+    mem_limit: 1g
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  redis:
+    restart: always
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  minio:
+    restart: always
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  api:
+    restart: always
+    mem_limit: 768m
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+  celery:
+    restart: always
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+  nginx:
+    restart: always
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  ntp:
+    restart: always
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }

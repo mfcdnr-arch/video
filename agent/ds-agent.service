@@ -1,0 +1,60 @@
+[Unit]
+Description=Digital Signage Agent
+Documentation=https://github.com/ds-minipc
+# Стартуем ПОСЛЕ: сеть готова, NTP синхронизирован, графическая сессия поднята.
+After=network-online.target chrony.service graphical.target
+Wants=network-online.target graphical.target
+
+[Service]
+Type=simple
+
+# ВАЖНО: install.sh подставит реальные значения User, Group и XAUTHORITY.
+User=user
+Group=user
+
+WorkingDirectory=/opt/ds-agent
+ExecStart=/opt/ds-agent/venv/bin/python /opt/ds-agent/ds_agent.py
+
+# ── Политика перезапуска ─────────────────────────────────────────────────
+# always: перезапускаем при любом завершении (штатном и нештатном).
+Restart=always
+# Ждём 10 сек перед перезапуском (X11 / VLC успевают подняться).
+RestartSec=10s
+# Ограничение: не более 5 перезапусков за 60 секунд.
+# Если агент падает чаще — это аномалия, systemd остановит попытки.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# При достижении лимита перезапусков — отправить уведомление (journalctl покажет).
+# StartLimitAction=reboot  # раскомментировать если нужна принудительная перезагрузка ПК
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ds-agent
+
+# ── Переменные окружения ─────────────────────────────────────────────────
+Environment=DS_CONFIG=/etc/ds-agent/config.ini
+
+# X11: VLC выводит видео через X-сервер.
+# install.sh подставит реальный XAUTHORITY для пользователя.
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/user/.Xauthority
+
+# Таймаут остановки: даём агенту 15 сек на корректное завершение.
+TimeoutStopSec=15s
+
+# ── Watchdog systemd ──────────────────────────────────────────────────────
+# systemd watchdog: если агент не шлёт sd_notify в течение 60 сек — перезапуск.
+# Агент должен вызывать notify("WATCHDOG=1") в главном цикле.
+# Раскомментировать после добавления sd_notify в ds_agent.py:
+# WatchdogSec=60s
+# NotifyAccess=main
+
+# ── Ограничение привилегий ───────────────────────────────────────────────
+NoNewPrivileges=true
+# ProtectHome=read-only: разрешает чтение ~/.Xauthority
+ProtectHome=read-only
+# PrivateTmp отключён: VLC нужен /tmp/.X11-unix/X0
+
+[Install]
+WantedBy=graphical.target
