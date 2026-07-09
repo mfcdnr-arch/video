@@ -137,6 +137,35 @@ def verify_device_token(
     return row
 
 
+def verify_any_device_token(
+    x_token: Optional[str] = Header(default=None, alias="X-Token"),
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    """
+    Проверяет, что X-Token принадлежит ЛЮБОМУ зарегистрированному экрану.
+    Нужна там, где в пути нет screen_id (например, скачивание OTA-файлов
+    агента): достаточно, что запрос пришёл от известного устройства сети.
+    Агент шлёт X-Token на всех запросах (см. ds_ota_updater.py).
+    """
+    token = x_token
+    if not token and authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Device token missing")
+
+    row = db.execute(
+        text("SELECT id FROM screens WHERE token = :t LIMIT 1"),
+        {"t": token},
+    ).first()
+
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid device token")
+
+    return True
+
+
 def require_write(current_admin=Depends(get_current_admin)):
     role = str(current_admin.get("role", "")).lower()
     # moderator — специализированная роль 38-ФЗ: может только одобрять/отклонять

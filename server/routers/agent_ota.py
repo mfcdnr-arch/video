@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from deps import get_db, get_current_admin, require_write
+from deps import get_db, get_current_admin, require_write, verify_any_device_token
 
 router = APIRouter()
 
@@ -57,13 +57,12 @@ async def upload_agent_file(file: UploadFile = File(...),
 
 
 @router.get("/agent/files/download/{filename}")
-def download_agent_file(filename: str):
+def download_agent_file(filename: str, _dev=Depends(verify_any_device_token)):
     """
-    Скачивание файла агентом при OTA (agent/ds_ota_updater.py). Без авторизации —
-    как и /files/download/{media_id} для медиафайлов, тот же принцип уже принят
-    в проекте. ПРИМЕЧАНИЕ: агент шлёт заголовок X-Token, но verify_device_token
-    в deps.py проверяет X-Device-Token/Bearer — они не совпадают, т.е. реальной
-    проверки токена устройства тут нет нигде в проекте (не в рамках этой задачи).
+    Скачивание файла агентом при OTA (agent/ds_ota_updater.py). Защищено
+    проверкой токена устройства: агент шлёт заголовок X-Token (см.
+    ds_ota_updater.py), сервер сверяет его с токенами зарегистрированных
+    экранов (verify_any_device_token). Неизвестный/отсутствующий токен → 401.
     """
     if filename not in ALLOWED_AGENT_FILES:
         raise HTTPException(status_code=404, detail="Файл не найден")
