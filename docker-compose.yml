@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./server/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./server/migrations/001_init_schema.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
       - ./server/migrations/002_admin_panel.sql:/docker-entrypoint-initdb.d/02_admin_panel.sql:ro
       - ./server/migrations/003_reports.sql:/docker-entrypoint-initdb.d/03_reports.sql:ro
       - ./server/migrations/004_users_roles.sql:/docker-entrypoint-initdb.d/04_users_roles.sql:ro
@@ -31,6 +31,7 @@ services:
       - ./server/migrations/021_schedule_levels_venue.sql:/docker-entrypoint-initdb.d/21_schedule_levels_venue.sql:ro
       - ./server/migrations/022_campaigns.sql:/docker-entrypoint-initdb.d/22_campaigns.sql:ro
       - ./server/migrations/023_notifications.sql:/docker-entrypoint-initdb.d/23_notifications.sql:ro
+      - ./server/migrations/024_force_password_change.sql:/docker-entrypoint-initdb.d/24_force_password_change.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
@@ -57,6 +58,11 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
     volumes:
       - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
     restart: always
 
   api:
@@ -108,6 +114,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      minio:
+        condition: service_healthy      # celery пишет бэкапы медиа в MinIO — ждём его готовности
     restart: always
 
   ntp:

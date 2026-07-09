@@ -27,8 +27,9 @@ TOKEN       = cfg["server"]["token"]
 SERVER_URL  = "http://{}:{}".format(SERVER_HOST, SERVER_PORT)
 
 MEDIA_DIR   = cfg["player"]["media_dir"]
-VLC_RC_PORT = int(cfg["player"]["vlc_rc_port"])
-VLC_BIN     = cfg["player"]["vlc_bin"]
+# Плеер — mpv (управляется через IPC-сокет). Путь к бинарнику берём из конфига;
+# .get() с дефолтом — на случай старого config.ini без ключа player_bin.
+PLAYER_BIN  = cfg["player"].get("player_bin", "/usr/bin/mpv")
 
 POLL_INTERVAL = int(cfg["schedule"]["poll_interval"])
 HB_INTERVAL   = int(cfg["schedule"]["heartbeat_interval"])
@@ -261,7 +262,7 @@ def main():
     sess = requests.Session()
     sess.headers["X-Token"] = TOKEN
 
-    player     = VLCPlayer(rc_port=VLC_RC_PORT, vlc_bin=VLC_BIN, media_dir=MEDIA_DIR)
+    player     = VLCPlayer(player_bin=PLAYER_BIN, media_dir=MEDIA_DIR)
     downloader = Downloader(SERVER_URL, TOKEN, MEDIA_DIR)
     sync_hdl   = SyncHandler(SERVER_URL, TOKEN, player, screen_id)
     hb         = Heartbeat(SERVER_URL, TOKEN, screen_id, MEDIA_DIR)

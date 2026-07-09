@@ -159,7 +159,9 @@ def change_my_password(body: dict = Body(...), current_admin: dict = Depends(get
     if not row or not pwd_context.verify(old_password, row.password_hash):
         raise HTTPException(status_code=400, detail="Неверный текущий пароль")
 
-    db.execute(text("UPDATE users SET password_hash = :ph WHERE username = :u"),
+    # Смена пароля снимает флаг обязательной смены (закрывает форс-экран входа).
+    db.execute(text("UPDATE users SET password_hash = :ph, must_change_password = FALSE "
+                    "WHERE username = :u"),
                {"ph": pwd_context.hash(new_password), "u": current_admin["username"]})
     db.commit()
     return {"status": "ok"}

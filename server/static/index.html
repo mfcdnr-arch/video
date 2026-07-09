@@ -12,7 +12,7 @@
 <div id="toast" class="toast"></div>
 
 <script src="js/core/api.js?v=20260705"></script>
-<script src="js/core/auth.js?v=20260705"></script>
+<script src="js/core/auth.js?v=20260708"></script>
 <script src="js/core/layout.js?v=20260707"></script>
 <script src="js/core/helpers.js?v=20260707d"></script>
 <script src="js/views/dashboard.js?v=20260707c"></script>
@@ -36,6 +36,8 @@ async function boot(){
   try{
     ME = await api('/me');
   }catch(e){ /* токен невалиден — api() уже покажет логин */ return; }
+  // Форс-смена пароля по умолчанию: панель не открываем, пока не сменён.
+  if(ME && ME.must_change_password){ renderForcePassword(); return; }
   renderApp(); nav('dash');
   // отметка активности (для отчёта по сессиям): сразу и каждые 2 минуты
   api('/session/ping',{method:'POST'}).catch(()=>{});

@@ -49,11 +49,12 @@ Video_miniPC_v16.2_modular/
 ├── server/                    # СЕРВЕР (FastAPI + Celery)
 │   ├── main.py                # Точка сборки приложения (только подключение роутеров)
 │   ├── deps.py                # Общие зависимости: БД-сессия, JWT, токены устройств
-│   ├── routers/               # 14 модулей эндпоинтов: auth, system, media, screens,
+│   ├── routers/               # 16 модулей эндпоинтов: auth, system, media, screens,
 │   │                          #   playlists, schedule, ticker, agent_ota, users,
-│   │                          #   backups, broadcast, reports, websockets, billing
+│   │                          #   backups, broadcast, reports, websockets, billing,
+│   │                          #   campaigns, notifications
 │   ├── static/                # Веб-панель (index.html, js/, css/)
-│   ├── migrations/            # SQL-миграции (001–018)
+│   ├── migrations/            # SQL-миграции (001–023; 001 применяется как init при первом старте БД)
 │   ├── tasks.py               # Celery-задачи
 │   ├── ws_manager.py          # Реестр WebSocket-подключений
 │   ├── Dockerfile
@@ -84,7 +85,7 @@ Video_miniPC_v16.2_modular/
 
 ## Что нового в v16.2
 
-✅ Модульный сервер: монолитный `main.py` разнесён на 14 роутеров в `server/routers/`,
+✅ Модульный сервер: монолитный `main.py` разнесён на 16 роутеров в `server/routers/`,
 `main.py` теперь только собирает приложение  
 ✅ Каталоги переименованы: `app/` → `server/`, `client/` → `agent/`;
 инсталлятор агента `install.sh` перенесён в корень проекта  

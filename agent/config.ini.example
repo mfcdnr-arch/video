@@ -8,10 +8,8 @@ token = ЗАМЕНИТЕ_НА_ТОКЕН
 [player]
 # Директория для хранения медиафайлов
 media_dir = /opt/ds-agent/media
-# Порт VLC RC-интерфейса
-vlc_rc_port = 4212
-# Путь к VLC
-vlc_bin = /usr/bin/vlc
+# Путь к бинарнику плеера (mpv). Управление — через IPC Unix-сокет.
+player_bin = /usr/bin/mpv
 
 [schedule]
 # Как часто опрашивать расписание (секунды)

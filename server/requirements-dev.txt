@@ -1,0 +1,6 @@
+# Зависимости ТОЛЬКО для запуска тестов (в production-образ не входят).
+# Установка в работающий контейнер:
+#   docker exec ds_api pip install -r /app/requirements-dev.txt
+# Запуск:
+#   docker exec -w /app ds_api python -m pytest tests -q
+pytest>=7.4

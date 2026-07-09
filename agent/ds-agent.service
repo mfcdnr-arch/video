@@ -18,7 +18,7 @@ ExecStart=/opt/ds-agent/venv/bin/python /opt/ds-agent/ds_agent.py
 # ── Политика перезапуска ─────────────────────────────────────────────────
 # always: перезапускаем при любом завершении (штатном и нештатном).
 Restart=always
-# Ждём 10 сек перед перезапуском (X11 / VLC успевают подняться).
+# Ждём 10 сек перед перезапуском (X11 / mpv успевают подняться).
 RestartSec=10s
 # Ограничение: не более 5 перезапусков за 60 секунд.
 # Если агент падает чаще — это аномалия, systemd остановит попытки.
@@ -35,7 +35,7 @@ SyslogIdentifier=ds-agent
 # ── Переменные окружения ─────────────────────────────────────────────────
 Environment=DS_CONFIG=/etc/ds-agent/config.ini
 
-# X11: VLC выводит видео через X-сервер.
+# X11: mpv выводит видео через X-сервер.
 # install.sh подставит реальный XAUTHORITY для пользователя.
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/user/.Xauthority
@@ -54,7 +54,7 @@ TimeoutStopSec=15s
 NoNewPrivileges=true
 # ProtectHome=read-only: разрешает чтение ~/.Xauthority
 ProtectHome=read-only
-# PrivateTmp отключён: VLC нужен /tmp/.X11-unix/X0
+# PrivateTmp отключён: mpv нужен /tmp/.X11-unix/X0 и IPC-сокет /tmp/ds-mpv.sock
 
 [Install]
 WantedBy=graphical.target

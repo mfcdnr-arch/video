@@ -11,8 +11,9 @@ MPV_SOCKET = '/tmp/ds-mpv.sock'
 class VLCPlayer:
     """Обёртка над mpv с тем же API что был у VLC."""
 
-    def __init__(self, rc_port=4212, vlc_bin='/usr/bin/vlc',
+    def __init__(self, player_bin='/usr/bin/mpv',
                  media_dir='/opt/ds-agent/media'):
+        self.player_bin = player_bin or '/usr/bin/mpv'
         self.media_dir = Path(media_dir)
         self._mpv_proc = None
         self._current_file = None
@@ -49,7 +50,7 @@ class VLCPlayer:
             sock_path.unlink()
 
         cmd = [
-            '/usr/bin/mpv',
+            self.player_bin,
             '--fullscreen',
             '--no-osd-bar',
             # ВАЖНО: только loop-playlist. Раньше стоял ещё --loop-file=inf,

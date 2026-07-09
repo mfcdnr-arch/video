@@ -119,7 +119,7 @@ echo "[1/10] Установка системных пакетов..."
 apt-get update -q
 DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
     python3 python3-pip python3-venv \
-    vlc chrony curl
+    mpv chrony curl
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ШАГ 2: Директории
@@ -187,8 +187,7 @@ token = $TOKEN
 
 [player]
 media_dir = $MEDIA_DIR
-vlc_rc_port = 4212
-vlc_bin = /usr/bin/vlc
+player_bin = /usr/bin/mpv
 
 [schedule]
 poll_interval = 60

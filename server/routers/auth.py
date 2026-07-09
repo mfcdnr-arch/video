@@ -32,6 +32,16 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 
 
 @router.get("/me")
-def get_me(current_admin=Depends(get_current_admin)):
-    """Текущий авторизованный пользователь (для фронтенда — роль, права записи)"""
-    return {"username": current_admin["username"], "role": current_admin["role"]}
+def get_me(current_admin=Depends(get_current_admin), db: Session = Depends(get_db)):
+    """Текущий авторизованный пользователь (для фронтенда — роль, права записи,
+    признак обязательной смены пароля по умолчанию)."""
+    row = db.execute(
+        text("SELECT COALESCE(must_change_password, FALSE) AS mcp "
+             "FROM users WHERE username = :u"),
+        {"u": current_admin["username"]},
+    ).fetchone()
+    return {
+        "username": current_admin["username"],
+        "role": current_admin["role"],
+        "must_change_password": bool(row.mcp) if row else False,
+    }
