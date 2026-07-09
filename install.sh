@@ -4,6 +4,14 @@
 # Пример:        sudo bash install.sh http://10.0.119.100 abc123 1 toor
 set -euo pipefail
 
+# ── Хелперы самодиагностики ──────────────────────────────────────────────────
+PASS=0; FAIL=0; WARN=0
+pass(){ echo "  ✓ $1"; PASS=$((PASS+1)); }
+bad(){  echo "  ✗ $1"; FAIL=$((FAIL+1)); }
+warn(){ echo "  ⚠ $1"; WARN=$((WARN+1)); }
+hint(){ echo "      └─ $1"; }
+die(){  echo; echo "ОСТАНОВ: $1"; [ -n "${2:-}" ] && hint "$2"; exit 1; }
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. АРГУМЕНТЫ
 # ══════════════════════════════════════════════════════════════════════════════
@@ -46,6 +54,14 @@ if [ "$EUID" -ne 0 ]; then
     echo "  sudo bash install.sh http://10.0.119.100 ТОКЕН ID toor"
     exit 1
 fi
+
+# ── Логирование всей установки в файл (для разбора постфактум) ───────────────
+INSTALL_LOG="/var/log/ds-agent-install.log"
+exec > >(tee -a "$INSTALL_LOG") 2>&1
+
+# ── Preflight: подходящая ли это система ─────────────────────────────────────
+command -v apt-get  >/dev/null 2>&1 || die "apt-get не найден — скрипт рассчитан на Astra/Debian." "Используйте подходящий дистрибутив или поставьте зависимости вручную."
+command -v systemctl >/dev/null 2>&1 || die "systemctl не найден — требуется systemd."
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. ПЕРЕМЕННЫЕ
@@ -116,10 +132,23 @@ echo "Все нужные файлы найдены."
 # ШАГ 1: Системные пакеты
 # ══════════════════════════════════════════════════════════════════════════════
 echo "[1/10] Установка системных пакетов..."
-apt-get update -q
-DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+apt-get update -q || warn "apt-get update завершился с ошибкой — установка пакетов может не удаться."
+if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
     python3 python3-pip python3-venv \
-    mpv chrony curl
+    mpv chrony curl; then
+    die "Не удалось установить системные пакеты." "Проверьте apt-источники и доступ к репозиториям (сеть/зеркало Astra)."
+fi
+# Проверяем, что критичные бинарники РЕАЛЬНО встали (особенно плеер mpv —
+# без него не будет воспроизведения).
+for bin in python3 mpv chronyc curl; do
+    if command -v "$bin" >/dev/null 2>&1; then
+        pass "$bin установлен"
+    else
+        bad "$bin НЕ установлен"
+        [ "$bin" = mpv ] && hint "Без mpv плеер не запустится. Поставьте вручную: apt-get install -y mpv"
+    fi
+done
+[ "$FAIL" -eq 0 ] || die "Не установлены обязательные пакеты (см. ✗ выше)."
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ШАГ 2: Директории
@@ -157,9 +186,18 @@ chown -R "$REAL_USER:$USER_GROUP" "$INSTALL_DIR"
 # ШАГ 4: Python virtual environment
 # ══════════════════════════════════════════════════════════════════════════════
 echo "[4/10] Установка Python-зависимостей..."
-sudo -u "$REAL_USER" python3 -m venv "$INSTALL_DIR/venv"
-sudo -u "$REAL_USER" "$INSTALL_DIR/venv/bin/pip" install --upgrade pip -q
-sudo -u "$REAL_USER" "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" -q
+sudo -u "$REAL_USER" python3 -m venv "$INSTALL_DIR/venv" \
+    || die "Не удалось создать venv." "Установлен ли пакет python3-venv?"
+sudo -u "$REAL_USER" "$INSTALL_DIR/venv/bin/pip" install --upgrade pip -q \
+    || warn "Не удалось обновить pip (продолжаем)."
+sudo -u "$REAL_USER" "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" -q \
+    || die "Не удалось установить Python-зависимости." "Проверьте сеть и доступ к PyPI/зеркалу."
+# Проверяем, что ключевая зависимость реально импортируется.
+if sudo -u "$REAL_USER" "$INSTALL_DIR/venv/bin/python" -c "import requests" 2>/dev/null; then
+    pass "Python-зависимости установлены (requests импортируется)"
+else
+    die "Пакет requests не установился." "Проверьте лог pip выше и доступ к PyPI."
+fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ШАГ 5: Проверка доступности сервера
@@ -347,24 +385,47 @@ systemctl restart ds-agent
 
 sleep 3
 
+# ── SELF-TEST: сводная проверка результата установки ─────────────────────────
+echo
+echo "▶ Самопроверка установки"
+
 if systemctl is-active --quiet ds-agent; then
-    echo "Сервис ds-agent успешно запущен."
+    pass "служба ds-agent запущена (active)"
 else
-    echo "ОШИБКА: сервис ds-agent не запустился."
-    systemctl status ds-agent --no-pager || true
-    journalctl -u ds-agent -n 50 --no-pager || true
-    exit 1
+    bad "служба ds-agent НЕ запущена"
+    hint "Диагностика: systemctl status ds-agent; journalctl -u ds-agent -n 50"
+    systemctl status ds-agent --no-pager 2>/dev/null | head -12 || true
+    journalctl -u ds-agent -n 30 --no-pager 2>/dev/null || true
 fi
 
-echo ""
+[ -x /usr/bin/mpv ]              && pass "плеер mpv на месте (/usr/bin/mpv)"        || { bad "нет /usr/bin/mpv — воспроизведение не заработает"; hint "apt-get install -y mpv"; }
+[ -f "$CONFIG_DIR/config.ini" ]  && pass "конфиг создан ($CONFIG_DIR/config.ini)"   || bad "нет config.ini"
+[ -f "$CONFIG_DIR/screen_id" ]   && pass "screen_id записан ($(cat "$CONFIG_DIR/screen_id" 2>/dev/null))" || bad "нет screen_id"
+if command -v chronyc >/dev/null 2>&1 && chronyc tracking >/dev/null 2>&1; then
+    pass "NTP (chrony) работает"
+else
+    warn "NTP ещё не синхронизировался — подождите 1–2 минуты (важно для расписания)"
+fi
+if curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null 2>&1; then
+    pass "сервер доступен ($HEALTH_URL)"
+else
+    warn "сервер сейчас недоступен — агент подключится, когда сеть/сервер поднимутся"
+fi
+
+echo
 echo "=========================================="
-echo " Установка завершена успешно!"
-echo "=========================================="
-echo " Проверка статуса: systemctl status ds-agent"
-echo " Логи в реальном времени: journalctl -u ds-agent -f"
-echo " Лог-файл: tail -f $LOG_DIR/ds-agent.log"
-echo ""
+if [ "$FAIL" -eq 0 ]; then
+    echo " ✅ Установка завершена. Проверок пройдено: $PASS, предупреждений: $WARN."
+else
+    echo " ❌ Установка с ошибками: провалено $FAIL, пройдено $PASS, предупреждений $WARN."
+    echo "    Разберите строки ✗ выше по подсказкам."
+fi
 echo " Пользователь сервиса: $REAL_USER (группа: $USER_GROUP)"
 echo " Сервер: $HOST_ONLY:$PORT_ONLY"
+echo " Статус:  systemctl status ds-agent"
+echo " Логи:    journalctl -u ds-agent -f   |   tail -f $LOG_DIR/ds-agent.log"
+echo " Лог установки: $INSTALL_LOG"
+echo " ⏳ Экран должен появиться ОНЛАЙН в панели через ~30 секунд."
 echo "=========================================="
+[ "$FAIL" -eq 0 ] || exit 1
 

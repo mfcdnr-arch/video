@@ -1,42 +1,76 @@
 #!/bin/bash
-# install_server.sh — первичная установка сервера Digital Signage.
+# install_server.sh — первичная установка / обновление сервера Digital Signage
+# с самодиагностикой хода установки.
+#
 # Использование:  bash install_server.sh            (полная установка)
 #                 bash install_server.sh --env-only (только создать .env, без запуска)
 #
 # Что делает:
-#   1. Проверяет наличие Docker и Docker Compose v2.
-#   2. Создаёт .env с автоматически сгенерированными секретами
-#      (пароль БД, пароль MinIO, SECRET_KEY для подписи JWT).
-#      Существующий .env НИКОГДА не перезаписывается — при обновлении
-#      установки пароли и ключи сохраняются.
-#   3. Собирает и запускает весь стек (docker compose up -d --build);
-#      миграции БД применяются автоматически при первом старте Postgres.
-#   4. Ждёт готовности API и печатает адрес панели.
+#   0. PREFLIGHT: проверяет окружение ДО любых изменений (Docker, Compose, демон,
+#      место на диске, наличие файлов проекта) и падает с понятной причиной.
+#   1. Создаёт .env с автогенерированными секретами (не перезаписывает существующий).
+#   2. Собирает и запускает стек; при ошибке сборки/запуска — диагностирует причину.
+#   3. SELF-TEST: проверяет, что поднялся КАЖДЫЙ из 7 контейнеров, доступна БД с
+#      применёнными миграциями, и панель отдаётся через nginx. Печатает итог PASS/FAIL.
 #
-# После установки ОБЯЗАТЕЛЬНО смените пароль администратора по умолчанию
-# (admin / admin123) через панель: Настройки → Пользователи.
-set -euo pipefail
+# Весь вывод дублируется в install_server.log (рядом со скриптом).
+# После установки ОБЯЗАТЕЛЬНО смените пароль admin (панель форсит это при первом входе).
+set -uo pipefail
 cd "$(dirname "$0")"
 
-# ── 1. Проверки окружения ────────────────────────────────────────────────────
-command -v docker >/dev/null 2>&1 || {
-    echo "ОШИБКА: Docker не установлен. Установите: https://docs.docker.com/engine/install/"
-    exit 1
-}
-docker compose version >/dev/null 2>&1 || {
-    echo "ОШИБКА: Docker Compose v2 не найден (нужна команда 'docker compose')."
-    exit 1
-}
+LOG="./install_server.log"
+exec > >(tee -a "$LOG") 2>&1
+echo "════════ install_server.sh — $(date '+%Y-%m-%d %H:%M:%S') ════════"
 
-# ── 2. Генерация секретов ────────────────────────────────────────────────────
-# openssl есть почти везде; на всякий случай запасной вариант через /dev/urandom.
-gen_hex() {  # gen_hex <байт> → hex-строка вдвое длиннее
-    openssl rand -hex "$1" 2>/dev/null \
-        || head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'
-}
+# ── Хелперы вывода/диагностики ───────────────────────────────────────────────
+PASS=0; FAIL=0; WARN=0
+pass(){ echo "  ✓ $1"; PASS=$((PASS+1)); }
+bad(){  echo "  ✗ $1"; FAIL=$((FAIL+1)); }
+warn(){ echo "  ⚠ $1"; WARN=$((WARN+1)); }
+hint(){ echo "      └─ $1"; }
+die(){  echo; echo "ОСТАНОВ: $1"; [ -n "${2:-}" ] && hint "$2"; echo "Полный лог: $LOG"; exit 1; }
+
+EXPECTED_CONTAINERS="ds_postgres ds_redis ds_minio ds_api ds_celery ds_nginx ds_ntp"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0. PREFLIGHT — проверки ДО любых изменений
+# ══════════════════════════════════════════════════════════════════════════════
+echo; echo "▶ [0/3] Preflight — проверка окружения"
+
+command -v docker >/dev/null 2>&1 \
+    || die "Docker не установлен." "Установите: https://docs.docker.com/engine/install/"
+pass "Docker найден ($(docker --version 2>/dev/null | awk '{print $3}' | tr -d ,))"
+
+docker info >/dev/null 2>&1 \
+    || die "Docker-демон не запущен или нет прав." "Запустите Docker (sudo systemctl start docker) или добавьте пользователя в группу docker."
+pass "Docker-демон отвечает"
+
+docker compose version >/dev/null 2>&1 \
+    || die "Docker Compose v2 не найден (нужна команда 'docker compose')." "Обновите Docker до версии с Compose v2."
+pass "Docker Compose v2 найден"
+
+for f in docker-compose.yml server/migrations/001_init_schema.sql; do
+    [ -f "$f" ] || die "Не найден обязательный файл: $f" "Запускайте скрипт из каталога проекта, скопированного полностью."
+done
+pass "Файлы проекта на месте"
+
+# Свободное место (предупреждение, не блокер): образы+тома требуют места.
+FREE_KB=$(df -Pk . 2>/dev/null | awk 'NR==2{print $4}')
+if [ -n "${FREE_KB:-}" ] && [ "$FREE_KB" -lt 2097152 ]; then
+    warn "Мало места на диске (<2 ГБ свободно) — сборке образов и БД может не хватить."
+    hint "Освободите место: docker image prune -f; docker builder prune -f"
+else
+    pass "Места на диске достаточно"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. Секреты (.env)
+# ══════════════════════════════════════════════════════════════════════════════
+echo; echo "▶ [1/3] Секреты (.env)"
+gen_hex(){ openssl rand -hex "$1" 2>/dev/null || head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
 if [ -f .env ]; then
-    echo "• .env уже существует — пароли и ключи НЕ перезаписываются."
+    pass ".env уже существует — пароли и ключи НЕ перезаписываются"
 else
     cat > .env <<EOF
 # Сгенерировано install_server.sh $(date '+%Y-%m-%d %H:%M')
@@ -49,43 +83,102 @@ MINIO_PASSWORD=$(gen_hex 16)
 SECRET_KEY=$(gen_hex 32)
 EOF
     chmod 600 .env
-    echo "• Создан .env: пароль БД, пароль MinIO и SECRET_KEY сгенерированы автоматически."
+    pass "Создан .env: пароль БД, пароль MinIO и SECRET_KEY сгенерированы"
 fi
-
-# Путь обновления старой установки: .env есть, но SECRET_KEY в нём нет.
 if ! grep -q '^SECRET_KEY=' .env; then
     echo "SECRET_KEY=$(gen_hex 32)" >> .env
-    echo "• В существующий .env добавлен SECRET_KEY (раньше использовался небезопасный дефолт)."
+    warn "В существующий .env добавлен SECRET_KEY (раньше был небезопасный дефолт)"
 fi
 
-[ "${1:-}" = "--env-only" ] && { echo "Готово (--env-only): стек не запускался."; exit 0; }
+# Значения для последующих проверок БД.
+set -a; . ./.env 2>/dev/null || true; set +a
+: "${POSTGRES_USER:=display_user}"; : "${POSTGRES_DB:=display_system}"
 
-# ── 3. Сборка и запуск ───────────────────────────────────────────────────────
-echo "• Сборка и запуск контейнеров..."
-docker compose up -d --build
+[ "${1:-}" = "--env-only" ] && { echo; echo "Готово (--env-only): стек не запускался."; exit 0; }
 
-# ── 4. Ожидание готовности API ───────────────────────────────────────────────
-echo -n "• Ожидание готовности API"
-ok=0
-for _ in $(seq 1 45); do
-    if docker compose exec -T api curl -sf http://localhost:8000/health >/dev/null 2>&1; then
-        ok=1; break
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. Сборка и запуск (с диагностикой ошибки)
+# ══════════════════════════════════════════════════════════════════════════════
+echo; echo "▶ [2/3] Сборка и запуск контейнеров"
+BUILD_LOG="$(mktemp)"
+docker compose up -d --build 2>&1 | tee "$BUILD_LOG"
+RC=${PIPESTATUS[0]}
+if [ "$RC" -ne 0 ]; then
+    echo
+    echo "Запуск не удался. Вероятная причина:"
+    if grep -qiE 'port is already allocated|address already in use|bind.*:80' "$BUILD_LOG"; then
+        hint "Порт 80 занят другим процессом. Найдите его: 'sudo lsof -i :80' (или 'ss -ltnp sport = :80') и остановите."
+    elif grep -qiE 'no space left' "$BUILD_LOG"; then
+        hint "Кончилось место на диске. Освободите: docker image prune -f; docker builder prune -f"
+    elif grep -qiE 'permission denied|got permission denied.*docker.sock' "$BUILD_LOG"; then
+        hint "Нет прав на Docker. Запустите через sudo или добавьте пользователя в группу docker."
+    elif grep -qiE 'failed to solve|error building|dockerfile' "$BUILD_LOG"; then
+        hint "Ошибка сборки образа. Смотрите вывод выше и Dockerfile в server/."
+    else
+        hint "Смотрите вывод выше и 'docker compose logs'."
     fi
+    rm -f "$BUILD_LOG"; die "docker compose up завершился с ошибкой (код $RC)."
+fi
+rm -f "$BUILD_LOG"
+pass "docker compose up отработал"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. SELF-TEST — проверка результата установки
+# ══════════════════════════════════════════════════════════════════════════════
+echo; echo "▶ [3/3] Самопроверка установки"
+
+# 3.1 Готовность API (до 90 c)
+echo -n "  … ожидание готовности API"
+api_ok=0
+for _ in $(seq 1 45); do
+    if docker compose exec -T api curl -sf http://localhost:8000/health >/dev/null 2>&1; then api_ok=1; break; fi
     echo -n "."; sleep 2
 done
 echo
-if [ "$ok" != "1" ]; then
-    echo "ОШИБКА: API не поднялся за 90 секунд. Логи: docker compose logs api"
-    exit 1
+if [ "$api_ok" = 1 ]; then pass "API /health отвечает"
+else bad "API не поднялся за 90 c"; hint "Логи: docker compose logs api"; fi
+
+# 3.2 Каждый контейнер запущен
+for c in $EXPECTED_CONTAINERS; do
+    state=$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null || echo "нет")
+    if [ "$state" = "true" ]; then
+        pass "контейнер $c запущен"
+    else
+        bad "контейнер $c НЕ запущен (состояние: $state)"
+        hint "Диагностика: docker compose logs --tail=50 ${c#ds_}"
+    fi
+done
+
+# 3.3 БД доступна и миграции применены
+if docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT 1" >/dev/null 2>&1; then
+    pass "PostgreSQL доступна"
+    core=$(docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT to_regclass('public.users')" 2>/dev/null | tr -d '[:space:]')
+    [ "$core" = "users" ] && pass "базовая схема применена (таблица users)" \
+                          || bad "нет таблицы users — миграция 001 не применилась"
+    recent=$(docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT to_regclass('public.campaigns')" 2>/dev/null | tr -d '[:space:]')
+    if [ "$recent" = "campaigns" ]; then pass "поздние миграции применены (таблица campaigns)"
+    else warn "нет таблицы campaigns — на существующей БД примените новые миграции вручную"
+         hint "См. docs/Инструкции/08_ОБНОВЛЕНИЕ_СЕРВЕРА.md (миграции на живой БД)"; fi
+else
+    bad "PostgreSQL недоступна"; hint "Логи: docker compose logs postgres"
 fi
 
-# ── 5. Итог ──────────────────────────────────────────────────────────────────
+# 3.4 Панель отдаётся через nginx (порт 80 на хосте)
+code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost/ 2>/dev/null || echo 000)
+[ "$code" = 200 ] && pass "панель отдаётся nginx (HTTP 200)" \
+                   || { bad "панель не отвечает (HTTP $code)"; hint "Логи: docker compose logs nginx"; }
+
+# ── Итог ──────────────────────────────────────────────────────────────────────
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+echo
 echo "════════════════════════════════════════════════════════════"
-echo "  Установка завершена."
-echo "  Панель:  http://${IP:-<IP-сервера>}/"
-echo "  Вход:    admin / admin123"
-echo ""
-echo "  ⚠ ПЕРВЫМ ДЕЛОМ смените пароль администратора:"
-echo "     Настройки → Пользователи → admin → Сменить пароль"
+if [ "$FAIL" -eq 0 ]; then
+    echo "  ✅ Установка завершена. Проверок пройдено: $PASS, предупреждений: $WARN."
+    echo "  Панель:  http://${IP:-<IP-сервера>}/"
+    echo "  Вход:    admin / admin123  (панель попросит сменить пароль)"
+else
+    echo "  ❌ Установка завершилась с ошибками: провалено $FAIL, пройдено $PASS, предупреждений $WARN."
+    echo "  Разберите ✗ выше по подсказкам. Полный лог: $LOG"
+fi
 echo "════════════════════════════════════════════════════════════"
+[ "$FAIL" -eq 0 ] && exit 0 || exit 1
