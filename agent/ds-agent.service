@@ -44,11 +44,11 @@ Environment=XAUTHORITY=/home/user/.Xauthority
 TimeoutStopSec=15s
 
 # ── Watchdog systemd ──────────────────────────────────────────────────────
-# systemd watchdog: если агент не шлёт sd_notify в течение 60 сек — перезапуск.
-# Агент должен вызывать notify("WATCHDOG=1") в главном цикле.
-# Раскомментировать после добавления sd_notify в ds_agent.py:
-# WatchdogSec=60s
-# NotifyAccess=main
+# Агент шлёт sd_notify(WATCHDOG=1) каждые ~10 c (_sd_notify в ds_agent.py).
+# Если главный цикл зависнет и keep-alive прекратится дольше WatchdogSec —
+# systemd перезапустит службу (в связке с Restart=always и StartLimit выше).
+WatchdogSec=30s
+NotifyAccess=main
 
 # ── Ограничение привилегий ───────────────────────────────────────────────
 NoNewPrivileges=true

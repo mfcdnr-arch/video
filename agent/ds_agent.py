@@ -12,6 +12,28 @@ from datetime import datetime, timezone, timedelta
 # часовые слоты расписания, окно питания экрана и ночная громкость.
 MSK = timezone(timedelta(hours=3))
 
+
+def _sd_notify(state: str) -> None:
+    """
+    Отправить статус systemd через $NOTIFY_SOCKET (для systemd watchdog).
+    Без внешних зависимостей. Если NOTIFY_SOCKET не задан (агент запущен не под
+    systemd-watchdog) — тихо ничего не делает, поэтому вызывать всегда безопасно.
+    """
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):          # абстрактное пространство имён сокетов
+        addr = "\0" + addr[1:]
+    try:
+        import socket as _s
+        sock = _s.socket(_s.AF_UNIX, _s.SOCK_DGRAM)
+        sock.connect(addr)
+        sock.sendall(state.encode())
+        sock.close()
+    except Exception:
+        pass
+
+
 # ── Загружаем конфиг ─────────────────────────────────────────────────────────
 CONFIG_PATH = os.getenv("DS_CONFIG", "/etc/ds-agent/config.ini")
 
@@ -297,6 +319,7 @@ def main():
     last_heartbeat     = 0
     last_cmd_poll      = 0
     last_cleanup       = 0
+    last_watchdog      = 0    # systemd watchdog: как давно слали WATCHDOG=1
     schedule           = None
     current_playing    = None    # что реально играет mpv (для heartbeat и play_log)
     current_list       = []      # плейлист, загруженный в mpv в данный момент
@@ -306,9 +329,18 @@ def main():
     broken_files       = set()   # файлы, которые не удалось воспроизвести
 
     log.info("Главный цикл запущен")
+    _sd_notify("READY=1")   # сообщаем systemd, что агент поднялся
 
     while True:
         now = time.time()
+
+        # ── systemd watchdog: подтверждаем «живость» ──
+        # Шлём не реже, чем WatchdogSec в ds-agent.service (там 30 c) — с запасом.
+        # Если главный цикл зависнет, WATCHDOG=1 перестанет приходить и systemd
+        # перезапустит службу.
+        if now - last_watchdog >= 10:
+            _sd_notify("WATCHDOG=1")
+            last_watchdog = now
 
         # ── Опрос расписания и синхронизация файлов ──
         if now - last_schedule_poll >= POLL_INTERVAL:
