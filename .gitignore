@@ -30,3 +30,6 @@ Thumbs.db
 
 # Служебные файлы Claude Code (локальные, не часть продукта)
 .claude/
+
+# Диагностические отчёты (создаются collect_diag*.sh)
+diag_*.txt
