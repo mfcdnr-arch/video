@@ -18,7 +18,7 @@
 # дампы БД
 docker cp ds_api:/data/backups ./offsite_backups/
 # медиа из MinIO (пример через mc — MinIO Client)
-mc alias set ds http://<IP>:9000 <MINIO_USER> <MINIO_PASSWORD>
+mc alias set ds http://10.0.119.100:9000 <MINIO_USER> <MINIO_PASSWORD>
 mc mirror ds/ds-media-backup ./offsite_media/
 ```
 
