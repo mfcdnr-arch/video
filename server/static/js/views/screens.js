@@ -1,3 +1,29 @@
+// Копирование в буфер обмена. navigator.clipboard доступен только в защищённом
+// контексте (HTTPS или localhost); по HTTP на IP он undefined — поэтому запасной
+// путь через execCommand с временным textarea.
+function copyToClipboard(text){
+  if(navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(text)
+      .then(()=>toast('Токен скопирован'))
+      .catch(()=>fallbackCopy(text));
+    return;
+  }
+  fallbackCopy(text);
+}
+function fallbackCopy(text){
+  try{
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.setAttribute('readonly','');
+    ta.style.position='fixed'; ta.style.top='-1000px'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    toast(ok ? 'Токен скопирован' : 'Выделите токен и скопируйте вручную (Ctrl+C)');
+  }catch(e){
+    toast('Скопируйте токен вручную (выделите и Ctrl+C)');
+  }
+}
+
 function initScreensViewActions(){
   if(window.__screensViewActionsBound) return;
   window.__screensViewActionsBound = true;
@@ -77,7 +103,8 @@ function initScreensViewActions(){
 
         case 'copy-screen-token': {
           const token = btn.dataset.token || '';
-          return navigator.clipboard.writeText(token).then(()=>toast('Токен скопирован'));
+          copyToClipboard(token);
+          return;
         }
 
         case 'open-screen-settings':
