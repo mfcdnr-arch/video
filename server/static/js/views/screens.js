@@ -543,9 +543,13 @@ async function createScreen(){
   }
 
   try{
-    const created = await api('/minipc',{method:'POST', body: JSON.stringify({name, city, location})});
-    const tokenData = await api('/minipc/'+created.id+'/token',{method:'POST'});
-    const token = tokenData.token;
+    // Бэкенд: POST /minipc/register (query-параметры) создаёт экран и сразу
+    // возвращает токен одним запросом.
+    const q = new URLSearchParams({name});
+    if(city) q.append('city', city);
+    if(location) q.append('location', location);
+    const created = await api('/minipc/register?' + q, {method:'POST'});
+    const token = created.token;
     const wrap = document.getElementById('scr-token-wrap');
 
     if(wrap){
