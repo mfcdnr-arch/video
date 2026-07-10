@@ -439,6 +439,27 @@ async function confirmAddToGroup(groupId){
   }
 }
 
+async function restartAgent(id, name){
+  if(!confirm('Перезапустить агент на экране «'+(name||('#'+id))+'»? Показ прервётся на пару секунд.')) return;
+  try{
+    await api('/command/restart/'+id, {method:'POST'});
+    toast('Команда перезапуска отправлена');
+  }catch(e){
+    toast('Ошибка: '+e.message);
+  }
+}
+
+async function stopScreen(id, name){
+  if(!confirm('Остановить показ на экране «'+(name||('#'+id))+'»? '
+            + 'Это разовая остановка — агент возобновит показ по расписанию.')) return;
+  try{
+    await api('/command/stop/'+id, {method:'POST'});
+    toast('Команда остановки отправлена');
+  }catch(e){
+    toast('Ошибка: '+e.message);
+  }
+}
+
 async function delScreen(id, name){
   if(!confirm('Удалить экран «'+(name||('#'+id))+'»? Действие необратимо. '
             + 'Агент на мини-ПК перестанет получать расписание.')) return;

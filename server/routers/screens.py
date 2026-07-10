@@ -682,6 +682,26 @@ async def command_restart_agent(
     return {"status": "ok", "ws_sent": screen_id in connected}
 
 
+@router.post("/command/stop/{screen_id}")
+async def command_stop_screen(
+    screen_id: int,
+    admin: dict = Depends(require_write),
+    db: Session = Depends(get_db)
+):
+    """Отправить команду остановки показа на мини ПК (очередь команд + WS-будильник).
+    Разовая остановка: агент возобновит показ по расписанию на следующем цикле."""
+    import json as _json
+    import asyncio as _asyncio
+    db.execute(text(
+        "INSERT INTO commands (screen_id, type, payload) VALUES (:sid, 'stop', CAST(:p AS jsonb))"
+    ), {"sid": screen_id, "p": _json.dumps({})})
+    db.commit()
+    connected = ws_manager.connected_screens()
+    if screen_id in connected:
+        _asyncio.create_task(ws_manager.send(screen_id, {"type": "new_command", "count": 1}))
+    return {"status": "ok", "ws_sent": screen_id in connected}
+
+
 @router.post("/sync/start/{group_id}")
 async def sync_start(
     group_id: int,
