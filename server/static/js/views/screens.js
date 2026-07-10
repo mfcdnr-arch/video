@@ -439,6 +439,19 @@ async function confirmAddToGroup(groupId){
   }
 }
 
+async function delScreen(id, name){
+  if(!confirm('Удалить экран «'+(name||('#'+id))+'»? Действие необратимо. '
+            + 'Агент на мини-ПК перестанет получать расписание.')) return;
+
+  try{
+    await api('/minipc/'+id, {method:'DELETE'});
+    toast('Экран удалён');
+    viewScreens('screens');
+  }catch(e){
+    toast('Ошибка: '+e.message);
+  }
+}
+
 async function deleteGroup(id, name){
   if(!confirm('Удалить группу «'+name+'»? Экраны останутся, но потеряют привязку.')) return;
 
