@@ -250,6 +250,7 @@ async function viewScreens(tab){
       h+=`<div class="cell">
         <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;flex-wrap:wrap;">
           <span class="dot" style="background:${on?'var(--accent)':'var(--danger)'};flex-shrink:0;"></span>
+          <span style="color:var(--muted);font-size:11px;flex-shrink:0;" title="ID экрана — для установки агента">ID ${s.id}</span>
           <span style="font-weight:500;flex:1;">${esc(s.name)}</span>${wsBadge}${groupLabel}
         </div>
         <div style="font-size:11px;color:var(--muted);margin-bottom:3px;">${esc(s.city||'')}${s.city&&s.location?' · ':''}${esc(s.location||'')} ${on?'· своб. '+(s.disk_free_gb!=null?Number(s.disk_free_gb).toFixed(0):'?')+' ГБ':'· офлайн'}</div>
@@ -577,16 +578,22 @@ async function createScreen(){
     if(location) q.append('location', location);
     const created = await api('/minipc/register?' + q, {method:'POST'});
     const token = created.token;
+    const sid = created.id;
     const wrap = document.getElementById('scr-token-wrap');
 
     if(wrap){
+      const cmd = `sudo bash install.sh http://${window.location.hostname} ${token} ${sid} toor`;
+      const cbox = 'user-select:all;word-break:break-all;background:rgba(255,255,255,.05);padding:6px 8px;border-radius:8px;';
       wrap.innerHTML = `<div style="margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:10px;background:var(--panel);">
-        <div style="font-weight:600;margin-bottom:6px;">Токен для агента</div>
-        <div style="font-size:12px;color:var(--muted);margin-bottom:8px;">Скопируйте и вставьте этот токен в ds-agent на мини-ПК:</div>
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-          <code style="user-select:all;word-break:break-all;background:rgba(255,255,255,.05);padding:6px 8px;border-radius:8px;">${esc(token)}</code>
+        <div style="font-weight:600;margin-bottom:8px;">Экран создан — данные для установки агента</div>
+        <div style="margin-bottom:8px;">ID экрана: <code style="${cbox}font-size:14px;font-weight:600;">${sid}</code></div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:4px;">Токен (сохраните — повторно не показывается):</div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;">
+          <code style="${cbox}">${esc(token)}</code>
           <button class="btn" data-action="copy-screen-token" data-token="${esc(token)}">Копировать</button>
         </div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:4px;">Команда установки на мини-ПК (проверьте пользователя, по умолчанию toor):</div>
+        <code style="${cbox}display:block;">${esc(cmd)}</code>
       </div>`;
     }
 
