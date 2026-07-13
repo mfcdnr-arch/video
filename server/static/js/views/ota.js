@@ -51,7 +51,7 @@ async function viewOta(){
     const fileCheckboxes = allowedFiles.map(fn=>{
       const exists = files.find(f=>f.name===fn);
       return `<label style="display:inline-flex;align-items:center;gap:5px;margin-right:12px;margin-bottom:5px;font-size:12px;${exists?'':'opacity:0.4'}">
-        <input type="checkbox" class="ota-file-chk" value="${fn}" ${exists?'':'disabled'} checked> ${fn}</label>`;
+        <input type="checkbox" class="ota-file-chk" value="${fn}" ${exists?'checked':'disabled'}> ${fn}</label>`;
     }).join('');
 
     view.innerHTML=`
@@ -133,7 +133,7 @@ async function otaPush(){
   const res = document.getElementById('ota-push-result');
   const version = (document.getElementById('ota-version')||{}).value||'auto';
   const changelog = (document.getElementById('ota-changelog')||{}).value||'';
-  const files = [...document.querySelectorAll('.ota-file-chk:checked')].map(c=>c.value);
+  const files = [...document.querySelectorAll('.ota-file-chk:checked:not(:disabled)')].map(c=>c.value);
   const screenIds = [...document.querySelectorAll('.ota-screen-chk:checked')].map(c=>Number(c.value));
   if(!files.length){ toast('Выберите хотя бы один файл'); return; }
   if(!version||version==='auto'||version.trim()===''){
