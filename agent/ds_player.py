@@ -152,6 +152,11 @@ class VLCPlayer:
             self._mpv_cmd(cmd)
 
         _load(existing[0], "replace")
+        # ВАЖНО: loadfile ... replace в части версий mpv заменяет только ТЕКУЩУЮ
+        # запись, оставляя записи предыдущего плейлиста в очереди. С
+        # --loop-playlist=inf старый плейлист продолжал крутиться вместе с новым.
+        # playlist-clear убирает все записи, кроме текущей (только что загруженной).
+        self._mpv_cmd(["playlist-clear"])
         for fn in existing[1:]:
             _load(fn, "append")
         self._current_file = existing[0]
