@@ -390,7 +390,15 @@ def main():
                 current_playing = None
 
         # ── Воспроизведение по расписанию ──
-        if schedule and display_on:
+        if player.user_stopped:
+            # Пользователь нажал «Стоп» — держим показ остановленным, не
+            # возобновляем по расписанию (иначе цикл тут же запускал заново).
+            # Снимается командой play/sync_play или перезапуском («Показ»).
+            if current_list or current_playing:
+                player.stop()
+                current_list = []
+                current_playing = None
+        elif schedule and display_on:
             files = current_playlist_files(schedule)
             # Только существующие локально и не помеченные нерабочими
             playable = []

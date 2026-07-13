@@ -21,6 +21,10 @@ class VLCPlayer:
         self._marquee_thread = None
         self._marquee_stop = None
         self._marquee_current = None
+        # Устойчивый флаг «остановлено пользователем» (кнопка «Стоп» в панели).
+        # Пока True — главный цикл не возобновляет показ по расписанию. Снимается
+        # явной командой play/sync_play или перезапуском агента (кнопка «Показ»).
+        self.user_stopped = False
 
     def _mpv_cmd(self, command: list):
         """Отправить JSON команду mpv через IPC-сокет."""

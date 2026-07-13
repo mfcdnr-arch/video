@@ -54,6 +54,7 @@ class SyncHandler:
         cmd_id   = command.get("id")
 
         if cmd_type == "sync_play":
+            self.player.user_stopped = False   # явный показ снимает «Стоп»
             filename = payload.get("filename")
             play_at  = payload.get("play_at")  # UNIX timestamp (float)
 
@@ -84,11 +85,13 @@ class SyncHandler:
 
         elif cmd_type == "stop":
             log.info("Команда: STOP")
+            self.player.user_stopped = True   # держим остановку до «Показ»/play
             self.player.stop()
             self.ack_command(cmd_id)
             return True
 
         elif cmd_type == "play":
+            self.player.user_stopped = False   # явный показ снимает «Стоп»
             filename = payload.get("filename")
             if filename:
                 log.info("Команда: PLAY " + filename)
