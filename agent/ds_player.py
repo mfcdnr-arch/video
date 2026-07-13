@@ -41,6 +41,17 @@ class VLCPlayer:
         if self._mpv_proc and self._mpv_proc.poll() is None:
             return
 
+        # Убить осиротевшие mpv от прошлых запусков агента. После systemctl restart
+        # у нового процесса агента self._mpv_proc = None, поэтому он стартует свежий
+        # mpv, НЕ трогая mpv, запущенные предыдущим процессом агента → экземпляры
+        # копятся, дерутся за экран, а IPC-сокет захватывает лишь один из них
+        # (команды/OSD уходят не в то окно, что видно на экране). Оставляем ровно один.
+        try:
+            subprocess.run(["pkill", "-9", "-x", "mpv"], timeout=5)
+            time.sleep(0.5)
+        except Exception as e:
+            log.debug(f"pkill mpv: {e}")
+
         env = os.environ.copy()
         if 'DISPLAY' not in env:
             env['DISPLAY'] = ':0'
