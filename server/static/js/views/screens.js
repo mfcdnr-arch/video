@@ -43,6 +43,9 @@ function initScreensViewActions(){
         case 'open-screen-add-form':
           return screenAddForm();
 
+        case 'play-screen':
+          return playScreen(Number(btn.dataset.screenId), btn.dataset.screenName || '');
+
         case 'stop-screen':
           return stopScreen(Number(btn.dataset.screenId), btn.dataset.screenName || '');
 
@@ -261,7 +264,8 @@ async function viewScreens(tab){
           : ''}
         <div style="font-size:11px;color:${on?'var(--txt2)':'var(--dim)'};margin-bottom:9px;">▶ ${esc(s.playing_file||'—')}</div>
         <div style="display:flex;gap:5px;flex-wrap:wrap;">${on
-          ? `<button class="btn danger" data-action="stop-screen" data-screen-id="${s.id}" data-screen-name="${esc(s.name)}">■ Стоп</button>
+          ? `<button class="btn" title="Возобновить показ по расписанию" data-action="play-screen" data-screen-id="${s.id}" data-screen-name="${esc(s.name)}">▶ Показ</button>
+             <button class="btn danger" data-action="stop-screen" data-screen-id="${s.id}" data-screen-name="${esc(s.name)}">■ Стоп</button>
              <button class="btn" title="Перезапустить агент ds-agent" data-action="restart-agent" data-screen-id="${s.id}" data-screen-name="${esc(s.name)}">↺ Агент</button>`
           : `<button class="btn" data-action="screen-offline-diagnostics">Диагностика</button>`}
           <button class="btn" title="Питание монитора и громкость по расписанию" data-action="open-screen-settings"
@@ -434,6 +438,18 @@ async function confirmAddToGroup(groupId){
     document.getElementById('modal-grp')?.remove();
     toast('Экран добавлен');
     viewScreens('groups');
+  }catch(e){
+    toast('Ошибка: '+e.message);
+  }
+}
+
+async function playScreen(id, name){
+  // Показ управляется расписанием; «возобновить» = перезапустить агент, он
+  // заново загрузит плейлист по расписанию (отдельной play-команды по расписанию
+  // в агенте нет — команда play требует конкретный файл).
+  try{
+    await api('/command/restart/'+id, {method:'POST'});
+    toast('Показ возобновляется…');
   }catch(e){
     toast('Ошибка: '+e.message);
   }
