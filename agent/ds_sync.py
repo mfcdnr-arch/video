@@ -100,9 +100,10 @@ class SyncHandler:
         elif cmd_type == "ticker_show":
             message = payload.get("message", "")
             color   = payload.get("color", "#ffd34d")
+            speed   = payload.get("speed")
             log.info("Команда: TICKER_SHOW")
             try:
-                self.player.set_marquee(message, color)
+                self.player.set_marquee(message, color, speed)
             except Exception as e:
                 log.warning("Не удалось показать бегущую строку: {}".format(e))
             self.ack_command(cmd_id)

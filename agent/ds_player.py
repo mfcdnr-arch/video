@@ -18,6 +18,8 @@ class VLCPlayer:
         self._mpv_proc = None
         self._current_file = None
         self._lock = threading.Lock()
+        self._marquee_thread = None
+        self._marquee_stop = None
 
     def _mpv_cmd(self, command: list):
         """Отправить JSON команду mpv через IPC-сокет."""
@@ -210,12 +212,95 @@ class VLCPlayer:
         playing = (not paused) and (not idle)
         return {"playing": playing, "filename": self._current_file}
 
-    def set_marquee(self, text, color="#ffd34d"):
-        """Показать текст поверх видео через OSD mpv."""
-        safe = text.replace('"', "'")
-        self._mpv_cmd(["show-text", safe, 10000])
-        log.info(f"OSD: {safe[:60]}")
+    # ── Бегущая строка (ticker) ─────────────────────────────────────────────
+    # Постоянная строка ВНИЗУ экрана, прокрутка справа налево, заданным цветом.
+    # Держится бессрочно (пока не вызовут clear_marquee). Реализована через
+    # osd-overlay (ASS): фоновый поток раз в кадр перерисовывает текст со сдвигом
+    # по X. Это заменяет прежний show-text (разовый OSD на 10 сек по центру).
+    MARQUEE_OVERLAY_ID = 47
+    MARQUEE_RES_X = 1280
+    MARQUEE_RES_Y = 720
+
+    def _mpv_send_quick(self, command):
+        """Лёгкая отправка команды mpv: подключиться, послать, выгрести ответ,
+        закрыть. Без sleep — для частой перерисовки бегущей строки. Каждый вызов
+        закрывает соединение → ответы mpv не копятся в буфере."""
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(1)
+            s.connect(MPV_SOCKET)
+            s.sendall((json.dumps({"command": command}) + "\n").encode())
+            try:
+                s.recv(4096)
+            except Exception:
+                pass
+            s.close()
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _hex_to_ass(color):
+        """#RRGGBB → ASS-цвет &HBBGGRR& (порядок B,G,R). По умолчанию — жёлтый."""
+        c = (color or "").strip().lstrip("#")
+        if len(c) == 6:
+            try:
+                r, g, b = c[0:2], c[2:4], c[4:6]
+                return "&H{}{}{}&".format(b, g, r).upper()
+            except Exception:
+                pass
+        return "&H4DD3FF&"
+
+    @staticmethod
+    def _ass_escape(text):
+        """Обезвредить спецсимволы ASS в пользовательском тексте."""
+        return (text or "").replace("\\", "/").replace("{", "(").replace("}", ")")
+
+    def _marquee_loop(self, text, ass_color, speed):
+        RES_X, RES_Y = self.MARQUEE_RES_X, self.MARQUEE_RES_Y
+        fs = 42                       # размер шрифта
+        y = RES_Y - 12                # почти у нижнего края (an1 = низ-лево)
+        step = max(1, int(speed)) if speed else 8   # пикселей за кадр
+        interval = 0.05               # ~20 кадров/сек
+        safe = self._ass_escape(text)
+        text_w = int(len(safe) * fs * 0.6) + 60     # грубая ширина для сброса
+        x = RES_X
+        while self._marquee_stop is not None and not self._marquee_stop.is_set():
+            tags = ("{\\an1\\pos(%d,%d)\\fs%d\\c%s\\bord2\\3c&H000000&\\shad1}"
+                    % (x, y, fs, ass_color))
+            ok = self._mpv_send_quick(["osd-overlay", self.MARQUEE_OVERLAY_ID,
+                                       "ass-events", tags + safe, RES_X, RES_Y])
+            if not ok:
+                # mpv мог перезапуститься — подождём и попробуем снова
+                self._marquee_stop.wait(0.5)
+            x -= step
+            if x < -text_w:
+                x = RES_X
+            self._marquee_stop.wait(interval)
+        # убрать оверлей
+        self._mpv_send_quick(["osd-overlay", self.MARQUEE_OVERLAY_ID, "none", ""])
+
+    def set_marquee(self, text, color="#ffd34d", speed=None):
+        """Запустить постоянную бегущую строку внизу экрана заданным цветом."""
+        self.clear_marquee()
+        text = (text or "").replace("\n", " ").strip()
+        if not text:
+            return
+        ass_color = self._hex_to_ass(color)
+        self._marquee_stop = threading.Event()
+        self._marquee_thread = threading.Thread(
+            target=self._marquee_loop, args=(text, ass_color, speed), daemon=True)
+        self._marquee_thread.start()
+        log.info("Бегущая строка (цвет {}): {}".format(ass_color, text[:60]))
 
     def clear_marquee(self):
-        """Скрыть OSD."""
-        self._mpv_cmd(["show-text", "", 1])
+        """Остановить бегущую строку и убрать оверлей."""
+        if self._marquee_stop is not None:
+            self._marquee_stop.set()
+        th = self._marquee_thread
+        if th and th.is_alive() and th is not threading.current_thread():
+            th.join(timeout=1.5)
+        self._marquee_thread = None
+        self._marquee_stop = None
+        # подстраховка: убрать оверлей, даже если поток уже мёртв
+        self._mpv_send_quick(["osd-overlay", self.MARQUEE_OVERLAY_ID, "none", ""])
