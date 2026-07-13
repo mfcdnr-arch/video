@@ -20,6 +20,7 @@ class VLCPlayer:
         self._lock = threading.Lock()
         self._marquee_thread = None
         self._marquee_stop = None
+        self._marquee_current = None
 
     def _mpv_cmd(self, command: list):
         """Отправить JSON команду mpv через IPC-сокет."""
@@ -256,37 +257,85 @@ class VLCPlayer:
         """Обезвредить спецсимволы ASS в пользовательском тексте."""
         return (text or "").replace("\\", "/").replace("{", "(").replace("}", ")")
 
+    def _marquee_send(self, sock, command):
+        """Отправить команду mpv по постоянному соединению: сначала вычерпать
+        накопившиеся ответы/события (не блокируясь), потом послать. Иначе буфер
+        ответов mpv переполнится и его event-loop может застопориться."""
+        sock.setblocking(False)
+        try:
+            while sock.recv(65536):
+                pass
+        except (BlockingIOError, OSError):
+            pass
+        sock.setblocking(True)
+        sock.settimeout(2)
+        sock.sendall((json.dumps({"command": command}) + "\n").encode())
+
     def _marquee_loop(self, text, ass_color, speed):
         RES_X, RES_Y = self.MARQUEE_RES_X, self.MARQUEE_RES_Y
         fs = 42                       # размер шрифта
         y = RES_Y - 12                # почти у нижнего края (an1 = низ-лево)
         step = max(1, int(speed)) if speed else 8   # пикселей за кадр
-        interval = 0.05               # ~20 кадров/сек
+        interval = 0.04               # ~25 кадров/сек
         safe = self._ass_escape(text)
         text_w = int(len(safe) * fs * 0.6) + 60     # грубая ширина для сброса
         x = RES_X
-        while self._marquee_stop is not None and not self._marquee_stop.is_set():
-            tags = ("{\\an1\\pos(%d,%d)\\fs%d\\c%s\\bord2\\3c&H000000&\\shad1}"
-                    % (x, y, fs, ass_color))
-            ok = self._mpv_send_quick(["osd-overlay", self.MARQUEE_OVERLAY_ID,
-                                       "ass-events", tags + safe, RES_X, RES_Y])
-            if not ok:
-                # mpv мог перезапуститься — подождём и попробуем снова
-                self._marquee_stop.wait(0.5)
+        stop = self._marquee_stop
+        sock = None
+        while stop is not None and not stop.is_set():
+            try:
+                if sock is None:
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    sock.settimeout(2)
+                    sock.connect(MPV_SOCKET)
+                tags = ("{\\an1\\pos(%d,%d)\\fs%d\\c%s\\bord2\\3c&H000000&\\shad1}"
+                        % (x, y, fs, ass_color))
+                self._marquee_send(sock, ["osd-overlay", self.MARQUEE_OVERLAY_ID,
+                                          "ass-events", tags + safe, RES_X, RES_Y])
+            except Exception:
+                # соединение отвалилось (mpv перезапущен) — переподключимся
+                try:
+                    if sock:
+                        sock.close()
+                except Exception:
+                    pass
+                sock = None
+                stop.wait(0.4)
+                continue
             x -= step
             if x < -text_w:
                 x = RES_X
-            self._marquee_stop.wait(interval)
+            stop.wait(interval)
         # убрать оверлей
-        self._mpv_send_quick(["osd-overlay", self.MARQUEE_OVERLAY_ID, "none", ""])
+        try:
+            if sock is None:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                sock.connect(MPV_SOCKET)
+            self._marquee_send(sock, ["osd-overlay", self.MARQUEE_OVERLAY_ID, "none", ""])
+        except Exception:
+            pass
+        try:
+            if sock:
+                sock.close()
+        except Exception:
+            pass
 
     def set_marquee(self, text, color="#ffd34d", speed=None):
-        """Запустить постоянную бегущую строку внизу экрана заданным цветом."""
-        self.clear_marquee()
+        """Запустить/обновить постоянную бегущую строку внизу экрана.
+        Идемпотентно: если ровно та же строка уже бежит — ничего не трогаем
+        (иначе повторные ticker_show на каждом опросе снимали бы и запускали
+        строку заново → мигание)."""
         text = (text or "").replace("\n", " ").strip()
+        ass_color = self._hex_to_ass(color)
+        if (text and self._marquee_thread is not None
+                and self._marquee_thread.is_alive()
+                and self._marquee_current == (text, ass_color)):
+            return
+        self.clear_marquee()
         if not text:
             return
-        ass_color = self._hex_to_ass(color)
+        self._marquee_current = (text, ass_color)
         self._marquee_stop = threading.Event()
         self._marquee_thread = threading.Thread(
             target=self._marquee_loop, args=(text, ass_color, speed), daemon=True)
@@ -302,5 +351,6 @@ class VLCPlayer:
             th.join(timeout=1.5)
         self._marquee_thread = None
         self._marquee_stop = None
+        self._marquee_current = None
         # подстраховка: убрать оверлей, даже если поток уже мёртв
         self._mpv_send_quick(["osd-overlay", self.MARQUEE_OVERLAY_ID, "none", ""])

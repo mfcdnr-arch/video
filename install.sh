@@ -262,9 +262,15 @@ echo "[7/10] Настройка sudo для перезагрузки и рест
 SUDOERS_FILE="/etc/sudoers.d/ds-agent-reboot"
 SUDOERS_TMP="$(mktemp /tmp/ds-sudoers.XXXXXX)"
 
+# ВАЖНО: путь в правиле должен совпадать с тем, как sudo резолвит команду.
+# На разных системах systemctl/reboot лежат в /bin или /usr/bin (/sbin или
+# /usr/sbin). Если путь не совпадёт — sudo запросит пароль, и в неинтерактивном
+# режиме (OTA-самоперезапуск) команда молча провалится. Поэтому перечисляем оба.
 printf '%s\n' \
     "$REAL_USER ALL=(ALL) NOPASSWD: /sbin/reboot" \
+    "$REAL_USER ALL=(ALL) NOPASSWD: /usr/sbin/reboot" \
     "$REAL_USER ALL=(ALL) NOPASSWD: /bin/systemctl restart ds-agent" \
+    "$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart ds-agent" \
     > "$SUDOERS_TMP"
 
 if visudo -cf "$SUDOERS_TMP" &>/dev/null; then
