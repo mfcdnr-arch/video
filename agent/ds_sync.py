@@ -90,6 +90,12 @@ class SyncHandler:
             self.ack_command(cmd_id)
             return True
 
+        elif cmd_type == "resume":
+            log.info("Команда: RESUME")
+            self.player.user_stopped = False  # снять «Стоп» — цикл сам возобновит показ
+            self.ack_command(cmd_id)
+            return True
+
         elif cmd_type == "play":
             self.player.user_stopped = False   # явный показ снимает «Стоп»
             filename = payload.get("filename")

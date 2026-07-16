@@ -444,11 +444,10 @@ async function confirmAddToGroup(groupId){
 }
 
 async function playScreen(id, name){
-  // Показ управляется расписанием; «возобновить» = перезапустить агент, он
-  // заново загрузит плейлист по расписанию (отдельной play-команды по расписанию
-  // в агенте нет — команда play требует конкретный файл).
+  // «Показ» снимает флаг «Стоп» командой resume — агент сам возобновит показ по
+  // расписанию на следующем цикле (без перезапуска/sudo, надёжно через опрос).
   try{
-    await api('/command/restart/'+id, {method:'POST'});
+    await api('/command/resume/'+id, {method:'POST'});
     toast('Показ возобновляется…');
   }catch(e){
     toast('Ошибка: '+e.message);
