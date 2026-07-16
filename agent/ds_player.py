@@ -299,29 +299,30 @@ class VLCPlayer:
         fs = 42                       # размер шрифта
         y = RES_Y - 12                # почти у нижнего края (an1 = низ-лево)
         pps = self._speed_to_pps(speed)             # пикселей в секунду
-        interval = 0.03               # ~33 кадра/сек
         safe = self._ass_escape(text)
         text_w = int(len(safe) * fs * 0.6) + 80     # грубая ширина строки
         span = RES_X + text_w                        # полный путь одного прохода
+        pass_ms = max(1000, int(span / pps * 1000))  # длительность прохода, мс
+        base = "\\an1\\fs%d\\c%s\\bord2\\3c&H000000&\\shad1" % (fs, ass_color)
         stop = self._marquee_stop
         start = time.monotonic()
         sock = None
+        # Прокрутка — через ASS \move: отправляем один оверлей на проход, дальше
+        # mpv анимирует его САМ, синхронно со своими кадрами видео → плавно, без
+        # «ряби» от перерисовки каждый кадр. В конце прохода текст уходит за левый
+        # край, следующий проход стартует из-за правого края → стык невиден.
         while stop is not None and not stop.is_set():
-            elapsed = time.monotonic() - start
-            if duration and elapsed >= duration:
+            if duration and (time.monotonic() - start) >= duration:
                 break
-            # позиция от РЕАЛЬНОГО времени → ровная скорость без «ряби»
-            # (при джиттере кадра следующий кадр встаёт в верную точку)
-            x = int(RES_X - (elapsed * pps) % span)
+            ass = "{%s\\move(%d,%d,%d,%d,0,%d)}%s" % (
+                base, RES_X, y, -text_w, y, pass_ms, safe)
             try:
                 if sock is None:
                     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                     sock.settimeout(2)
                     sock.connect(MPV_SOCKET)
-                tags = ("{\\an1\\pos(%d,%d)\\fs%d\\c%s\\bord2\\3c&H000000&\\shad1}"
-                        % (x, y, fs, ass_color))
                 self._marquee_send(sock, ["osd-overlay", self.MARQUEE_OVERLAY_ID,
-                                          "ass-events", tags + safe, RES_X, RES_Y])
+                                          "ass-events", ass, RES_X, RES_Y])
             except Exception:
                 # соединение отвалилось (mpv перезапущен) — переподключимся
                 try:
@@ -332,7 +333,14 @@ class VLCPlayer:
                 sock = None
                 stop.wait(0.4)
                 continue
-            stop.wait(interval)
+            # ждём завершения прохода, дробно (реагируем на stop/duration)
+            waited = 0.0
+            while (stop is not None and not stop.is_set()
+                   and waited < pass_ms / 1000.0):
+                if duration and (time.monotonic() - start) >= duration:
+                    break
+                stop.wait(0.1)
+                waited += 0.1
         # убрать оверлей
         try:
             if sock is None:
