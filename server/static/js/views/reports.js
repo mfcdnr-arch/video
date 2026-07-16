@@ -208,15 +208,15 @@ async function viewReports(){
         h+=`<tr><td>${esc(l.screen||'—')}</td><td class="muted" style="font-size:12px;">${l.lost_at?new Date(l.lost_at).toLocaleString('ru-RU'):'—'}</td><td class="muted" style="font-size:12px;">${l.restored_at?new Date(l.restored_at).toLocaleString('ru-RU'):'—'}</td><td>${dur}</td><td style="color:${l.ongoing?'var(--danger)':'var(--accent)'};font-size:12px;">${l.ongoing?'нет связи':'восстановлена'}</td></tr>`; });
       h+='</table>'; }
 
-    // Версии ПО (ОС и VLC)
-    h+='<div class="rhead">Версии ПО на мини ПК (ОС и VLC)</div>';
+    // Версии ПО (ОС и плеер mpv)
+    h+='<div class="rhead">Версии ПО на мини ПК (ОС и плеер mpv)</div>';
     let vers=null; try{ vers=await api('/reports/versions'); }catch(e){}
     if(!vers||!vers.screens||!vers.screens.length){ h+='<div class="muted" style="font-size:12px;">Нет данных о версиях.</div>'; }
     else {
       const oc = vers.outdated_count!=null?vers.outdated_count:vers.mismatch_count;
-      h+=`<div class="muted" style="font-size:12px;margin-bottom:8px;">Целевые версии — ОС: <b style="color:var(--text);">${esc(vers.target_os||'не задана')}</b>, VLC: <b style="color:var(--text);">${esc(vers.target_vlc||'не задана')}</b>. Устарели: <b style="color:${oc?'var(--danger)':'var(--accent)'};">${oc}</b>. Задать целевые версии можно в «Настройках».</div>`;
+      h+=`<div class="muted" style="font-size:12px;margin-bottom:8px;">Целевые версии — ОС: <b style="color:var(--text);">${esc(vers.target_os||'не задана')}</b>, плеер (mpv): <b style="color:var(--text);">${esc(vers.target_vlc||'не задана')}</b>. Устарели: <b style="color:${oc?'var(--danger)':'var(--accent)'};">${oc}</b>. Задать целевые версии можно в «Настройках».</div>`;
       const vstat=(s)=>s==='ok'?['актуальна','var(--accent)']:s==='outdated'?['устарела — обновить','var(--danger)']:['не сравнить','var(--muted)'];
-      h+='<table><tr><th>Мини ПК</th><th>ОС на ПК</th><th>Статус ОС</th><th>VLC на ПК</th><th>Статус VLC</th></tr>';
+      h+='<table><tr><th>Мини ПК</th><th>ОС на ПК</th><th>Статус ОС</th><th>Плеер (mpv)</th><th>Статус плеера</th></tr>';
       vers.screens.forEach(s=>{ const os=vstat(s.os_status), vl=vstat(s.vlc_status);
         h+=`<tr><td>${esc(s.name)}</td><td class="muted">${esc(s.os_version||'—')}</td><td style="color:${os[1]};font-size:12px;">${os[0]}</td><td class="muted">${esc(s.vlc_version||'—')}</td><td style="color:${vl[1]};font-size:12px;">${vl[0]}</td></tr>`; });
       h+='</table>'; }

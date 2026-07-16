@@ -24,12 +24,13 @@ def _read_os_version() -> str:
 
 
 def _read_vlc_version() -> str:
-    """Версия VLC из вывода `vlc --version` (первое число вида X.Y.Z)."""
-    for cmd in (["vlc", "--version"], ["cvlc", "--version"]):
+    """Версия ПЛЕЕРА из вывода `mpv --version` (первое число вида X.Y[.Z]).
+    Имя функции/колонки в БД историческое (vlc_version) — плеер давно mpv."""
+    for cmd in (["mpv", "--version"], ["/usr/bin/mpv", "--version"]):
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
             text_out = (out.stdout or "") + (out.stderr or "")
-            m = re.search(r"\b(\d+\.\d+\.\d+(?:\.\d+)?)\b", text_out)
+            m = re.search(r"\bv?(\d+\.\d+(?:\.\d+)?)\b", text_out)
             if m:
                 return m.group(1)
         except Exception:

@@ -357,7 +357,7 @@ def main():
                     log.warning("Используем кешированное расписание")
             last_schedule_poll = now
 
-        # ── Watchdog VLC ──
+        # ── Watchdog плеера (mpv) ──
         player.watchdog(current_playing)
 
         # ── Команды с сервера ──

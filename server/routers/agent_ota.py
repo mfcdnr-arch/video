@@ -153,6 +153,6 @@ def save_target_versions(body: dict = Body(...), current_admin: dict = Depends(r
     db.execute(text("""
         INSERT INTO audit_log (event_type, title, detail, actor)
         VALUES ('version', 'Целевые версии обновлены', :detail, :who)
-    """), {"detail": f"ОС: {os_version or '—'}, VLC: {vlc_version or '—'}", "who": current_admin["username"]})
+    """), {"detail": f"ОС: {os_version or '—'}, плеер (mpv): {vlc_version or '—'}", "who": current_admin["username"]})
     db.commit()
     return {"status": "ok"}

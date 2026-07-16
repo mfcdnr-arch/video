@@ -326,7 +326,7 @@ async function loadTargetVersions(){
     el.innerHTML = `
       <div class="row">
         <div class="fld" style="flex:1;"><label>Целевая версия ОС (Astra)</label><input class="inp" id="tgt-os" value="${esc(t.os_version || '')}" placeholder="например, 1.7" ${editable ? '' : 'readonly'}></div>
-        <div class="fld" style="flex:1;"><label>Целевая версия VLC</label><input class="inp" id="tgt-vlc" value="${esc(t.vlc_version || '')}" placeholder="например, 3.0.20" ${editable ? '' : 'readonly'}></div>
+        <div class="fld" style="flex:1;"><label>Целевая версия плеера (mpv)</label><input class="inp" id="tgt-vlc" value="${esc(t.vlc_version || '')}" placeholder="например, 0.35.0" ${editable ? '' : 'readonly'}></div>
       </div>
       ${editable ? '<button class="btn primary" data-action="settings-save-target-versions">Сохранить целевые версии</button>' : ''}
       ${t.updated_at ? `<div class="muted" style="font-size:11px;margin-top:6px;">Обновлено: ${new Date(t.updated_at).toLocaleString('ru-RU')}${t.updated_by ? ' · ' + esc(t.updated_by) : ''}</div>` : ''}`;
