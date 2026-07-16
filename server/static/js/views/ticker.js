@@ -125,6 +125,11 @@ async function viewTicker(){
     </div>
   </div>`;
 
+  h += `<div class="fld" style="margin-top:2px;">
+    <label>Время показа, сек <span class="muted" style="font-weight:normal;">(0 или пусто — бессрочно, до снятия)</span></label>
+    <input class="inp" id="tk-duration" type="number" min="0" step="1" placeholder="0" style="max-width:220px;">
+  </div>`;
+
   h += '<div class="sec">Куда вывести</div>';
   h += `<div class="seg" style="margin-bottom:11px;">
     <button class="${TICK_TARGET === 'all' ? 'on' : ''}" data-action="ticker-target-all">На все экраны</button>
@@ -166,6 +171,7 @@ async function startTicker(){
   }
 
   const speed = val('tk-speed');
+  const duration = Math.max(0, parseInt(val('tk-duration'), 10) || 0);
   const screen_ids = TICK_TARGET === 'one'
     ? Object.keys(TICK_SCREENS).filter(k => TICK_SCREENS[k]).map(Number)
     : [];
@@ -182,6 +188,7 @@ async function startTicker(){
       body: JSON.stringify({
         message: msg,
         speed,
+        duration,
         color: TICK_COLOR,
         is_all: TICK_TARGET === 'all',
         screen_ids

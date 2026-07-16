@@ -261,6 +261,25 @@ class VLCPlayer:
         """Обезвредить спецсимволы ASS в пользовательском тексте."""
         return (text or "").replace("\\", "/").replace("{", "(").replace("}", ")")
 
+    @staticmethod
+    def _speed_to_pps(speed):
+        """Скорость прокрутки → пикселей/сек. Принимает slow|medium|fast или число."""
+        table = {"slow": 80, "medium": 140, "fast": 220}
+        if speed is None:
+            return table["medium"]
+        if isinstance(speed, str):
+            s = speed.strip().lower()
+            if s in table:
+                return table[s]
+            try:
+                return max(20, int(float(s)))
+            except ValueError:
+                return table["medium"]
+        try:
+            return max(20, int(speed))
+        except (TypeError, ValueError):
+            return table["medium"]
+
     def _marquee_send(self, sock, command):
         """Отправить команду mpv по постоянному соединению: сначала вычерпать
         накопившиеся ответы/события (не блокируясь), потом послать. Иначе буфер
@@ -275,18 +294,25 @@ class VLCPlayer:
         sock.settimeout(2)
         sock.sendall((json.dumps({"command": command}) + "\n").encode())
 
-    def _marquee_loop(self, text, ass_color, speed):
+    def _marquee_loop(self, text, ass_color, speed, duration):
         RES_X, RES_Y = self.MARQUEE_RES_X, self.MARQUEE_RES_Y
         fs = 42                       # размер шрифта
         y = RES_Y - 12                # почти у нижнего края (an1 = низ-лево)
-        step = max(1, int(speed)) if speed else 8   # пикселей за кадр
-        interval = 0.04               # ~25 кадров/сек
+        pps = self._speed_to_pps(speed)             # пикселей в секунду
+        interval = 0.03               # ~33 кадра/сек
         safe = self._ass_escape(text)
-        text_w = int(len(safe) * fs * 0.6) + 60     # грубая ширина для сброса
-        x = RES_X
+        text_w = int(len(safe) * fs * 0.6) + 80     # грубая ширина строки
+        span = RES_X + text_w                        # полный путь одного прохода
         stop = self._marquee_stop
+        start = time.monotonic()
         sock = None
         while stop is not None and not stop.is_set():
+            elapsed = time.monotonic() - start
+            if duration and elapsed >= duration:
+                break
+            # позиция от РЕАЛЬНОГО времени → ровная скорость без «ряби»
+            # (при джиттере кадра следующий кадр встаёт в верную точку)
+            x = int(RES_X - (elapsed * pps) % span)
             try:
                 if sock is None:
                     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -306,9 +332,6 @@ class VLCPlayer:
                 sock = None
                 stop.wait(0.4)
                 continue
-            x -= step
-            if x < -text_w:
-                x = RES_X
             stop.wait(interval)
         # убрать оверлей
         try:
@@ -324,27 +347,38 @@ class VLCPlayer:
                 sock.close()
         except Exception:
             pass
+        # авто-снятие по времени: сбросить состояние, если это ещё активный поток
+        if duration and self._marquee_thread is threading.current_thread():
+            self._marquee_thread = None
+            self._marquee_stop = None
+            self._marquee_current = None
 
-    def set_marquee(self, text, color="#ffd34d", speed=None):
+    def set_marquee(self, text, color="#ffd34d", speed=None, duration=0):
         """Запустить/обновить постоянную бегущую строку внизу экрана.
-        Идемпотентно: если ровно та же строка уже бежит — ничего не трогаем
-        (иначе повторные ticker_show на каждом опросе снимали бы и запускали
-        строку заново → мигание)."""
+        duration: секунды показа; 0/None — бессрочно (до снятия). Идемпотентно:
+        если ровно та же строка (текст/цвет/скорость/время) уже бежит — не трогаем
+        (повторная доставка ticker_show не должна вызывать мигание)."""
         text = (text or "").replace("\n", " ").strip()
         ass_color = self._hex_to_ass(color)
+        try:
+            duration = max(0, int(float(duration))) if duration else 0
+        except (TypeError, ValueError):
+            duration = 0
+        key = (text, ass_color, str(speed), duration)
         if (text and self._marquee_thread is not None
                 and self._marquee_thread.is_alive()
-                and self._marquee_current == (text, ass_color)):
+                and self._marquee_current == key):
             return
         self.clear_marquee()
         if not text:
             return
-        self._marquee_current = (text, ass_color)
+        self._marquee_current = key
         self._marquee_stop = threading.Event()
         self._marquee_thread = threading.Thread(
-            target=self._marquee_loop, args=(text, ass_color, speed), daemon=True)
+            target=self._marquee_loop, args=(text, ass_color, speed, duration), daemon=True)
         self._marquee_thread.start()
-        log.info("Бегущая строка (цвет {}): {}".format(ass_color, text[:60]))
+        log.info("Бегущая строка (цвет {}, скорость {}, время {}): {}".format(
+            ass_color, speed, (str(duration) + "с") if duration else "∞", text[:60]))
 
     def clear_marquee(self):
         """Остановить бегущую строку и убрать оверлей."""

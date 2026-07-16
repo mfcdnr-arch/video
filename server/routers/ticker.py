@@ -43,13 +43,20 @@ def create_ticker(body: dict = Body(...), db: Session = Depends(get_db),
     speed = body.get("speed") or "medium"
     is_all = bool(body.get("is_all", True))
     screen_ids = body.get("screen_ids") or []
+    # Время показа в секундах: 0/пусто = бессрочно (до снятия). >0 → проставляем
+    # expires_at и передаём агенту, чтобы он сам снял строку через N секунд.
+    try:
+        duration = max(0, int(body.get("duration") or 0))
+    except (TypeError, ValueError):
+        duration = 0
 
     row = db.execute(text("""
-        INSERT INTO tickers (message, color, speed, is_all, created_by)
-        VALUES (:msg, :color, :speed, :is_all, :who)
+        INSERT INTO tickers (message, color, speed, is_all, created_by, expires_at)
+        VALUES (:msg, :color, :speed, :is_all, :who,
+                CASE WHEN :dur > 0 THEN NOW() + make_interval(secs => :dur) ELSE NULL END)
         RETURNING id
     """), {"msg": message, "color": color, "speed": speed, "is_all": is_all,
-           "who": current_admin["username"]}).fetchone()
+           "who": current_admin["username"], "dur": duration}).fetchone()
     ticker_id = row.id
 
     if is_all:
@@ -62,7 +69,8 @@ def create_ticker(body: dict = Body(...), db: Session = Depends(get_db),
             ), {"tid": ticker_id, "sid": sid})
 
     for sid in targets:
-        _send_ticker_command(db, sid, "ticker_show", {"message": message, "color": color})
+        _send_ticker_command(db, sid, "ticker_show", {
+            "message": message, "color": color, "speed": speed, "duration": duration})
 
     db.execute(text("""
         INSERT INTO audit_log (event_type, title, detail, actor)
