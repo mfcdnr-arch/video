@@ -43,6 +43,20 @@ class VLCPlayer:
             log.debug(f"mpv IPC: {e}")
             return {}
 
+    def keep_screen_awake(self, env=None):
+        """Отключить гашение экрана и DPMS, чтобы signage-экран не гас и не
+        уходил в блокировку по простою. Требует доступ к X (DISPLAY/.Xauthority) —
+        тот же, что и для запуска mpv. Ошибки не критичны (например, нет xset)."""
+        if env is None:
+            env = os.environ.copy()
+            env.setdefault('DISPLAY', ':0')
+        for args in (["xset", "s", "off"], ["xset", "s", "noblank"], ["xset", "-dpms"]):
+            try:
+                subprocess.run(args, env=env, timeout=3,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                log.debug("xset {}: {}".format(" ".join(args), e))
+
     def start_vlc(self):
         """Запустить mpv в режиме ожидания, полный экран, IPC-сокет."""
         if self._mpv_proc and self._mpv_proc.poll() is None:
@@ -62,6 +76,9 @@ class VLCPlayer:
         env = os.environ.copy()
         if 'DISPLAY' not in env:
             env['DISPLAY'] = ':0'
+
+        # Не давать экрану гаснуть/блокироваться по простою (signage).
+        self.keep_screen_awake(env)
 
         sock_path = Path(MPV_SOCKET)
         if sock_path.exists():

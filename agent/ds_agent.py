@@ -320,6 +320,7 @@ def main():
     last_cmd_poll      = 0
     last_cleanup       = 0
     last_watchdog      = 0    # systemd watchdog: как давно слали WATCHDOG=1
+    last_awake         = 0    # как давно отключали гашение экрана (xset)
     schedule           = None
     current_playing    = None    # что реально играет mpv (для heartbeat и play_log)
     current_list       = []      # плейлист, загруженный в mpv в данный момент
@@ -341,6 +342,13 @@ def main():
         if now - last_watchdog >= 10:
             _sd_notify("WATCHDOG=1")
             last_watchdog = now
+
+        # ── Держим экран включённым (signage не должен гаснуть/блокироваться) ──
+        # Периодически повторяем на случай, если рабочий стол снова включил
+        # хранитель экрана/DPMS после событий сессии.
+        if now - last_awake >= 300:
+            player.keep_screen_awake()
+            last_awake = now
 
         # ── Опрос расписания и синхронизация файлов ──
         if now - last_schedule_poll >= POLL_INTERVAL:
