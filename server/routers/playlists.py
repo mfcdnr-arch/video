@@ -41,6 +41,13 @@ def add_to_playlist(
             m.review_status, m.review_status)
         raise HTTPException(409, f"Ролик «{m.title}» {status_ru} — в плейлист можно добавлять только одобренные ролики")
 
+    # #1: один и тот же ролик нельзя добавить в плейлист дважды
+    dup = db.execute(text(
+        "SELECT 1 FROM playlist_items WHERE playlist_id = :pid AND media_id = :mid"
+    ), {"pid": playlist_id, "mid": media_id}).fetchone()
+    if dup:
+        raise HTTPException(409, f"Ролик «{m.title}» уже есть в этом плейлисте")
+
     pos = db.execute(text(
         "SELECT COALESCE(MAX(position), 0) + 1 FROM playlist_items WHERE playlist_id = :pid"
     ), {"pid": playlist_id}).scalar()
@@ -49,8 +56,19 @@ def add_to_playlist(
         "VALUES (:pid, :mid, :pos, :rc) RETURNING id"
     ), {"pid": playlist_id, "mid": media_id, "pos": pos, "rc": repeat_count})
     db.commit()
+
+    # #2: предупреждение, если ролик уже используется в других плейлистах
+    others = db.execute(text(
+        "SELECT p.name FROM playlist_items pi JOIN playlists p ON p.id = pi.playlist_id "
+        "WHERE pi.media_id = :mid AND pi.playlist_id <> :pid ORDER BY p.name"
+    ), {"mid": media_id, "pid": playlist_id}).fetchall()
+    warning = None
+    if others:
+        names = ", ".join(f"«{o.name}»" for o in others)
+        warning = f"Этот ролик уже используется в плейлисте(ах): {names}"
+
     return {"id": result.fetchone()[0], "playlist_id": playlist_id,
-            "media_id": media_id, "position": pos}
+            "media_id": media_id, "position": pos, "warning": warning}
 
 
 @router.get("/playlists/{playlist_id}/items")

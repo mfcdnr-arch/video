@@ -91,11 +91,12 @@ async function renderWeekGrid(view, list){
 
 async function setWeekSlot(dow, hour){
   if(!SCH_PLAYLISTS.length){ toast('Сначала создайте плейлист'); return; }
-  const names=SCH_PLAYLISTS.map(p=>p.id+': '+p.name).join('\n');
+  const names=SCH_PLAYLISTS.map((p,i)=>'№'+(i+1)+': '+p.name).join('\n');
   const hourLabel = hour===null?'весь день':hour+':00';
   const cur = await api('/schedule/slots?'+schTargetQS(new URLSearchParams())).catch(()=>[]);
   const existing = cur.find(s=>s.day_of_week===dow && (s.hour===null?null:s.hour)===(hour===null?null:hour));
-  const v = prompt('Плейлист на '+SCH_DOW[dow]+', '+hourLabel+':\n'+names+'\n\nВведите ID (пусто — убрать слот)', existing?existing.playlist_id:'');
+  const existingNum = existing ? (SCH_PLAYLISTS.findIndex(p=>p.id===existing.playlist_id)+1) : '';
+  const v = prompt('Плейлист на '+SCH_DOW[dow]+', '+hourLabel+':\n'+names+'\n\nВведите № (пусто — убрать слот)', existingNum||'');
   if(v===null) return;
   const q = schTargetQS(new URLSearchParams({day_of_week:dow}));
   if(hour!==null) q.append('hour',hour);
@@ -104,7 +105,9 @@ async function setWeekSlot(dow, hour){
       await api('/schedule/slot?'+q,{method:'DELETE'});
       toast('Слот убран');
     }else{
-      q.append('playlist_id', parseInt(v,10));
+      const pl=SCH_PLAYLISTS[parseInt(v,10)-1];
+      if(!pl){ toast('Нет плейлиста с таким №'); return; }
+      q.append('playlist_id', pl.id);
       await api('/schedule?'+q,{method:'POST'});
       toast('Слот задан');
     }
@@ -218,12 +221,13 @@ function initScheduleViewActions(){
 async function setOverride(day){
   if(!SCH_PLAYLISTS.length){ try{ SCH_PLAYLISTS=await api('/playlists'); }catch(e){} }
   if(!SCH_PLAYLISTS.length){ toast('Сначала создайте плейлист'); return; }
-  const names=SCH_PLAYLISTS.map(p=>p.id+': '+p.name).join('\n');
-  const pid=prompt('Плейлист на '+day+'.'+SCH_MONTH.split('-')[1]+' — введите ID:\n'+names+'\n(пусто = выключить показ)');
-  if(pid===null) return;
+  const names=SCH_PLAYLISTS.map((p,i)=>'№'+(i+1)+': '+p.name).join('\n');
+  const num=prompt('Плейлист на '+day+'.'+SCH_MONTH.split('-')[1]+' — введите №:\n'+names+'\n(пусто = выключить показ)');
+  if(num===null) return;
   const date=SCH_MONTH+'-'+String(day).padStart(2,'0');
   const q=new URLSearchParams({on_date:date}); q.append(SCH_TGT==='screen'?'screen_id':'group_id',SCH_TARGET_ID);
-  if(pid==='') q.append('is_off','true'); else q.append('playlist_id',pid);
+  if(num.trim()===''){ q.append('is_off','true'); }
+  else { const pl=SCH_PLAYLISTS[parseInt(num,10)-1]; if(!pl){ toast('Нет плейлиста с таким №'); return; } q.append('playlist_id',pl.id); }
   try{ await api('/schedule/overrides?'+q,{method:'POST'}); toast('Переопределение задано'); viewSchedule(); }
   catch(e){ toast('Ошибка: '+e.message); }
 }

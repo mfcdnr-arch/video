@@ -66,13 +66,14 @@ async function viewPlaylists(){
       return;
     }
 
-    let h = '<div class="muted" style="font-size:12px;margin-bottom:11px;">Плейлист — набор роликов, воспроизводимых по порядку. Назначается экрану через Расписание.</div>';
+    let h = '<div class="muted" style="font-size:12px;margin-bottom:11px;">Плейлист — набор роликов, воспроизводимых по порядку. Назначается экрану через Расписание. «№» — порядковый номер (тот же номер используется при выборе плейлиста в Расписании).</div>';
 
-    pls.forEach(p => {
+    pls.forEach((p, i) => {
       h += `<div class="cell" style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:7px;"
         data-action="playlists-open"
         data-playlist-id="${p.id}"
         data-playlist-name="${esc(p.name)}">
+        <span style="min-width:30px;text-align:center;font-size:12px;font-weight:600;color:var(--muted);">№${i + 1}</span>
         <span style="font-size:18px;color:var(--accent);">▶</span>
         <span style="font-weight:500;flex:1;">${esc(p.name)}</span>
         ${canWrite() ? `<button class="btn danger" style="padding:4px 10px;font-size:12px;"
@@ -181,8 +182,8 @@ async function addToPlaylist(pid){
   }
 
   try{
-    await api(`/playlists/${pid}/items?media_id=${mid}&repeat_count=${rc}`, { method:'POST' });
-    toast('Ролик добавлен');
+    const res = await api(`/playlists/${pid}/items?media_id=${mid}&repeat_count=${rc}`, { method:'POST' });
+    toast(res && res.warning ? ('Добавлен. ⚠ ' + res.warning) : 'Ролик добавлен');
     openPlaylist(pid, CUR_PL?.name || '');
   }catch(e){
     toast('Ошибка: ' + e.message);

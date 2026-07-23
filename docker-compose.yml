@@ -32,6 +32,7 @@ services:
       - ./server/migrations/022_campaigns.sql:/docker-entrypoint-initdb.d/22_campaigns.sql:ro
       - ./server/migrations/023_notifications.sql:/docker-entrypoint-initdb.d/23_notifications.sql:ro
       - ./server/migrations/024_force_password_change.sql:/docker-entrypoint-initdb.d/24_force_password_change.sql:ro
+      - ./server/migrations/025_playlist_unique_media.sql:/docker-entrypoint-initdb.d/25_playlist_unique_media.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
