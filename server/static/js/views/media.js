@@ -85,6 +85,9 @@ function initMediaViewActions(){
         return delMedia(fileId, fileName);
       }
 
+      case 'media-bulk-delete':
+        return bulkDeleteMedia();
+
       case 'media-create-adv-in-form':
         return createAdvInForm();
 
@@ -104,6 +107,14 @@ function initMediaViewActions(){
     }
     if(action === 'media-upload-cat-change'){
       return applyAdCategoryRules();
+    }
+    if(action === 'media-select-all'){
+      const on = el.checked;
+      document.querySelectorAll('.media-sel-chk').forEach(c => { c.checked = on; });
+      return mediaUpdateSelBar();
+    }
+    if(action === 'media-toggle-sel'){
+      return mediaUpdateSelBar();
     }
   });
 
@@ -261,6 +272,15 @@ async function openAdv(id, name){
 
     if(!files.length){ h += '<div class="empty">В этой медиатеке пока нет файлов</div>'; view.innerHTML = h; return; }
 
+    if(canWrite()){
+      h += `<div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;">
+        <label style="font-size:12px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+          <input type="checkbox" id="media-sel-all" data-action="media-select-all" style="width:16px;height:16px;cursor:pointer;"> Выбрать все</label>
+        <button class="btn danger" id="media-bulk-del" data-action="media-bulk-delete" disabled
+          style="padding:4px 10px;font-size:12px;opacity:.5;">🗑 Удалить выбранные</button>
+      </div>`;
+    }
+
     h += '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr));">';
     files.forEach(f => {
       h += `<div class="cell" style="padding:0;overflow:hidden;">
@@ -275,7 +295,8 @@ async function openAdv(id, name){
         <div style="padding:9px 10px;">
           <div style="font-size:12px;font-weight:500;word-break:break-all;">${esc(f.title||f.filename)}</div>
           <div style="font-size:11px;color:var(--muted);margin:2px 0 7px;">${fmtSize(f.filesize)}${f.duration_seconds?' · '+Math.round(f.duration_seconds)+' c':''}</div>
-          <div style="display:flex;gap:5px;border-top:0.5px solid var(--border2);padding-top:7px;">
+          <div style="display:flex;gap:5px;align-items:center;border-top:0.5px solid var(--border2);padding-top:7px;">
+            ${canWrite()?`<label class="iconbtn" title="Выбрать" style="cursor:pointer;padding:0 3px;display:inline-flex;align-items:center;"><input type="checkbox" class="media-sel-chk" data-action="media-toggle-sel" data-file-id="${f.id}" style="width:15px;height:15px;cursor:pointer;"></label>`:''}
             <button class="iconbtn" title="Скачать" data-action="media-download" data-file-id="${f.id}">⤓</button>
             ${/\.(png|jpe?g|bmp|webp|gif)$/i.test(f.filename||'')?`<button class="iconbtn" title="Длительность показа баннера" data-action="media-banner-duration" data-file-id="${f.id}" data-seconds="${Math.round(f.duration_seconds||10)}">⏱</button>`:''}
             <button class="iconbtn" title="${f.is_filler?'Снять пометку заглушки':'Пометить как заглушку'}" data-action="media-toggle-filler" data-file-id="${f.id}" data-is-filler="${f.is_filler?'true':'false'}">${f.is_filler?'🟢':'⬚'}</button>
@@ -477,6 +498,36 @@ async function delMedia(id, name){
     await api('/media/' + id, {method:'DELETE'});
     toast('Удалено'); MEDIA_ADV?openAdv(MEDIA_ADV.id, MEDIA_ADV.name):viewMedia();
   }catch(e){ toast('Ошибка: ' + e.message); }
+}
+
+// Множественный выбор в медиатеке: обновить панель по состоянию чекбоксов
+function mediaUpdateSelBar(){
+  const chks = [...document.querySelectorAll('.media-sel-chk')];
+  const selected = chks.filter(c => c.checked).length;
+  const btn = document.getElementById('media-bulk-del');
+  if(btn){
+    btn.disabled = selected === 0;
+    btn.style.opacity = selected === 0 ? '.5' : '1';
+    btn.textContent = '🗑 Удалить выбранные' + (selected ? ' (' + selected + ')' : '');
+  }
+  const all = document.getElementById('media-sel-all');
+  if(all){
+    all.checked = chks.length > 0 && selected === chks.length;
+    all.indeterminate = selected > 0 && selected < chks.length;
+  }
+}
+
+async function bulkDeleteMedia(){
+  const ids = [...document.querySelectorAll('.media-sel-chk:checked')].map(c => Number(c.dataset.fileId));
+  if(!ids.length){ toast('Ничего не выбрано'); return; }
+  if(!confirm('Удалить выбранные файлы (' + ids.length + ' шт.)? Действие необратимо.')) return;
+  let ok = 0, fail = 0;
+  for(const id of ids){
+    try{ await api('/media/' + id, {method:'DELETE'}); ok++; }
+    catch(e){ fail++; }
+  }
+  toast('Удалено: ' + ok + (fail ? (', ошибок: ' + fail) : ''));
+  MEDIA_ADV ? openAdv(MEDIA_ADV.id, MEDIA_ADV.name) : viewMedia();
 }
 
 function fmtSize(b){ if(!b) return '—'; const mb = b/1048576; return mb>1024?(mb/1024).toFixed(1)+' ГБ':mb.toFixed(0)+' МБ'; }
