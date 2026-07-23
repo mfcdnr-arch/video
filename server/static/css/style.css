@@ -59,7 +59,7 @@
   .cell{background:var(--panel);border:0.5px solid var(--border2);border-radius:10px;padding:11px 13px;}
   .sec{font-size:13px;font-weight:500;margin:18px 0 9px;}
   /* выделенные заголовки разделов в отчётах — чтобы не сливались с данными */
-  .rhead{font-size:14px;font-weight:600;color:#0e1014;background:var(--accent);border-radius:7px;padding:7px 12px;margin:20px 0 10px;display:inline-block;}
+  .rhead{font-size:14px;font-weight:600;color:#0e1014;background:var(--accent);border-radius:7px;padding:7px 12px;margin:20px 0 10px;display:block;width:fit-content;max-width:100%;}
   .muted{color:var(--muted);}
   .dim{color:var(--dim);}
   .chip{display:inline-flex;align-items:center;gap:5px;background:#262b34;border:0.5px solid #454b57;border-radius:6px;padding:3px 8px;font-size:11px;color:var(--txt2);margin:2px 4px 0 0;}
