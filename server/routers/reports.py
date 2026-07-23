@@ -266,6 +266,7 @@ BUILDER_PERIODS = [
 BUILDER_FILTERS = [
     {"key": "none", "label": "Без фильтра"},
     {"key": "advertiser", "label": "Рекламодатель"},
+    {"key": "media", "label": "Ролик"},
     {"key": "screen", "label": "Экран"},
     {"key": "city", "label": "Город"},
 ]
@@ -297,6 +298,7 @@ _BUILDER_METRIC_LABELS = {m["key"]: m["label"] for m in BUILDER_METRICS}
 _BUILDER_DIMENSION_LABELS = {d["key"]: d["label"] for d in BUILDER_DIMENSIONS}
 _BUILDER_FILTER_SQL = {
     "advertiser": "a.name = :fval",
+    "media": "COALESCE(m.title, pl.filename) = :fval",
     "screen": "s.name = :fval",
     "city": "s.city = :fval",
 }
@@ -306,11 +308,17 @@ _BUILDER_FILTER_SQL = {
 def builder_options(admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
     advertisers = [r[0] for r in db.execute(text("SELECT name FROM advertisers ORDER BY name")).fetchall()]
     screens = [r[0] for r in db.execute(text("SELECT name FROM screens ORDER BY name")).fetchall()]
+    media = [r[0] for r in db.execute(text("""
+        SELECT DISTINCT COALESCE(m.title, pl.filename) AS v
+        FROM play_log pl LEFT JOIN media m ON m.id = pl.media_id
+        WHERE COALESCE(m.title, pl.filename) IS NOT NULL
+        ORDER BY v
+    """)).fetchall()]
     return {
         "metrics": BUILDER_METRICS, "dimensions": BUILDER_DIMENSIONS,
         "periods": BUILDER_PERIODS, "filters": BUILDER_FILTERS,
         "sorts": BUILDER_SORTS, "limits": BUILDER_LIMITS,
-        "advertisers": advertisers, "screens": screens,
+        "advertisers": advertisers, "screens": screens, "media": media,
     }
 
 
@@ -323,14 +331,26 @@ def _builder_run_data(body: dict, db: Session):
         raise HTTPException(status_code=400, detail="Недопустимый разрез")
 
     days = int(body.get("days") or 7)
+    date_from = body.get("date_from")
+    date_to = body.get("date_to")
     filter_key = body.get("filter") or "none"
     filter_value = body.get("filter_value")
     sort_by = "val" if body.get("sort_by") != "label" else "label"
     sort_dir = "ASC" if body.get("sort_dir") == "asc" else "DESC"
     limit = int(body.get("limit") or 0)
 
-    where = ["pl.started_at > NOW() - (INTERVAL '1 day' * :days)"]
-    params = {"days": days}
+    # Диапазон дат имеет приоритет над периодом-пресетом (days)
+    if date_from or date_to:
+        where, params = [], {}
+        if date_from:
+            where.append("pl.started_at >= CAST(:d_from AS date)")
+            params["d_from"] = date_from
+        if date_to:
+            where.append("pl.started_at < (CAST(:d_to AS date) + 1)")
+            params["d_to"] = date_to
+    else:
+        where = ["pl.started_at > NOW() - (INTERVAL '1 day' * :days)"]
+        params = {"days": days}
     if filter_key in _BUILDER_FILTER_SQL and filter_value:
         where.append(_BUILDER_FILTER_SQL[filter_key])
         params["fval"] = filter_value
@@ -400,35 +420,41 @@ def builder_delete_saved(report_id: int, admin: dict = Depends(get_current_admin
     return {"status": "deleted"}
 
 
-def _data_playtime(db: Session, days: int = 7):
-    total = db.execute(text("""
+def _data_playtime(db: Session, days: int = 7, advertiser: Optional[str] = None):
+    p = {"days": days}
+    adv_join, adv_where = "", ""
+    if advertiser:
+        p["adv"] = advertiser
+        adv_where = " AND a.name = :adv"
+        adv_join = "JOIN media m ON m.id = pl.media_id JOIN advertisers a ON a.id = m.advertiser_id"
+    total = db.execute(text(f"""
         SELECT COUNT(*) as plays,
                COALESCE(SUM(EXTRACT(EPOCH FROM (pl.ended_at - pl.started_at))), 0) as seconds
-        FROM play_log pl
-        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days)
-    """), {"days": days}).fetchone()
+        FROM play_log pl {adv_join}
+        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days){adv_where}
+    """), p).fetchone()
 
-    by_media = db.execute(text("""
+    by_media = db.execute(text(f"""
         SELECT m.title, m.filename, a.name AS advertiser, COUNT(*) as plays,
                COALESCE(SUM(EXTRACT(EPOCH FROM (pl.ended_at - pl.started_at))), 0) as seconds
         FROM play_log pl
         JOIN media m ON m.id = pl.media_id
         LEFT JOIN advertisers a ON a.id = m.advertiser_id
-        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days)
+        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days){adv_where}
         GROUP BY m.id, m.title, m.filename, a.name
         ORDER BY plays DESC
-    """), {"days": days}).fetchall()
+    """), p).fetchall()
 
-    by_advertiser = db.execute(text("""
+    by_advertiser = db.execute(text(f"""
         SELECT a.name AS advertiser, COUNT(*) as plays,
                COALESCE(SUM(EXTRACT(EPOCH FROM (pl.ended_at - pl.started_at))), 0) as seconds
         FROM play_log pl
         JOIN media m ON m.id = pl.media_id
         JOIN advertisers a ON a.id = m.advertiser_id
-        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days)
+        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days){adv_where}
         GROUP BY a.id, a.name
         ORDER BY seconds DESC
-    """), {"days": days}).fetchall()
+    """), p).fetchall()
 
     return {
         "total": dict(total._mapping) if total else {"plays": 0, "seconds": 0},
@@ -438,43 +464,53 @@ def _data_playtime(db: Session, days: int = 7):
 
 
 @router.get("/reports/playtime")
-def report_playtime(days: int = Query(7), admin: dict = Depends(get_current_admin),
-                     db: Session = Depends(get_db)):
-    return _data_playtime(db, days)
+def report_playtime(days: int = Query(7), advertiser: Optional[str] = Query(None),
+                     admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    return _data_playtime(db, days, advertiser)
 
 
-def _data_by_screen_advertiser(db: Session, days: int = 7):
-    rows = db.execute(text("""
+def _data_by_screen_advertiser(db: Session, days: int = 7, advertiser: Optional[str] = None):
+    p = {"days": days}
+    adv_where = ""
+    if advertiser:
+        p["adv"] = advertiser
+        adv_where = " AND a.name = :adv"
+    rows = db.execute(text(f"""
         SELECT s.name AS screen, a.name AS advertiser, m.title, COUNT(*) as plays
         FROM play_log pl
         JOIN screens s ON s.id = pl.screen_id
         JOIN media m ON m.id = pl.media_id
         LEFT JOIN advertisers a ON a.id = m.advertiser_id
-        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days)
+        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days){adv_where}
         GROUP BY s.name, a.name, m.title
         ORDER BY plays DESC
-    """), {"days": days}).fetchall()
+    """), p).fetchall()
     return [dict(r._mapping) for r in rows]
 
 
 @router.get("/reports/by-screen-advertiser")
-def report_by_screen_advertiser(days: int = Query(7), admin: dict = Depends(get_current_admin),
-                                 db: Session = Depends(get_db)):
-    return _data_by_screen_advertiser(db, days)
+def report_by_screen_advertiser(days: int = Query(7), advertiser: Optional[str] = Query(None),
+                                 admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    return _data_by_screen_advertiser(db, days, advertiser)
 
 
-def _data_earnings(db: Session, days: int = 30):
-    rows = db.execute(text("""
+def _data_earnings(db: Session, days: int = 30, advertiser: Optional[str] = None):
+    p = {"days": days}
+    adv_where = ""
+    if advertiser:
+        p["adv"] = advertiser
+        adv_where = " AND a.name = :adv"
+    rows = db.execute(text(f"""
         SELECT a.name AS advertiser, COUNT(*) as plays,
                COALESCE(SUM(EXTRACT(EPOCH FROM (pl.ended_at - pl.started_at))), 0) / 60.0 as minutes,
                a.price_per_minute
         FROM play_log pl
         JOIN media m ON m.id = pl.media_id
         JOIN advertisers a ON a.id = m.advertiser_id
-        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days)
+        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days){adv_where}
         GROUP BY a.id, a.name, a.price_per_minute
         ORDER BY minutes DESC
-    """), {"days": days}).fetchall()
+    """), p).fetchall()
 
     by_advertiser = []
     total_earnings = 0.0
@@ -492,13 +528,45 @@ def _data_earnings(db: Session, days: int = 30):
 
 
 @router.get("/reports/earnings")
-def report_earnings(days: int = Query(30), admin: dict = Depends(get_current_admin),
-                     db: Session = Depends(get_db)):
-    return _data_earnings(db, days)
+def report_earnings(days: int = Query(30), advertiser: Optional[str] = Query(None),
+                     admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    return _data_earnings(db, days, advertiser)
 
 
-def _data_playlog(db: Session, days: int = 7, advertiser: Optional[str] = None, limit: int = 500):
-    rows = db.execute(text("""
+def _playlog_where(days=7, date_from=None, date_to=None, advertiser=None,
+                   media_id=None, screen=None):
+    """Собрать WHERE и параметры для журнала показов из белого списка фильтров.
+    Если задан диапазон дат (date_from/date_to) — используется он; иначе — период
+    в днях (days). Все значения передаются как bind-параметры (без вставки в SQL)."""
+    where, params = [], {}
+    if date_from or date_to:
+        if date_from:
+            where.append("pl.started_at >= CAST(:d_from AS date)")
+            params["d_from"] = date_from
+        if date_to:
+            where.append("pl.started_at < (CAST(:d_to AS date) + 1)")
+            params["d_to"] = date_to
+    else:
+        where.append("pl.started_at > NOW() - (INTERVAL '1 day' * :days)")
+        params["days"] = int(days or 7)
+    if advertiser:
+        where.append("a.name = :advertiser")
+        params["advertiser"] = advertiser
+    if media_id:
+        where.append("pl.media_id = :media_id")
+        params["media_id"] = int(media_id)
+    if screen:
+        where.append("s.name = :screen")
+        params["screen"] = screen
+    return " AND ".join(where), params
+
+
+def _data_playlog(db: Session, days: int = 7, advertiser: Optional[str] = None, limit: int = 500,
+                  date_from: Optional[str] = None, date_to: Optional[str] = None,
+                  media_id: Optional[int] = None, screen: Optional[str] = None):
+    where, params = _playlog_where(days, date_from, date_to, advertiser, media_id, screen)
+    params["limit"] = limit
+    rows = db.execute(text(f"""
         SELECT to_char(pl.started_at, 'YYYY-MM-DD') as day,
                to_char(pl.started_at, 'HH24:MI:SS') as time,
                s.name AS screen, COALESCE(m.title, pl.filename) AS media, a.name AS advertiser
@@ -506,23 +574,26 @@ def _data_playlog(db: Session, days: int = 7, advertiser: Optional[str] = None, 
         JOIN screens s ON s.id = pl.screen_id
         LEFT JOIN media m ON m.id = pl.media_id
         LEFT JOIN advertisers a ON a.id = m.advertiser_id
-        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days)
-          AND (:advertiser IS NULL OR a.name = :advertiser)
+        WHERE {where}
         ORDER BY pl.started_at DESC
         LIMIT :limit
-    """), {"days": days, "advertiser": advertiser or None, "limit": limit}).fetchall()
+    """), params).fetchall()
     return [dict(r._mapping) for r in rows]
 
 
 @router.get("/playlog")
 def get_playlog(days: int = Query(7), advertiser: Optional[str] = Query(None),
-                 limit: int = Query(500), admin: dict = Depends(get_current_admin),
-                 db: Session = Depends(get_db)):
-    return _data_playlog(db, days, advertiser, limit)
+                 limit: int = Query(500), date_from: Optional[str] = Query(None),
+                 date_to: Optional[str] = Query(None), media_id: Optional[int] = Query(None),
+                 screen: Optional[str] = Query(None),
+                 admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    return _data_playlog(db, days, advertiser, limit, date_from, date_to, media_id, screen)
 
 
-def _data_playlog_by_advertiser(db: Session, days: int = 7):
-    rows = db.execute(text("""
+def _data_playlog_by_advertiser(db: Session, days: int = 7, date_from=None, date_to=None,
+                                media_id=None, screen=None):
+    where, params = _playlog_where(days, date_from, date_to, None, media_id, screen)
+    rows = db.execute(text(f"""
         SELECT a.name AS advertiser, COUNT(*) as plays,
                COUNT(DISTINCT DATE(pl.started_at)) as days,
                COUNT(DISTINCT pl.screen_id) as screens,
@@ -531,17 +602,20 @@ def _data_playlog_by_advertiser(db: Session, days: int = 7):
         FROM play_log pl
         JOIN media m ON m.id = pl.media_id
         JOIN advertisers a ON a.id = m.advertiser_id
-        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days)
+        JOIN screens s ON s.id = pl.screen_id
+        WHERE {where}
         GROUP BY a.id, a.name
         ORDER BY plays DESC
-    """), {"days": days}).fetchall()
+    """), params).fetchall()
     return [dict(r._mapping) for r in rows]
 
 
 @router.get("/playlog/by-advertiser")
-def get_playlog_by_advertiser(days: int = Query(7), admin: dict = Depends(get_current_admin),
-                               db: Session = Depends(get_db)):
-    return _data_playlog_by_advertiser(db, days)
+def get_playlog_by_advertiser(days: int = Query(7), date_from: Optional[str] = Query(None),
+                               date_to: Optional[str] = Query(None), media_id: Optional[int] = Query(None),
+                               screen: Optional[str] = Query(None),
+                               admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    return _data_playlog_by_advertiser(db, days, date_from, date_to, media_id, screen)
 
 
 # ─── Экспорт отчётов в Excel/PDF ─────────────────────────────────────────────
@@ -856,8 +930,10 @@ def export_reports_pdf(days: int = Query(7), sections: str = Query(""),
 
 @router.get("/playlog/export.xlsx")
 def export_playlog_xlsx(days: int = Query(7), advertiser: Optional[str] = Query(None),
+                         date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None),
+                         media_id: Optional[int] = Query(None), screen: Optional[str] = Query(None),
                          admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    rows = _data_playlog(db, days, advertiser, limit=5000)
+    rows = _data_playlog(db, days, advertiser, 5000, date_from, date_to, media_id, screen)
     columns = ["Дата", "Время", "Экран", "Ролик", "Рекламодатель"]
     data_rows = [[r["day"], r["time"], r["screen"], r["media"], r["advertiser"]] for r in rows]
     buf = _build_xlsx([("Журнал показов", columns, data_rows)])
@@ -867,8 +943,10 @@ def export_playlog_xlsx(days: int = Query(7), advertiser: Optional[str] = Query(
 
 @router.get("/playlog/export.pdf")
 def export_playlog_pdf(days: int = Query(7), advertiser: Optional[str] = Query(None),
+                        date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None),
+                        media_id: Optional[int] = Query(None), screen: Optional[str] = Query(None),
                         admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    rows = _data_playlog(db, days, advertiser, limit=2000)
+    rows = _data_playlog(db, days, advertiser, 2000, date_from, date_to, media_id, screen)
     columns = ["Дата", "Время", "Экран", "Ролик", "Рекламодатель"]
     data_rows = [[r["day"], r["time"], r["screen"], r["media"], r["advertiser"]] for r in rows]
     buf = _build_pdf([("Журнал показов", columns, data_rows)], doc_title="Журнал показов")

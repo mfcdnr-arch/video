@@ -40,6 +40,14 @@ function initReportsViewActions(){
       case 'reports-load-playlog':
         return loadPlaylog();
 
+      case 'reports-dash-apply':
+        DASH_DAYS=(document.getElementById('dash-days')||{}).value||'7';
+        DASH_ADV=(document.getElementById('dash-adv')||{}).value||'';
+        return viewReports();
+
+      case 'reports-toggle-section':
+        return toggleReportSection(el);
+
       case 'reports-export-fas':
         return exportFasReport();
 
@@ -90,26 +98,41 @@ async function viewReports(){
   document.getElementById('topright').innerHTML=`<button class="btn" data-action="reports-open-playlog">📋 Журнал показов</button><button class="btn" data-action="reports-open-builder">⚒ Конструктор</button><button class="btn" title="Отчёт о соответствии закону о рекламе (38-ФЗ): декларации, решения модерации, показы" data-action="reports-export-fas">⚖ Для ФАС</button><button class="btn" data-action="reports-open-export">↓ Экспорт отчётов</button>`;
   view.innerHTML='<div class="empty">Загрузка отчётов…</div>';
   try{
+    if(!DASH_ADVS){ try{ const a=await api('/advertisers'); DASH_ADVS=a.map(x=>x.name); }catch(e){ DASH_ADVS=[]; } }
+    const advQ=DASH_ADV?('&advertiser='+encodeURIComponent(DASH_ADV)):'';
+    const perLabel={'1':'сегодня','7':'7 дней','30':'30 дней','90':'90 дней'}[DASH_DAYS]||(DASH_DAYS+' дн.');
     const [sum,offline,playtime,byScr,lowDisk,downtime,broken] = await Promise.all([
       api('/reports/summary').catch(()=>({})),
       api('/reports/offline-screens').catch(()=>({count:0,screens:[]})),
-      api('/reports/playtime?days=7').catch(()=>({total:{},by_media:[],by_advertiser:[]})),
-      api('/reports/by-screen-advertiser?days=7').catch(()=>[]),
+      api('/reports/playtime?days='+DASH_DAYS+advQ).catch(()=>({total:{},by_media:[],by_advertiser:[]})),
+      api('/reports/by-screen-advertiser?days='+DASH_DAYS+advQ).catch(()=>[]),
       api('/reports/low-disk?threshold_pct=15').catch(()=>[]),
       api('/reports/downtime?hours_full=8').catch(()=>[]),
       api('/reports/broken-media').catch(()=>[]),
     ]);
-    let h='<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));">';
+    // Панель фильтров дашборда
+    let h=`<div class="row" style="flex-wrap:wrap;align-items:end;margin-bottom:12px;">
+      <div class="fld" style="min-width:140px;"><label>Период</label><select class="inp" id="dash-days">
+        <option value="1"${DASH_DAYS==='1'?' selected':''}>Сегодня</option>
+        <option value="7"${DASH_DAYS==='7'?' selected':''}>7 дней</option>
+        <option value="30"${DASH_DAYS==='30'?' selected':''}>30 дней</option>
+        <option value="90"${DASH_DAYS==='90'?' selected':''}>90 дней</option></select></div>
+      <div class="fld" style="min-width:200px;"><label>Рекламодатель</label><select class="inp" id="dash-adv">
+        <option value="">Все</option>${(DASH_ADVS||[]).map(a=>`<option${a===DASH_ADV?' selected':''}>${esc(a)}</option>`).join('')}</select></div>
+      <div class="fld" style="flex:0;"><button class="btn primary" data-action="reports-dash-apply">Применить</button></div>
+      <div class="muted" style="font-size:11px;align-self:center;">Влияет на «время показа», «заработок», «показы по экранам».</div>
+    </div>`;
+    h+='<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));">';
     h+=kpi('Всего экранов', sum.total_screens??'—','');
     h+=kpi('Не работают', offline.count??0, offline.count?'см. список ниже':'все онлайн','var(--danger)');
-    h+=kpi('Общее время показа', fmtDur(playtime.total&&playtime.total.seconds), (playtime.total&&playtime.total.plays||0)+' показов за 7 дней');
+    h+=kpi('Общее время показа', fmtDur(playtime.total&&playtime.total.seconds), (playtime.total&&playtime.total.plays||0)+' показов за '+perLabel);
     h+=kpi('Нерабочих роликов', broken.length, broken.length?'требуют замены':'нет','var(--danger)');
     h+='</div>';
 
     // Занятость инвентаря (недельный шаблон)
     let inv=null; try{ inv=await api('/reports/inventory'); }catch(e){}
     if(inv && inv.screens_total){
-      h+='<div class="rhead">Занятость инвентаря — недельный шаблон (сеть: '+inv.network_fill_pct+'% продано)</div>';
+      h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Занятость инвентаря — недельный шаблон (сеть: '+inv.network_fill_pct+'% продано)</div>';
       inv.by_screen.forEach(s=>{
         const p=s.fill_pct||0;
         const col=p>=70?'var(--accent)':(p>=30?'#ffd34d':'var(--danger)');
@@ -123,49 +146,49 @@ async function viewReports(){
     }
 
     // Неработающие экраны
-    h+='<div class="rhead">Неработающие экраны ('+(offline.count||0)+')</div>';
+    h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Неработающие экраны ('+(offline.count||0)+')</div>';
     if(!offline.count){ h+='<div class="muted" style="font-size:12px;">Все экраны онлайн.</div>'; }
     else { h+='<table><tr><th>Экран</th><th>Город</th><th>Последний раз на связи</th></tr>';
       offline.screens.forEach(s=>{ h+=`<tr><td>${esc(s.name)}</td><td class="muted">${esc(s.city||'')}</td><td class="muted">${s.last_seen?new Date(s.last_seen).toLocaleString('ru-RU'):'—'}</td></tr>`; });
       h+='</table>'; }
 
     // Простой экранов (%)
-    h+='<div class="rhead">Простой экранов (8 часов = 100%)</div>';
+    h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Простой экранов (8 часов = 100%)</div>';
     if(!downtime.length){ h+='<div class="muted" style="font-size:12px;">Нет простаивающих экранов.</div>'; }
     else { downtime.forEach(s=>{ const p=s.downtime_pct||0;
       h+=`<div style="display:flex;align-items:center;gap:10px;margin-bottom:7px;"><span style="width:150px;font-size:12px;">${esc(s.name)}</span><span style="flex:1;height:12px;background:var(--panel);border-radius:6px;overflow:hidden;"><span style="display:block;height:100%;width:${p}%;background:var(--danger);"></span></span><span class="muted" style="font-size:11px;width:60px;text-align:right;">${p}%</span></div>`; }); }
 
     // ПК с памятью < 15%
-    h+='<div class="rhead">ПК со свободной памятью < 15%</div>';
+    h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>ПК со свободной памятью < 15%</div>';
     if(!lowDisk.length){ h+='<div class="muted" style="font-size:12px;">Нет ПК с критично малой памятью.</div>'; }
     else { h+='<table><tr><th>Экран</th><th>Свободно</th><th>Всего</th><th>Свободно %</th></tr>';
       lowDisk.forEach(s=>{ h+=`<tr><td>${esc(s.name)}</td><td>${s.disk_free_gb!=null?Number(s.disk_free_gb).toFixed(0)+' ГБ':'—'}</td><td class="muted">${s.disk_total_gb!=null?Number(s.disk_total_gb).toFixed(0)+' ГБ':'—'}</td><td class="danger" style="color:var(--danger);">${s.free_pct!=null?s.free_pct+'%':'—'}</td></tr>`; });
       h+='</table>'; }
 
     // Нерабочие ролики
-    h+='<div class="rhead">Нерабочие ролики</div>';
+    h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Нерабочие ролики</div>';
     if(!broken.length){ h+='<div class="muted" style="font-size:12px;">Нерабочих роликов нет.</div>'; }
     else { h+='<table><tr><th>Ролик</th><th>Рекламодатель</th><th>Ошибок</th><th>Последняя ошибка</th></tr>';
       broken.forEach(b=>{ h+=`<tr><td>${esc(b.title||b.filename)}</td><td class="muted">${esc(b.advertiser||'—')}</td><td>${b.error_count||1}</td><td class="muted" style="font-size:11px;">${esc(b.last_error||'')}</td></tr>`; });
       h+='</table>'; }
 
     // Время показа по роликам
-    h+='<div class="rhead">Время показа и повторы — по роликам</div>';
+    h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Время показа и повторы — по роликам</div>';
     if(!playtime.by_media||!playtime.by_media.length){ h+='<div class="muted" style="font-size:12px;">Нет данных о показах за период.</div>'; }
     else { h+='<table><tr><th>Ролик</th><th>Рекламодатель</th><th>Повторов</th><th>Время показа</th></tr>';
       playtime.by_media.forEach(m=>{ h+=`<tr><td>${esc(m.title||m.filename)}</td><td class="muted">${esc(m.advertiser||'—')}</td><td>${m.plays}</td><td>${fmtDur(m.seconds)}</td></tr>`; });
       h+='</table>'; }
 
     // По рекламодателям
-    h+='<div class="rhead">Время показа и повторы — по рекламодателям</div>';
+    h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Время показа и повторы — по рекламодателям</div>';
     if(!playtime.by_advertiser||!playtime.by_advertiser.length){ h+='<div class="muted" style="font-size:12px;">Нет данных.</div>'; }
     else { h+='<table><tr><th>Рекламодатель</th><th>Повторов</th><th>Время показа</th></tr>';
       playtime.by_advertiser.forEach(a=>{ h+=`<tr><td>${esc(a.advertiser)}</td><td>${a.plays}</td><td>${fmtDur(a.seconds)}</td></tr>`; });
       h+='</table>'; }
 
     // Заработок по рекламодателям
-    h+='<div class="rhead">Заработок по рекламодателям</div>';
-    let earn=null; try{ earn=await api('/reports/earnings?days=30'); }catch(e){}
+    h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Заработок по рекламодателям</div>';
+    let earn=null; try{ earn=await api('/reports/earnings?days=30'+advQ); }catch(e){}
     if(!earn||!earn.by_advertiser||!earn.by_advertiser.length){ h+='<div class="muted" style="font-size:12px;">Нет данных.</div>'; }
     else {
       h+='<div class="muted" style="font-size:11px;margin-bottom:6px;">Расчётная оценка по прокрутам за 30 дней: показы × длительность ролика × цена за минуту. Цена задаётся в Медиатеке у рекламодателя.</div>';
@@ -175,14 +198,14 @@ async function viewReports(){
       h+='</table>'; }
 
     // Кто где сколько раз
-    h+='<div class="rhead">Показы: ролик · рекламодатель · экран · количество</div>';
+    h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Показы: ролик · рекламодатель · экран · количество</div>';
     if(!byScr.length){ h+='<div class="muted" style="font-size:12px;">Нет данных.</div>'; }
     else { h+='<table><tr><th>Экран</th><th>Рекламодатель</th><th>Ролик</th><th>Повторов</th></tr>';
       byScr.forEach(r=>{ h+=`<tr><td>${esc(r.screen||'—')}</td><td class="muted">${esc(r.advertiser||'—')}</td><td>${esc(r.title||'')}</td><td>${r.plays}</td></tr>`; });
       h+='</table>'; }
 
     // Сессии пользователей
-    h+='<div class="rhead">Входы пользователей в панель</div>';
+    h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Входы пользователей в панель</div>';
     let sessions=[]; try{ sessions=await api('/reports/sessions?days=30'); }catch(e){}
     if(!sessions.length){ h+='<div class="muted" style="font-size:12px;">Нет данных о входах.</div>'; }
     else { h+='<table><tr><th>Пользователь</th><th>Роль</th><th>Вход</th><th>Длительность</th></tr>';
@@ -190,7 +213,7 @@ async function viewReports(){
       h+='</table>'; }
 
     // Сроки действия роликов
-    h+='<div class="rhead">Сроки действия роликов</div>';
+    h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Сроки действия роликов</div>';
     let validity=[]; try{ validity=await api('/reports/validity'); }catch(e){}
     if(!validity.length){ h+='<div class="muted" style="font-size:12px;">Нет роликов.</div>'; }
     else { h+='<table><tr><th>Ролик</th><th>Рекламодатель</th><th>Показывать с</th><th>Показывать по</th><th>Статус</th></tr>';
@@ -200,7 +223,7 @@ async function viewReports(){
       h+='</table>'; }
 
     // Потери связи с ПК
-    h+='<div class="rhead">Потери связи с мини ПК</div>';
+    h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Потери связи с мини ПК</div>';
     let losses=[]; try{ losses=await api('/reports/connection-losses?days=30'); }catch(e){}
     if(!losses.length){ h+='<div class="muted" style="font-size:12px;">За период потерь связи не зафиксировано.</div>'; }
     else { h+='<table><tr><th>Мини ПК</th><th>Связь пропала</th><th>Восстановлена</th><th>Длительность</th><th>Статус</th></tr>';
@@ -209,7 +232,7 @@ async function viewReports(){
       h+='</table>'; }
 
     // Версии ПО (ОС и плеер mpv)
-    h+='<div class="rhead">Версии ПО на мини ПК (ОС и плеер mpv)</div>';
+    h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Версии ПО на мини ПК (ОС и плеер mpv)</div>';
     let vers=null; try{ vers=await api('/reports/versions'); }catch(e){}
     if(!vers||!vers.screens||!vers.screens.length){ h+='<div class="muted" style="font-size:12px;">Нет данных о версиях.</div>'; }
     else {
@@ -314,47 +337,72 @@ async function doExport(fmt){
 // ЖУРНАЛ ПОКАЗОВ
 //=============================================================================
 let PLAYLOG_ADVS=null;
+let PLAYLOG_MEDIA=null;
+let PLAYLOG_SCREENS=null;
+let DASH_DAYS='7';       // период дашборда
+let DASH_ADV='';         // фильтр дашборда по рекламодателю ('' = все)
+let DASH_ADVS=null;      // список рекламодателей для выпадашки
+
+// Свернуть/развернуть секцию отчёта: прячет все элементы до следующего .rhead
+function toggleReportSection(el){
+  const collapsed=el.classList.toggle('collapsed');
+  const car=el.querySelector('.rcaret'); if(car) car.textContent=collapsed?'▸':'▾';
+  let n=el.nextElementSibling;
+  while(n && !n.classList.contains('rhead')){ n.style.display=collapsed?'none':''; n=n.nextElementSibling; }
+}
 async function openPlaylog(){
   const view=document.getElementById('view');
   document.getElementById('topright').innerHTML=`<button class="btn" data-action="reports-back-to-list">← К отчётам</button>`;
 
   document.getElementById('vtitle').textContent='Журнал показов';
   if(!PLAYLOG_ADVS){ try{ const a=await api('/advertisers'); PLAYLOG_ADVS=a.map(x=>x.name); }catch(e){ PLAYLOG_ADVS=[]; } }
+  if(!PLAYLOG_MEDIA){ try{ PLAYLOG_MEDIA=await api('/media'); }catch(e){ PLAYLOG_MEDIA=[]; } }
+  if(!PLAYLOG_SCREENS){ try{ const s=await api('/minipc'); PLAYLOG_SCREENS=s.map(x=>x.name); }catch(e){ PLAYLOG_SCREENS=[]; } }
   view.innerHTML=`
-    <div class="muted" style="font-size:12px;margin-bottom:12px;">Журнал фактических показов роликов: дата, время, экран, ролик, рекламодатель. Можно отфильтровать и выгрузить — например, как доказательство показов для рекламодателя.</div>
+    <div class="muted" style="font-size:12px;margin-bottom:12px;">Журнал фактических показов роликов: дата, время, экран, ролик, рекламодатель. Отфильтруйте по дате, рекламодателю, ролику или экрану и выгрузите — например, как доказательство показов для рекламодателя.</div>
     <div class="row" style="flex-wrap:wrap;align-items:end;">
-      <div class="fld" style="min-width:160px;"><label>Период</label><select class="inp" id="pl-days"><option value="1">Сегодня</option><option value="7" selected>7 дней</option><option value="30">30 дней</option><option value="90">90 дней</option></select></div>
-      <div class="fld" style="min-width:200px;"><label>Рекламодатель</label><select class="inp" id="pl-adv"><option value="">Все</option>${PLAYLOG_ADVS.map(a=>`<option>${esc(a)}</option>`).join('')}</select></div>
+      <div class="fld" style="min-width:130px;"><label>Период</label><select class="inp" id="pl-days"><option value="1">Сегодня</option><option value="7" selected>7 дней</option><option value="30">30 дней</option><option value="90">90 дней</option></select></div>
+      <div class="fld" style="min-width:135px;"><label>Дата с</label><input class="inp" type="date" id="pl-from"></div>
+      <div class="fld" style="min-width:135px;"><label>по</label><input class="inp" type="date" id="pl-to"></div>
+      <div class="fld" style="min-width:180px;"><label>Рекламодатель</label><select class="inp" id="pl-adv"><option value="">Все</option>${PLAYLOG_ADVS.map(a=>`<option>${esc(a)}</option>`).join('')}</select></div>
+      <div class="fld" style="min-width:200px;"><label>Ролик</label><select class="inp" id="pl-media"><option value="">Все</option>${PLAYLOG_MEDIA.map(m=>`<option value="${m.id}">${esc(m.title||m.filename)}</option>`).join('')}</select></div>
+      <div class="fld" style="min-width:170px;"><label>Экран</label><select class="inp" id="pl-screen"><option value="">Все</option>${PLAYLOG_SCREENS.map(s=>`<option>${esc(s)}</option>`).join('')}</select></div>
       <div class="fld" style="flex:0;"><button class="btn primary" data-action="reports-load-playlog">Показать</button></div>
 <div class="fld" style="flex:0;"><button class="btn" data-action="reports-export-playlog-xlsx">Excel</button></div>
 <div class="fld" style="flex:0;"><button class="btn" data-action="reports-export-playlog-pdf">PDF</button></div>
     </div>
+    <div class="muted" style="font-size:11px;margin:-4px 0 8px;">Если задать «Дата с/по» — период (слева) игнорируется и берётся точный диапазон.</div>
     <div id="pl-summary"></div>
     <div id="pl-result"><div class="muted" style="font-size:12px;">Нажмите «Показать».</div></div>`;
   loadPlaylog();
 }
 function playlogParams(){
-  const days=document.getElementById('pl-days').value;
-  const adv=document.getElementById('pl-adv').value;
-  const q=new URLSearchParams({days}); if(adv) q.append('advertiser',adv);
+  const q=new URLSearchParams();
+  const from=(document.getElementById('pl-from')||{}).value;
+  const to=(document.getElementById('pl-to')||{}).value;
+  if(from||to){ if(from) q.append('date_from',from); if(to) q.append('date_to',to); }
+  else { q.append('days', document.getElementById('pl-days').value); }
+  const adv=document.getElementById('pl-adv').value; if(adv) q.append('advertiser',adv);
+  const media=(document.getElementById('pl-media')||{}).value; if(media) q.append('media_id',media);
+  const screen=(document.getElementById('pl-screen')||{}).value; if(screen) q.append('screen',screen);
   return q;
 }
 async function loadPlaylog(){
   const q=playlogParams();
   document.getElementById('pl-result').innerHTML='<div class="muted" style="font-size:12px;">Загрузка…</div>';
   try{
-    // сводка по рекламодателям
-    const summ=await api('/playlog/by-advertiser?days='+document.getElementById('pl-days').value);
+    // сводка по рекламодателям — с теми же фильтрами
+    const summ=await api('/playlog/by-advertiser?'+q.toString());
     let sh='';
     if(summ.length){
-      sh='<div class="rhead" style="margin-top:8px;">Сводка по рекламодателям</div><table><tr><th>Рекламодатель</th><th>Показов</th><th>Дней</th><th>Экранов</th><th>Первый показ</th><th>Последний показ</th></tr>';
+      sh='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;margin-top:8px;"><span class="rcaret">▾</span>Сводка по рекламодателям</div><table><tr><th>Рекламодатель</th><th>Показов</th><th>Дней</th><th>Экранов</th><th>Первый показ</th><th>Последний показ</th></tr>';
       summ.forEach(s=>{ sh+=`<tr><td>${esc(s.advertiser)}</td><td>${s.plays}</td><td>${s.days}</td><td>${s.screens}</td><td class="muted" style="font-size:12px;">${esc(s.first_play||'—')}</td><td class="muted" style="font-size:12px;">${esc(s.last_play||'—')}</td></tr>`; });
       sh+='</table>';
     }
     document.getElementById('pl-summary').innerHTML=sh;
     // сырой журнал
     const rows=await api('/playlog?'+q+'&limit=500');
-    let h='<div class="rhead">Журнал показов (последние записи)</div>';
+    let h='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Журнал показов (последние записи)</div>';
     if(!rows.length){ h+='<div class="muted" style="font-size:12px;">Нет показов за выбранный период. Если экраны работают, но журнал пуст — проверьте, что агент отправляет логи показов.</div>'; }
     else {
       h+=`<div class="muted" style="font-size:11px;margin-bottom:6px;">Показано записей: ${rows.length}${rows.length>=500?' (показаны последние 500 — уточните фильтр или выгрузите файл)':''}</div>`;
@@ -395,7 +443,10 @@ async function openBuilder(){
       <div class="fld" style="min-width:180px;"><label>Показатель</label><select class="inp" id="b-metric">${o.metrics.map(m=>`<option value="${m.key}">${esc(m.label)}</option>`).join('')}</select></div>
       <div class="fld" style="min-width:180px;"><label>Разрез</label><select class="inp" id="b-dim">${o.dimensions.map(d=>`<option value="${d.key}">${esc(d.label)}</option>`).join('')}</select></div>
       <div class="fld" style="min-width:130px;"><label>Период</label><select class="inp" id="b-days">${o.periods.map(p=>`<option value="${p.key}">${esc(p.label)}</option>`).join('')}</select></div>
+      <div class="fld" style="min-width:130px;"><label>Дата с</label><input class="inp" type="date" id="b-from"></div>
+      <div class="fld" style="min-width:130px;"><label>по</label><input class="inp" type="date" id="b-to"></div>
     </div>
+    <div class="muted" style="font-size:11px;margin:-4px 0 8px;">Если задать «Дата с/по» — период (слева) игнорируется и берётся точный диапазон.</div>
     <div class="row" style="flex-wrap:wrap;align-items:end;">
       <div class="fld" style="min-width:160px;"><label>Фильтр</label><select class="inp" id="b-filter" data-action="reports-builder-filter-change">${o.filters.map(f=>`<option value="${f.key}">${esc(f.label)}</option>`).join('')}</select></div>
       <div class="fld" style="min-width:160px;" id="b-fval-wrap"></div>
@@ -414,6 +465,7 @@ function builderFilterChange(){
   const wrap=document.getElementById('b-fval-wrap');
   const o=BUILDER_OPTS;
   if(f==='advertiser'){ wrap.innerHTML=`<label>Значение</label><select class="inp" id="b-fval">${o.advertisers.map(a=>`<option>${esc(a)}</option>`).join('')||'<option value="">нет данных</option>'}</select>`; }
+  else if(f==='media'){ wrap.innerHTML=`<label>Значение (ролик)</label><select class="inp" id="b-fval">${(o.media||[]).map(m=>`<option>${esc(m)}</option>`).join('')||'<option value="">нет данных</option>'}</select>`; }
   else if(f==='screen'){ wrap.innerHTML=`<label>Значение</label><select class="inp" id="b-fval">${o.screens.map(s=>`<option>${esc(s)}</option>`).join('')||'<option value="">нет данных</option>'}</select>`; }
   else if(f==='city'){ const cities=[...new Set(o.screens)]; wrap.innerHTML=`<label>Значение (город)</label><input class="inp" id="b-fval" placeholder="например, Москва">`; }
   else { wrap.innerHTML=''; }
@@ -425,13 +477,15 @@ function builderConfig(){
     days:document.getElementById('b-days').value, filter:document.getElementById('b-filter').value,
     sort_by:sb, sort_dir:sd, limit:(document.getElementById('b-limit')||{}).value||'0'};
   const fv=document.getElementById('b-fval'); if(fv) c.filter_value=fv.value;
+  const df=(document.getElementById('b-from')||{}).value; if(df) c.date_from=df;
+  const dt=(document.getElementById('b-to')||{}).value; if(dt) c.date_to=dt;
   return c;
 }
 async function builderRun(){
   const cfg=builderConfig(); BUILDER_LAST=cfg;
   try{
     const res=await api('/reports/builder/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});
-    let h=`<div class="rhead" style="margin-top:16px;">${esc(res.title)}</div>`;
+    let h=`<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;margin-top:16px;"><span class="rcaret">▾</span>${esc(res.title)}</div>`;
     if(!res.rows.length){ h+='<div class="muted" style="font-size:12px;">Нет данных за выбранный период.</div>'; document.getElementById('b-result').innerHTML=h; return; }
     // график (CSS-столбцы)
     const maxv=Math.max(...res.rows.map(r=>Number(r[1])||0))||1;
