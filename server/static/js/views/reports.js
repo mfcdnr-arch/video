@@ -42,7 +42,15 @@ function initReportsViewActions(){
 
       case 'reports-dash-apply':
         DASH_DAYS=(document.getElementById('dash-days')||{}).value||'7';
+        DASH_FROM=(document.getElementById('dash-from')||{}).value||'';
+        DASH_TO=(document.getElementById('dash-to')||{}).value||'';
         DASH_ADV=(document.getElementById('dash-adv')||{}).value||'';
+        DASH_MEDIA=(document.getElementById('dash-media')||{}).value||'';
+        DASH_SCREEN=(document.getElementById('dash-screen')||{}).value||'';
+        return viewReports();
+
+      case 'reports-dash-reset':
+        DASH_DAYS='7'; DASH_FROM=''; DASH_TO=''; DASH_ADV=''; DASH_MEDIA=''; DASH_SCREEN='';
         return viewReports();
 
       case 'reports-toggle-section':
@@ -99,29 +107,39 @@ async function viewReports(){
   view.innerHTML='<div class="empty">Загрузка отчётов…</div>';
   try{
     if(!DASH_ADVS){ try{ const a=await api('/advertisers'); DASH_ADVS=a.map(x=>x.name); }catch(e){ DASH_ADVS=[]; } }
-    const advQ=DASH_ADV?('&advertiser='+encodeURIComponent(DASH_ADV)):'';
-    const perLabel={'1':'сегодня','7':'7 дней','30':'30 дней','90':'90 дней'}[DASH_DAYS]||(DASH_DAYS+' дн.');
+    if(!DASH_MEDIA_LIST){ try{ DASH_MEDIA_LIST=await api('/media'); }catch(e){ DASH_MEDIA_LIST=[]; } }
+    if(!DASH_SCREEN_LIST){ try{ const s=await api('/minipc'); DASH_SCREEN_LIST=s.map(x=>x.name); }catch(e){ DASH_SCREEN_LIST=[]; } }
+    const dq=dashQ();
+    const perLabel=(DASH_FROM||DASH_TO)?((DASH_FROM||'…')+'…'+(DASH_TO||'…'))
+      :({'1':'сегодня','7':'7 дней','30':'30 дней','90':'90 дней'}[DASH_DAYS]||(DASH_DAYS+' дн.'));
     const [sum,offline,playtime,byScr,lowDisk,downtime,broken] = await Promise.all([
       api('/reports/summary').catch(()=>({})),
       api('/reports/offline-screens').catch(()=>({count:0,screens:[]})),
-      api('/reports/playtime?days='+DASH_DAYS+advQ).catch(()=>({total:{},by_media:[],by_advertiser:[]})),
-      api('/reports/by-screen-advertiser?days='+DASH_DAYS+advQ).catch(()=>[]),
+      api('/reports/playtime?'+dq).catch(()=>({total:{},by_media:[],by_advertiser:[]})),
+      api('/reports/by-screen-advertiser?'+dq).catch(()=>[]),
       api('/reports/low-disk?threshold_pct=15').catch(()=>[]),
       api('/reports/downtime?hours_full=8').catch(()=>[]),
-      api('/reports/broken-media').catch(()=>[]),
+      api('/reports/broken-media?'+dq).catch(()=>[]),
     ]);
-    // Панель фильтров дашборда
-    let h=`<div class="row" style="flex-wrap:wrap;align-items:end;margin-bottom:12px;">
-      <div class="fld" style="min-width:140px;"><label>Период</label><select class="inp" id="dash-days">
+    // Единая панель фильтров дашборда (Дата · Рекламодатель · Ролик · Экран)
+    let h=`<div class="row" style="flex-wrap:wrap;align-items:end;margin-bottom:6px;">
+      <div class="fld" style="min-width:120px;"><label>Период</label><select class="inp" id="dash-days">
         <option value="1"${DASH_DAYS==='1'?' selected':''}>Сегодня</option>
         <option value="7"${DASH_DAYS==='7'?' selected':''}>7 дней</option>
         <option value="30"${DASH_DAYS==='30'?' selected':''}>30 дней</option>
         <option value="90"${DASH_DAYS==='90'?' selected':''}>90 дней</option></select></div>
-      <div class="fld" style="min-width:200px;"><label>Рекламодатель</label><select class="inp" id="dash-adv">
+      <div class="fld" style="min-width:130px;"><label>Дата с</label><input class="inp" type="date" id="dash-from" value="${DASH_FROM}"></div>
+      <div class="fld" style="min-width:130px;"><label>по</label><input class="inp" type="date" id="dash-to" value="${DASH_TO}"></div>
+      <div class="fld" style="min-width:170px;"><label>Рекламодатель</label><select class="inp" id="dash-adv">
         <option value="">Все</option>${(DASH_ADVS||[]).map(a=>`<option${a===DASH_ADV?' selected':''}>${esc(a)}</option>`).join('')}</select></div>
+      <div class="fld" style="min-width:180px;"><label>Ролик</label><select class="inp" id="dash-media">
+        <option value="">Все</option>${(DASH_MEDIA_LIST||[]).map(m=>`<option value="${m.id}"${String(m.id)===DASH_MEDIA?' selected':''}>${esc(m.title||m.filename)}</option>`).join('')}</select></div>
+      <div class="fld" style="min-width:150px;"><label>Экран</label><select class="inp" id="dash-screen">
+        <option value="">Все</option>${(DASH_SCREEN_LIST||[]).map(s=>`<option${s===DASH_SCREEN?' selected':''}>${esc(s)}</option>`).join('')}</select></div>
       <div class="fld" style="flex:0;"><button class="btn primary" data-action="reports-dash-apply">Применить</button></div>
-      <div class="muted" style="font-size:11px;align-self:center;">Влияет на «время показа», «заработок», «показы по экранам».</div>
-    </div>`;
+      <div class="fld" style="flex:0;"><button class="btn" data-action="reports-dash-reset">Сбросить</button></div>
+    </div>
+    <div class="muted" style="font-size:11px;margin-bottom:12px;">Фильтры применяются ко всем отчётам по их полям. «Дата с/по» перебивает период. Ролик/рекламодатель/экран — где такие столбцы есть.</div>`;
     h+='<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));">';
     h+=kpi('Всего экранов', sum.total_screens??'—','');
     h+=kpi('Не работают', offline.count??0, offline.count?'см. список ниже':'все онлайн','var(--danger)');
@@ -188,10 +206,10 @@ async function viewReports(){
 
     // Заработок по рекламодателям
     h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Заработок по рекламодателям</div>';
-    let earn=null; try{ earn=await api('/reports/earnings?days=30'+advQ); }catch(e){}
+    let earn=null; try{ earn=await api('/reports/earnings?'+dq); }catch(e){}
     if(!earn||!earn.by_advertiser||!earn.by_advertiser.length){ h+='<div class="muted" style="font-size:12px;">Нет данных.</div>'; }
     else {
-      h+='<div class="muted" style="font-size:11px;margin-bottom:6px;">Расчётная оценка по прокрутам за 30 дней: показы × длительность ролика × цена за минуту. Цена задаётся в Медиатеке у рекламодателя.</div>';
+      h+='<div class="muted" style="font-size:11px;margin-bottom:6px;">Расчётная оценка по прокрутам за '+perLabel+': показы × длительность ролика × цена за минуту. Цена задаётся в Медиатеке у рекламодателя.</div>';
       h+='<table><tr><th>Рекламодатель</th><th>Показов</th><th>Минут эфира</th><th>Цена ₽/мин</th><th>Заработано ₽</th></tr>';
       earn.by_advertiser.forEach(a=>{ h+=`<tr><td>${esc(a.advertiser)}</td><td>${a.plays}</td><td>${a.minutes}</td><td class="muted">${a.price_per_minute}</td><td style="font-weight:600;color:var(--accent);">${a.earnings.toLocaleString('ru-RU')}</td></tr>`; });
       h+=`<tr><td colspan="4" style="text-align:right;font-weight:600;">Итого:</td><td style="font-weight:700;color:var(--accent);">${earn.total_earnings.toLocaleString('ru-RU')} ₽</td></tr>`;
@@ -206,7 +224,7 @@ async function viewReports(){
 
     // Сессии пользователей
     h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Входы пользователей в панель</div>';
-    let sessions=[]; try{ sessions=await api('/reports/sessions?days=30'); }catch(e){}
+    let sessions=[]; try{ sessions=await api('/reports/sessions?'+dq); }catch(e){}
     if(!sessions.length){ h+='<div class="muted" style="font-size:12px;">Нет данных о входах.</div>'; }
     else { h+='<table><tr><th>Пользователь</th><th>Роль</th><th>Вход</th><th>Длительность</th></tr>';
       sessions.forEach(s=>{ h+=`<tr><td>${esc(s.username||'')}</td><td class="muted">${esc(roleLabel(s.role))}</td><td class="muted" style="font-size:12px;">${s.login_at?new Date(s.login_at).toLocaleString('ru-RU'):'—'}</td><td>${fmtDur(s.seconds)}</td></tr>`; });
@@ -214,7 +232,7 @@ async function viewReports(){
 
     // Сроки действия роликов
     h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Сроки действия роликов</div>';
-    let validity=[]; try{ validity=await api('/reports/validity'); }catch(e){}
+    let validity=[]; try{ validity=await api('/reports/validity?'+dq); }catch(e){}
     if(!validity.length){ h+='<div class="muted" style="font-size:12px;">Нет роликов.</div>'; }
     else { h+='<table><tr><th>Ролик</th><th>Рекламодатель</th><th>Показывать с</th><th>Показывать по</th><th>Статус</th></tr>';
       const vlabel={active:['в сроке','var(--accent)'],upcoming:['ещё не начался','var(--c-pepsi)'],expired:['просрочен','var(--danger)'],unlimited:['без ограничения','var(--muted)']};
@@ -339,9 +357,27 @@ async function doExport(fmt){
 let PLAYLOG_ADVS=null;
 let PLAYLOG_MEDIA=null;
 let PLAYLOG_SCREENS=null;
-let DASH_DAYS='7';       // период дашборда
-let DASH_ADV='';         // фильтр дашборда по рекламодателю ('' = все)
-let DASH_ADVS=null;      // список рекламодателей для выпадашки
+let DASH_DAYS='7';       // период дашборда (пресет, если не задан диапазон дат)
+let DASH_FROM='';        // дата с (диапазон перебивает период)
+let DASH_TO='';          // дата по
+let DASH_ADV='';         // фильтр по рекламодателю ('' = все)
+let DASH_MEDIA='';       // фильтр по ролику (media_id)
+let DASH_SCREEN='';      // фильтр по экрану (имя)
+let DASH_ADVS=null;      // списки для выпадашек
+let DASH_MEDIA_LIST=null;
+let DASH_SCREEN_LIST=null;
+
+// Единая строка фильтров дашборда — добавляется ко ВСЕМ отчётам (лишние параметры
+// эндпоинты игнорируют, берут только свои: дата/рекламодатель/ролик/экран).
+function dashQ(){
+  const q=new URLSearchParams();
+  if(DASH_FROM||DASH_TO){ if(DASH_FROM)q.append('date_from',DASH_FROM); if(DASH_TO)q.append('date_to',DASH_TO); }
+  else q.append('days', DASH_DAYS);
+  if(DASH_ADV) q.append('advertiser', DASH_ADV);
+  if(DASH_MEDIA) q.append('media_id', DASH_MEDIA);
+  if(DASH_SCREEN) q.append('screen', DASH_SCREEN);
+  return q.toString();
+}
 
 // Свернуть/развернуть секцию отчёта: прячет все элементы до следующего .rhead
 function toggleReportSection(el){

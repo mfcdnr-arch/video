@@ -98,8 +98,14 @@ def report_downtime(hours_full: float = Query(8), admin: dict = Depends(get_curr
     return _data_downtime(db, hours_full)
 
 
-def _data_validity(db: Session):
-    rows = db.execute(text("""
+def _data_validity(db: Session, advertiser=None, media_id=None):
+    where = ["m.status = 'ready'"]
+    params = {}
+    if advertiser:
+        where.append("a.name = :adv"); params["adv"] = advertiser
+    if media_id:
+        where.append("m.id = :mid"); params["mid"] = int(media_id)
+    rows = db.execute(text(f"""
         SELECT m.title, a.name AS advertiser, m.valid_from, m.valid_until,
                CASE
                  WHEN m.valid_from IS NULL AND m.valid_until IS NULL THEN 'unlimited'
@@ -109,15 +115,16 @@ def _data_validity(db: Session):
                END AS validity_status
         FROM media m
         LEFT JOIN advertisers a ON a.id = m.advertiser_id
-        WHERE m.status = 'ready'
+        WHERE {' AND '.join(where)}
         ORDER BY m.valid_until NULLS LAST, m.title
-    """)).fetchall()
+    """), params).fetchall()
     return [dict(r._mapping) for r in rows]
 
 
 @router.get("/reports/validity")
-def report_validity(admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    return _data_validity(db)
+def report_validity(advertiser: Optional[str] = Query(None), media_id: Optional[int] = Query(None),
+                    admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    return _data_validity(db, advertiser, media_id)
 
 
 @router.get("/reports/versions")
@@ -208,38 +215,54 @@ def session_ping(current_admin: dict = Depends(get_current_admin), db: Session =
     return {"status": "ok"}
 
 
-def _data_sessions(db: Session, days: int = 30):
-    rows = db.execute(text("""
+def _data_sessions(db: Session, days: int = 30, date_from=None, date_to=None):
+    where, params = [], {}
+    if date_from or date_to:
+        if date_from:
+            where.append("us.login_at >= CAST(:d_from AS date)"); params["d_from"] = date_from
+        if date_to:
+            where.append("us.login_at < (CAST(:d_to AS date) + 1)"); params["d_to"] = date_to
+    else:
+        where.append("us.login_at > NOW() - (INTERVAL '1 day' * :days)"); params["days"] = days
+    rows = db.execute(text(f"""
         SELECT us.username, COALESCE(u.role, 'admin') AS role, us.login_at,
                EXTRACT(EPOCH FROM (COALESCE(us.logout_at, us.last_seen) - us.login_at)) AS seconds
         FROM user_sessions us
         LEFT JOIN users u ON u.id = us.user_id
-        WHERE us.login_at > NOW() - (INTERVAL '1 day' * :days)
+        WHERE {' AND '.join(where)}
         ORDER BY us.login_at DESC
-    """), {"days": days}).fetchall()
+    """), params).fetchall()
     return [dict(r._mapping) for r in rows]
 
 
 @router.get("/reports/sessions")
-def report_sessions(days: int = Query(30), admin: dict = Depends(get_current_admin),
+def report_sessions(days: int = Query(30), date_from: Optional[str] = Query(None),
+                     date_to: Optional[str] = Query(None), admin: dict = Depends(get_current_admin),
                      db: Session = Depends(get_db)):
-    return _data_sessions(db, days)
+    return _data_sessions(db, days, date_from, date_to)
 
 
-def _data_broken_media(db: Session):
-    rows = db.execute(text("""
+def _data_broken_media(db: Session, advertiser=None, media_id=None):
+    where = ["m.is_broken = TRUE"]
+    params = {}
+    if advertiser:
+        where.append("a.name = :adv"); params["adv"] = advertiser
+    if media_id:
+        where.append("m.id = :mid"); params["mid"] = int(media_id)
+    rows = db.execute(text(f"""
         SELECT m.title, m.filename, a.name AS advertiser, m.error_count, m.last_error
         FROM media m
         LEFT JOIN advertisers a ON a.id = m.advertiser_id
-        WHERE m.is_broken = TRUE
+        WHERE {' AND '.join(where)}
         ORDER BY m.last_error_at DESC NULLS LAST
-    """)).fetchall()
+    """), params).fetchall()
     return [dict(r._mapping) for r in rows]
 
 
 @router.get("/reports/broken-media")
-def report_broken_media(admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    return _data_broken_media(db)
+def report_broken_media(advertiser: Optional[str] = Query(None), media_id: Optional[int] = Query(None),
+                        admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    return _data_broken_media(db, advertiser, media_id)
 
 
 # ─── Конструктор отчётов ─────────────────────────────────────────────────────
@@ -420,27 +443,26 @@ def builder_delete_saved(report_id: int, admin: dict = Depends(get_current_admin
     return {"status": "deleted"}
 
 
-def _data_playtime(db: Session, days: int = 7, advertiser: Optional[str] = None):
-    p = {"days": days}
-    adv_join, adv_where = "", ""
-    if advertiser:
-        p["adv"] = advertiser
-        adv_where = " AND a.name = :adv"
-        adv_join = "JOIN media m ON m.id = pl.media_id JOIN advertisers a ON a.id = m.advertiser_id"
+_CONTENT_JOINS = ("LEFT JOIN media m ON m.id = pl.media_id "
+                  "LEFT JOIN advertisers a ON a.id = m.advertiser_id "
+                  "LEFT JOIN screens s ON s.id = pl.screen_id")
+
+
+def _data_playtime(db: Session, days: int = 7, advertiser: Optional[str] = None,
+                   date_from=None, date_to=None, media_id=None, screen=None):
+    where, p = _playlog_where(days, date_from, date_to, advertiser, media_id, screen)
     total = db.execute(text(f"""
         SELECT COUNT(*) as plays,
                COALESCE(SUM(EXTRACT(EPOCH FROM (pl.ended_at - pl.started_at))), 0) as seconds
-        FROM play_log pl {adv_join}
-        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days){adv_where}
+        FROM play_log pl {_CONTENT_JOINS}
+        WHERE {where}
     """), p).fetchone()
 
     by_media = db.execute(text(f"""
         SELECT m.title, m.filename, a.name AS advertiser, COUNT(*) as plays,
                COALESCE(SUM(EXTRACT(EPOCH FROM (pl.ended_at - pl.started_at))), 0) as seconds
-        FROM play_log pl
-        JOIN media m ON m.id = pl.media_id
-        LEFT JOIN advertisers a ON a.id = m.advertiser_id
-        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days){adv_where}
+        FROM play_log pl {_CONTENT_JOINS}
+        WHERE {where}
         GROUP BY m.id, m.title, m.filename, a.name
         ORDER BY plays DESC
     """), p).fetchall()
@@ -448,10 +470,8 @@ def _data_playtime(db: Session, days: int = 7, advertiser: Optional[str] = None)
     by_advertiser = db.execute(text(f"""
         SELECT a.name AS advertiser, COUNT(*) as plays,
                COALESCE(SUM(EXTRACT(EPOCH FROM (pl.ended_at - pl.started_at))), 0) as seconds
-        FROM play_log pl
-        JOIN media m ON m.id = pl.media_id
-        JOIN advertisers a ON a.id = m.advertiser_id
-        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days){adv_where}
+        FROM play_log pl {_CONTENT_JOINS}
+        WHERE {where} AND a.name IS NOT NULL
         GROUP BY a.id, a.name
         ORDER BY seconds DESC
     """), p).fetchall()
@@ -465,23 +485,22 @@ def _data_playtime(db: Session, days: int = 7, advertiser: Optional[str] = None)
 
 @router.get("/reports/playtime")
 def report_playtime(days: int = Query(7), advertiser: Optional[str] = Query(None),
+                     date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None),
+                     media_id: Optional[int] = Query(None), screen: Optional[str] = Query(None),
                      admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    return _data_playtime(db, days, advertiser)
+    return _data_playtime(db, days, advertiser, date_from, date_to, media_id, screen)
 
 
-def _data_by_screen_advertiser(db: Session, days: int = 7, advertiser: Optional[str] = None):
-    p = {"days": days}
-    adv_where = ""
-    if advertiser:
-        p["adv"] = advertiser
-        adv_where = " AND a.name = :adv"
+def _data_by_screen_advertiser(db: Session, days: int = 7, advertiser: Optional[str] = None,
+                               date_from=None, date_to=None, media_id=None, screen=None):
+    where, p = _playlog_where(days, date_from, date_to, advertiser, media_id, screen)
     rows = db.execute(text(f"""
         SELECT s.name AS screen, a.name AS advertiser, m.title, COUNT(*) as plays
         FROM play_log pl
         JOIN screens s ON s.id = pl.screen_id
         JOIN media m ON m.id = pl.media_id
         LEFT JOIN advertisers a ON a.id = m.advertiser_id
-        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days){adv_where}
+        WHERE {where}
         GROUP BY s.name, a.name, m.title
         ORDER BY plays DESC
     """), p).fetchall()
@@ -490,16 +509,15 @@ def _data_by_screen_advertiser(db: Session, days: int = 7, advertiser: Optional[
 
 @router.get("/reports/by-screen-advertiser")
 def report_by_screen_advertiser(days: int = Query(7), advertiser: Optional[str] = Query(None),
+                                 date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None),
+                                 media_id: Optional[int] = Query(None), screen: Optional[str] = Query(None),
                                  admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    return _data_by_screen_advertiser(db, days, advertiser)
+    return _data_by_screen_advertiser(db, days, advertiser, date_from, date_to, media_id, screen)
 
 
-def _data_earnings(db: Session, days: int = 30, advertiser: Optional[str] = None):
-    p = {"days": days}
-    adv_where = ""
-    if advertiser:
-        p["adv"] = advertiser
-        adv_where = " AND a.name = :adv"
+def _data_earnings(db: Session, days: int = 30, advertiser: Optional[str] = None,
+                   date_from=None, date_to=None, media_id=None, screen=None):
+    where, p = _playlog_where(days, date_from, date_to, advertiser, media_id, screen)
     rows = db.execute(text(f"""
         SELECT a.name AS advertiser, COUNT(*) as plays,
                COALESCE(SUM(EXTRACT(EPOCH FROM (pl.ended_at - pl.started_at))), 0) / 60.0 as minutes,
@@ -507,7 +525,8 @@ def _data_earnings(db: Session, days: int = 30, advertiser: Optional[str] = None
         FROM play_log pl
         JOIN media m ON m.id = pl.media_id
         JOIN advertisers a ON a.id = m.advertiser_id
-        WHERE pl.started_at > NOW() - (INTERVAL '1 day' * :days){adv_where}
+        LEFT JOIN screens s ON s.id = pl.screen_id
+        WHERE {where}
         GROUP BY a.id, a.name, a.price_per_minute
         ORDER BY minutes DESC
     """), p).fetchall()
@@ -529,8 +548,10 @@ def _data_earnings(db: Session, days: int = 30, advertiser: Optional[str] = None
 
 @router.get("/reports/earnings")
 def report_earnings(days: int = Query(30), advertiser: Optional[str] = Query(None),
+                     date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None),
+                     media_id: Optional[int] = Query(None), screen: Optional[str] = Query(None),
                      admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    return _data_earnings(db, days, advertiser)
+    return _data_earnings(db, days, advertiser, date_from, date_to, media_id, screen)
 
 
 def _playlog_where(days=7, date_from=None, date_to=None, advertiser=None,
