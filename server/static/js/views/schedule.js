@@ -88,7 +88,24 @@ async function renderWeekGrid(view, list){
     if(SCH_TGT==='screen') h+=`<button class="btn" data-action="schedule-clone">⧉ Скопировать расписание экрана…</button>`;
     h+=`<button class="btn danger" data-action="schedule-clear-week">🗑 Очистить весь шаблон</button>`;
     h+=`</div>`;
-    h+=`<div class="muted" style="font-size:11px;margin-top:6px;">Массовое удаление: «Очистить весь шаблон» убирает все слоты сразу; клик по названию дня в шапке — очистить все слоты за этот день.</div>`;
+    h+=`<div class="muted" style="font-size:11px;margin-top:6px;">Массовое удаление: «Очистить весь шаблон» убирает все слоты; клик по названию дня в шапке — очистить все слоты за этот день.</div>`;
+
+    // Список назначенных слотов с галочками — удалить несколько конкретных
+    if(slots.length){
+      h+=`<div class="rhead" data-action="schedule-toggle-list" style="cursor:pointer;user-select:none;margin-top:16px;"><span class="rcaret">▾</span> Назначенные слоты — удалить несколько (${slots.length})</div>`;
+      h+=`<div id="sch-slot-list">`;
+      slots.slice().sort((a,b)=> (a.day_of_week-b.day_of_week) || ((a.hour===null?-1:a.hour)-(b.hour===null?-1:b.hour)) )
+        .forEach(s=>{
+          const hourLabel = s.hour===null ? 'весь день' : (s.hour+':00');
+          h+=`<label class="cell" style="display:flex;align-items:center;gap:9px;margin-bottom:5px;cursor:pointer;font-size:12px;">
+            <input type="checkbox" class="sch-slot-chk" data-dow="${s.day_of_week}" data-hour="${s.hour===null?'':s.hour}" style="width:15px;height:15px;">
+            <span style="min-width:120px;">${SCH_DOW[s.day_of_week]}, ${hourLabel}</span>
+            <span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${schPlColor(s.playlist_id)};"></span>
+            <span style="flex:1;">${esc(s.playlist_name||('#'+s.playlist_id))}</span>
+          </label>`;
+        });
+      h+=`</div><button class="btn danger" style="margin-top:6px;" data-action="schedule-delete-selected">🗑 Удалить выбранные слоты</button>`;
+    }
   }
 
   view.innerHTML=h;
@@ -199,6 +216,16 @@ function initScheduleViewActions(){
       case 'schedule-clear-day': {
         if(!canWrite()) return;
         return Signage.clearWeekDay(Number(el.dataset.dow));
+      }
+
+      case 'schedule-delete-selected':
+        return Signage.deleteSelectedSlots();
+
+      case 'schedule-toggle-list': {
+        const box=document.getElementById('sch-slot-list');
+        const car=el.querySelector('.rcaret');
+        if(box){ const hide=box.style.display!=='none'; box.style.display=hide?'none':''; if(car) car.textContent=hide?'▸':'▾'; }
+        return;
       }
 
       case 'schedule-clone':
@@ -337,10 +364,26 @@ async function clearWeekDay(dow){
   }catch(e){ toast('Ошибка: '+e.message); }
 }
 
+async function deleteSelectedSlots(){
+  const chks=[...document.querySelectorAll('.sch-slot-chk:checked')];
+  if(!chks.length){ toast('Ничего не выбрано'); return; }
+  if(!confirm('Удалить выбранные слоты ('+chks.length+')?')) return;
+  let ok=0, fail=0;
+  for(const c of chks){
+    const q=schTargetQS(new URLSearchParams()); q.append('day_of_week', c.dataset.dow);
+    if(c.dataset.hour!=='') q.append('hour', c.dataset.hour);
+    try{ await api('/schedule/slot?'+q, {method:'DELETE'}); ok++; }
+    catch(e){ fail++; }
+  }
+  toast('Удалено слотов: '+ok+(fail?', ошибок: '+fail:''));
+  viewSchedule();
+}
+
 window.Signage = window.Signage || {};
 window.Signage.viewSchedule = viewSchedule;
 window.Signage.clearWeekSlots = clearWeekSlots;
 window.Signage.clearWeekDay = clearWeekDay;
+window.Signage.deleteSelectedSlots = deleteSelectedSlots;
 window.Signage.setWeekSlot = setWeekSlot;
 window.Signage.setOverride = setOverride;
 window.Signage.clearOverrides = clearOverrides;
