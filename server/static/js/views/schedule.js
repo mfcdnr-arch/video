@@ -74,7 +74,7 @@ async function renderWeekGrid(view, list){
   };
 
   h+='<div style="overflow-x:auto;"><table style="border-collapse:separate;border-spacing:2px;min-width:640px;">';
-  h+='<tr><th style="font-size:11px;"></th>'+SCH_DOW.map(d=>`<th style="font-size:11px;">${d}</th>`).join('')+'</tr>';
+  h+='<tr><th style="font-size:11px;"></th>'+SCH_DOW.map((d,di)=>`<th style="font-size:11px;${canWrite()?'cursor:pointer;':''}" ${canWrite()?`data-action="schedule-clear-day" data-dow="${di}" title="Очистить все слоты за ${d}"`:''}>${d}</th>`).join('')+'</tr>';
   h+='<tr><td class="muted" style="font-size:10px;white-space:nowrap;padding-right:6px;">Весь день</td>'
      +SCH_DOW.map((_,d)=>cell(d,null)).join('')+'</tr>';
   for(let hr=0;hr<24;hr++){
@@ -83,8 +83,13 @@ async function renderWeekGrid(view, list){
   }
   h+='</table></div>';
 
-  if(SCH_TGT==='screen' && canWrite())
-    h+=`<div style="margin-top:12px;"><button class="btn" data-action="schedule-clone">⧉ Скопировать расписание экрана…</button></div>`;
+  if(canWrite()){
+    h+=`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">`;
+    if(SCH_TGT==='screen') h+=`<button class="btn" data-action="schedule-clone">⧉ Скопировать расписание экрана…</button>`;
+    h+=`<button class="btn danger" data-action="schedule-clear-week">🗑 Очистить весь шаблон</button>`;
+    h+=`</div>`;
+    h+=`<div class="muted" style="font-size:11px;margin-top:6px;">Массовое удаление: «Очистить весь шаблон» убирает все слоты сразу; клик по названию дня в шапке — очистить все слоты за этот день.</div>`;
+  }
 
   view.innerHTML=h;
 }
@@ -187,6 +192,14 @@ function initScheduleViewActions(){
 
       case 'schedule-clear-overrides':
         return Signage.clearOverrides();
+
+      case 'schedule-clear-week':
+        return Signage.clearWeekSlots();
+
+      case 'schedule-clear-day': {
+        if(!canWrite()) return;
+        return Signage.clearWeekDay(Number(el.dataset.dow));
+      }
 
       case 'schedule-clone':
         return Signage.cloneSchedule();
@@ -305,8 +318,29 @@ async function cloneSchedule(){
   }catch(e){ toast('Ошибка: '+e.message); }
 }
 
+async function clearWeekSlots(){
+  if(!confirm('Очистить ВЕСЬ недельный шаблон для выбранной цели? Все слоты будут удалены.')) return;
+  try{
+    const r=await api('/schedule/slots/clear?'+schTargetQS(new URLSearchParams()), {method:'DELETE'});
+    toast('Очищено слотов: '+(r.removed!=null?r.removed:'—'));
+    viewSchedule();
+  }catch(e){ toast('Ошибка: '+e.message); }
+}
+
+async function clearWeekDay(dow){
+  if(!confirm('Очистить все слоты за '+SCH_DOW[dow]+'?')) return;
+  try{
+    const q=schTargetQS(new URLSearchParams()); q.append('day_of_week', dow);
+    const r=await api('/schedule/slots/clear?'+q, {method:'DELETE'});
+    toast('Очищено за '+SCH_DOW[dow]+': '+(r.removed!=null?r.removed:'—'));
+    viewSchedule();
+  }catch(e){ toast('Ошибка: '+e.message); }
+}
+
 window.Signage = window.Signage || {};
 window.Signage.viewSchedule = viewSchedule;
+window.Signage.clearWeekSlots = clearWeekSlots;
+window.Signage.clearWeekDay = clearWeekDay;
 window.Signage.setWeekSlot = setWeekSlot;
 window.Signage.setOverride = setOverride;
 window.Signage.clearOverrides = clearOverrides;

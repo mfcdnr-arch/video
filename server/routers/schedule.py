@@ -97,6 +97,38 @@ def delete_slot(
     return {"status": "deleted", "target": label}
 
 
+@router.delete("/schedule/slots/clear")
+def clear_slots(
+    day_of_week: Optional[int] = Query(None, ge=0, le=6),
+    screen_id: Optional[int] = Query(None),
+    group_id: Optional[int] = Query(None),
+    network: bool = Query(False),
+    admin: dict = Depends(require_write),
+    db: Session = Depends(get_db)
+):
+    """Массово убрать слоты недельного шаблона на выбранном уровне: все сразу
+    либо только за указанный день недели (day_of_week)."""
+    where, params, label = _slot_target(screen_id, group_id, network)
+    day_sql = ""
+    if day_of_week is not None:
+        day_sql = " AND day_of_week = :d"
+        params["d"] = day_of_week
+    res = db.execute(text(f"DELETE FROM schedule_slots WHERE {where}{day_sql}"), params)
+    removed = res.rowcount if res.rowcount is not None else 0
+    try:
+        db.execute(text("""
+            INSERT INTO audit_log (event_type, title, detail, actor, screen_id)
+            VALUES ('schedule', :t, :dt, :a, :sid)
+        """), {"t": f"Расписание очищено: {label}",
+               "dt": (f"день {day_of_week}" if day_of_week is not None else "весь шаблон")
+                     + f", удалено слотов: {removed}",
+               "a": admin.get("username", "admin"), "sid": screen_id})
+    except Exception:
+        pass
+    db.commit()
+    return {"status": "cleared", "removed": removed, "target": label}
+
+
 @router.get("/schedule/slots")
 def get_slots(
     screen_id: Optional[int] = Query(None),
