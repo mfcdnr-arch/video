@@ -359,13 +359,30 @@ LEOF
 elif command -v fly-dm >/dev/null 2>&1 || [ -e /etc/X11/fly-dm ] || [ -d /etc/X11/fly-dm ]; then
     warn "Дисплей-менеджер Astra (fly-dm) — автологин НЕ настраивается автоматически."
     hint "Включите ВРУЧНУЮ: Панель управления Fly → «Менеджер входа в систему» (fly-admin-dm)"
-    hint "→ автоматический вход для пользователя $REAL_USER."
+    hint "→ «Автоматический вход» для пользователя $REAL_USER, задержка 0."
+    hint "ВАЖНО: правка /etc/X11/fly-dm/fly-dmrc через sed на Astra НЕ работает — только GUI."
+    hint "Не включайте «повторный автовход» (AutoLoginAgain) — виснет окно отсчёта."
     hint "Без автологина после перезагрузки не поднимется X-сессия и плеер (чёрный экран)."
 else
     warn "LightDM не найден — автологин НЕ настроен."
     hint "Настройте автоматический вход для пользователя $REAL_USER средствами вашего"
     hint "дисплей-менеджера, иначе после перезагрузки графическая сессия не поднимется."
 fi
+
+# ── Signage-режим экрана: не блокировать/не гасить по простою ──
+# Блокировщик KDE/fly (kscreenlocker) отключаем автоматически для сессии
+# пользователя. Гашение/DPMS дополнительно снимает агент (xset) при старте mpv.
+KSCR_CFG="$USER_HOME/.config/kscreenlockerrc"
+mkdir -p "$USER_HOME/.config"
+cat > "$KSCR_CFG" << KEOF
+[Daemon]
+Autolock=false
+LockOnResume=false
+Timeout=0
+KEOF
+chown -R "$REAL_USER:$USER_GROUP" "$USER_HOME/.config" 2>/dev/null || true
+echo "Блокировка экрана по простою отключена (kscreenlockerrc)."
+hint "Питание: Панель управления Fly → «Управление питанием» → «От сети»: экран и сон = «Никогда»."
 
 XINITRC="$USER_HOME/.xinitrc"
 if [ ! -f "$XINITRC" ]; then
