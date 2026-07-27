@@ -115,7 +115,13 @@ class VLCPlayer:
                 self._mpv_proc.terminate()
                 self._mpv_proc.wait(timeout=5)
             except Exception:
-                self._mpv_proc.kill()
+                # kill без последующего wait оставлял зомби [mpv] <defunct>
+                # до перезапуска агента (замечено при приёмке на мини-ПК)
+                try:
+                    self._mpv_proc.kill()
+                    self._mpv_proc.wait(timeout=3)
+                except Exception:
+                    pass
             self._mpv_proc = None
 
     def is_vlc_running(self):
