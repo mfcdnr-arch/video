@@ -1,7 +1,11 @@
 """Резервное копирование БД (pg_dump + gzip)."""
 import os
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+# Имена бэкапов — в московском времени (вся система живёт по МСК),
+# иначе «backup_…_1009» в 13:09 по Москве путает при разборе инцидентов
+MSK = timezone(timedelta(hours=3))
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
@@ -27,7 +31,7 @@ def get_backups(admin: dict = Depends(get_current_admin), db: Session = Depends(
 @router.post("/backups/create")
 def create_backup(current_admin: dict = Depends(require_write), db: Session = Depends(get_db)):
     """Снять дамп БД через pg_dump и сохранить сжатым в BACKUP_DIR."""
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(MSK).strftime("%Y%m%d_%H%M%S")
     filename = f"backup_{timestamp}.sql.gz"
     filepath = os.path.join(BACKUP_DIR, filename)
 

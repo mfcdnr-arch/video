@@ -346,7 +346,7 @@ async function loadAuditLog(){
         <td>${esc(r.title || '')}</td>
         <td class="muted" style="font-size:11px;">${esc(r.detail || '—')}</td>
         <td class="muted" style="font-size:11px;">${esc(r.actor || '—')}</td>
-        <td class="muted" style="font-size:11px;">${r.created_at ? new Date(r.created_at).toLocaleString('ru-RU') : '—'}</td>
+        <td class="muted" style="font-size:11px;">${r.created_at ? fmtServerTS(r.created_at) : '—'}</td>
       </tr>`).join('') + '</table>';
   }catch(e){
     el.innerHTML = '<div class="muted" style="font-size:12px;">Не удалось загрузить журнал</div>';
@@ -577,7 +577,7 @@ async function loadBackups(){
     el.innerHTML = '<table><tr><th>Файл</th><th>Дата</th><th>Размер</th><th style="text-align:right;">Действия</th></tr>' +
       list.map(b => `<tr>
         <td style="font-family:monospace;font-size:12px;">${esc(b.filename)}</td>
-        <td class="muted" style="font-size:12px;white-space:nowrap;">${b.created_at ? new Date(b.created_at).toLocaleString('ru-RU') : '—'}</td>
+        <td class="muted" style="font-size:12px;white-space:nowrap;">${b.created_at ? fmtServerTS(b.created_at) : '—'}</td>
         <td class="muted" style="font-size:12px;">${b.size_bytes ? Math.round(b.size_bytes / 1024 / 1024 * 10) / 10 + ' МБ' : '—'}</td>
         <td style="text-align:right;white-space:nowrap;">
           <a class="btn" style="padding:4px 8px;font-size:12px;text-decoration:none;" href="/api/backups/${b.id}/download" download>&#10515; Скачать</a>

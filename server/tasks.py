@@ -10,7 +10,7 @@ nightly_backup — ночной дамп БД + ротация. Та же мех
 import logging
 import os
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from celery import Celery
 from celery.schedules import crontab
@@ -72,7 +72,8 @@ def nightly_backup():
     backup_dir = os.getenv("BACKUP_DIR", "/data/backups")
     os.makedirs(backup_dir, exist_ok=True)
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    # Имя — в МСК (стандарт проекта; ручные бэкапы в routers/backups.py — так же)
+    timestamp = datetime.now(timezone(timedelta(hours=3))).strftime("%Y%m%d_%H%M%S")
     filename = f"backup_{timestamp}.sql.gz"
     filepath = os.path.join(backup_dir, filename)
 

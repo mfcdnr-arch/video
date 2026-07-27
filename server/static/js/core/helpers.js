@@ -1,5 +1,17 @@
 // Общие helper-функции UI
 
+// Серверные метки времени (created_at и т.п.) приходят БЕЗ часового пояса,
+// но фактически это UTC (Postgres в контейнере). new Date('...') без Z
+// трактует их как местные и показывает со сдвигом (для МСК — на 3 часа
+// назад). Добавляем Z, если пояс не указан, и показываем в местном времени.
+function fmtServerTS(ts) {
+  if (!ts) return '—';
+  const s = String(ts);
+  const hasTZ = /Z$|[+-]\d\d:?\d\d$/.test(s);
+  const d = new Date(hasTZ ? s : s + 'Z');
+  return isNaN(d) ? s : d.toLocaleString('ru-RU');
+}
+
 function kpi(l, v, s, col) {
   return `<div class="kpi"><div class="l">${l}</div><div class="v"${col?` style="color:${col}"`:''}>${v}</div>${s?`<div class="s"${col?` style="color:${col}"`:''}>${s}</div>`:''}</div>`;
 }
