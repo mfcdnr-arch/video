@@ -63,7 +63,7 @@ async function viewModeration(){
         <div style="font-weight:500;">${esc(m.title || m.filename)}</div>
         <div class="muted" style="font-size:11px;margin:2px 0;">
           ${esc(m.advertiser || 'без рекламодателя')} · ${m.duration_seconds ? Math.round(m.duration_seconds) + ' c' : ''}
-          · загружен ${m.created_at ? new Date(m.created_at).toLocaleString('ru-RU') : ''}
+          · загружен ${m.created_at ? fmtServerTS(m.created_at) : ''}
         </div>
         <div style="font-size:12px;margin:4px 0;">
           <b>${esc(cat)}</b>${m.age_rating ? ' · маркировка <b>' + esc(m.age_rating) + '</b>' : ''}

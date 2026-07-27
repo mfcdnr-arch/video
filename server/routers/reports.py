@@ -311,7 +311,7 @@ _BUILDER_DIMENSION_SQL = {
     "advertiser": "a.name",
     "screen": "s.name",
     "city": "s.city",
-    "day": "to_char(pl.started_at, 'YYYY-MM-DD')",
+    "day": "to_char(pl.started_at + INTERVAL '3 hours', 'YYYY-MM-DD')",
 }
 _BUILDER_METRIC_SQL = {
     "plays": "COUNT(*)",
@@ -366,10 +366,10 @@ def _builder_run_data(body: dict, db: Session):
     if date_from or date_to:
         where, params = [], {}
         if date_from:
-            where.append("pl.started_at >= CAST(:d_from AS date)")
+            where.append("pl.started_at >= CAST(:d_from AS timestamp) - INTERVAL '3 hours'")
             params["d_from"] = date_from
         if date_to:
-            where.append("pl.started_at < (CAST(:d_to AS date) + 1)")
+            where.append("pl.started_at < CAST(:d_to AS timestamp) + INTERVAL '21 hours'")
             params["d_to"] = date_to
     else:
         where = ["pl.started_at > NOW() - (INTERVAL '1 day' * :days)"]
@@ -611,10 +611,10 @@ def _playlog_where(days=7, date_from=None, date_to=None, advertiser=None,
     where, params = [], {}
     if date_from or date_to:
         if date_from:
-            where.append("pl.started_at >= CAST(:d_from AS date)")
+            where.append("pl.started_at >= CAST(:d_from AS timestamp) - INTERVAL '3 hours'")
             params["d_from"] = date_from
         if date_to:
-            where.append("pl.started_at < (CAST(:d_to AS date) + 1)")
+            where.append("pl.started_at < CAST(:d_to AS timestamp) + INTERVAL '21 hours'")
             params["d_to"] = date_to
     else:
         where.append("pl.started_at > NOW() - (INTERVAL '1 day' * :days)")
@@ -637,8 +637,8 @@ def _data_playlog(db: Session, days: int = 7, advertiser: Optional[str] = None, 
     where, params = _playlog_where(days, date_from, date_to, advertiser, media_id, screen)
     params["limit"] = limit
     rows = db.execute(text(f"""
-        SELECT to_char(pl.started_at, 'YYYY-MM-DD') as day,
-               to_char(pl.started_at, 'HH24:MI:SS') as time,
+        SELECT to_char(pl.started_at + INTERVAL '3 hours', 'YYYY-MM-DD') as day,
+               to_char(pl.started_at + INTERVAL '3 hours', 'HH24:MI:SS') as time,
                s.name AS screen, COALESCE(m.title, pl.filename) AS media, a.name AS advertiser
         FROM play_log pl
         JOIN screens s ON s.id = pl.screen_id
@@ -667,8 +667,8 @@ def _data_playlog_by_advertiser(db: Session, days: int = 7, date_from=None, date
         SELECT a.name AS advertiser, COUNT(*) as plays,
                COUNT(DISTINCT DATE(pl.started_at)) as days,
                COUNT(DISTINCT pl.screen_id) as screens,
-               to_char(MIN(pl.started_at), 'YYYY-MM-DD HH24:MI') as first_play,
-               to_char(MAX(pl.started_at), 'YYYY-MM-DD HH24:MI') as last_play
+               to_char(MIN(pl.started_at) + INTERVAL '3 hours', 'YYYY-MM-DD HH24:MI') as first_play,
+               to_char(MAX(pl.started_at) + INTERVAL '3 hours', 'YYYY-MM-DD HH24:MI') as last_play
         FROM play_log pl
         JOIN media m ON m.id = pl.media_id
         JOIN advertisers a ON a.id = m.advertiser_id

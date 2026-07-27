@@ -4,12 +4,16 @@
 // но фактически это UTC (Postgres в контейнере). new Date('...') без Z
 // трактует их как местные и показывает со сдвигом (для МСК — на 3 часа
 // назад). Добавляем Z, если пояс не указан, и показываем в местном времени.
-function fmtServerTS(ts) {
-  if (!ts) return '—';
+function parseServerTS(ts) {
   const s = String(ts);
   const hasTZ = /Z$|[+-]\d\d:?\d\d$/.test(s);
-  const d = new Date(hasTZ ? s : s + 'Z');
-  return isNaN(d) ? s : d.toLocaleString('ru-RU');
+  return new Date(hasTZ ? s : s + 'Z');
+}
+
+function fmtServerTS(ts) {
+  if (!ts) return '—';
+  const d = parseServerTS(ts);
+  return isNaN(d) ? String(ts) : d.toLocaleString('ru-RU');
 }
 
 function kpi(l, v, s, col) {

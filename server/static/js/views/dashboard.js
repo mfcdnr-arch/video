@@ -102,7 +102,7 @@ function feedRow(f){ const m=FEED_IC[f.event_type]||['•','#aeb4be']; const ago
   return `<div class="feed"><span class="fi" style="background:${hexA(m[1],.16)};color:${m[1]};">${m[0]}</span>
     <span><span class="ft" style="display:block;">${esc(f.title)}</span><span class="fm">${esc(f.detail||'')}</span></span>
     <span class="fz">${ago}</span></div>`; }
-function timeAgo(ts){ if(!ts) return ''; const d=new Date(ts); const s=(Date.now()-d.getTime())/1000;
+function timeAgo(ts){ if(!ts) return ''; const d=parseServerTS(ts); const s=(Date.now()-d.getTime())/1000;
   if(s<60) return 'только что'; if(s<3600) return Math.floor(s/60)+' мин назад'; if(s<86400) return Math.floor(s/3600)+' ч назад'; return Math.floor(s/86400)+' дн назад'; }
 
 // ─── Метрики сервера ───────────────────────────────────────────────────────────────

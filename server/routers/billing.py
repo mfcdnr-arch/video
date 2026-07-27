@@ -37,8 +37,8 @@ def _period_stats(db: Session, advertiser_id: int, period_start: date, period_en
         FROM play_log pl
         JOIN media m ON m.id = pl.media_id
         WHERE m.advertiser_id = :aid
-          AND pl.started_at >= :d_from
-          AND pl.started_at < (CAST(:d_to AS date) + 1)
+          AND pl.started_at >= CAST(:d_from AS timestamp) - INTERVAL '3 hours'
+          AND pl.started_at < CAST(:d_to AS timestamp) + INTERVAL '21 hours'
     """), {"aid": advertiser_id, "d_from": period_start, "d_to": period_end}).fetchone()
     plays = int(row.plays or 0)
     minutes = round(float(row.minutes or 0), 1)
@@ -256,8 +256,8 @@ def billing_details(advertiser_id: int = Query(...),
         FROM play_log pl
         JOIN media m ON m.id = pl.media_id
         WHERE m.advertiser_id = :aid
-          AND pl.started_at >= :d_from
-          AND pl.started_at < (CAST(:d_to AS date) + 1)
+          AND pl.started_at >= CAST(:d_from AS timestamp) - INTERVAL '3 hours'
+          AND pl.started_at < CAST(:d_to AS timestamp) + INTERVAL '21 hours'
         GROUP BY m.id, m.title, m.filename
         ORDER BY minutes DESC, plays DESC
     """), {"aid": advertiser_id, "d_from": d_from, "d_to": d_to}).fetchall()

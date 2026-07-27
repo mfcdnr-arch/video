@@ -168,7 +168,7 @@ async function viewReports(){
     h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Неработающие экраны ('+(offline.count||0)+')</div>';
     if(!offline.count){ h+='<div class="muted" style="font-size:12px;">Все экраны онлайн.</div>'; }
     else { h+='<table><tr><th>Экран</th><th>Город</th><th>Последний раз на связи</th></tr>';
-      offline.screens.forEach(s=>{ h+=`<tr><td>${esc(s.name)}</td><td class="muted">${esc(s.city||'')}</td><td class="muted">${s.last_seen?new Date(s.last_seen).toLocaleString('ru-RU'):'—'}</td></tr>`; });
+      offline.screens.forEach(s=>{ h+=`<tr><td>${esc(s.name)}</td><td class="muted">${esc(s.city||'')}</td><td class="muted">${fmtServerTS(s.last_seen)}</td></tr>`; });
       h+='</table>'; }
 
     // Простой экранов (%)
@@ -250,7 +250,7 @@ async function viewReports(){
     let sessions=[]; try{ sessions=await api('/reports/sessions?'+dq); }catch(e){}
     if(!sessions.length){ h+='<div class="muted" style="font-size:12px;">Нет данных о входах.</div>'; }
     else { h+='<table><tr><th>Пользователь</th><th>Роль</th><th>Вход</th><th>Длительность</th></tr>';
-      sessions.forEach(s=>{ h+=`<tr><td>${esc(s.username||'')}</td><td class="muted">${esc(roleLabel(s.role))}</td><td class="muted" style="font-size:12px;">${s.login_at?new Date(s.login_at).toLocaleString('ru-RU'):'—'}</td><td>${fmtDur(s.seconds)}</td></tr>`; });
+      sessions.forEach(s=>{ h+=`<tr><td>${esc(s.username||'')}</td><td class="muted">${esc(roleLabel(s.role))}</td><td class="muted" style="font-size:12px;">${fmtServerTS(s.login_at)}</td><td>${fmtDur(s.seconds)}</td></tr>`; });
       h+='</table>'; }
 
     // Сроки действия роликов
@@ -269,7 +269,7 @@ async function viewReports(){
     if(!losses.length){ h+='<div class="muted" style="font-size:12px;">За период потерь связи не зафиксировано.</div>'; }
     else { h+='<table><tr><th>Мини ПК</th><th>Связь пропала</th><th>Восстановлена</th><th>Длительность</th><th>Статус</th></tr>';
       losses.forEach(l=>{ const secs=l.seconds||0; const dur=fmtDur(secs);
-        h+=`<tr><td>${esc(l.screen||'—')}</td><td class="muted" style="font-size:12px;">${l.lost_at?new Date(l.lost_at).toLocaleString('ru-RU'):'—'}</td><td class="muted" style="font-size:12px;">${l.restored_at?new Date(l.restored_at).toLocaleString('ru-RU'):'—'}</td><td>${dur}</td><td style="color:${l.ongoing?'var(--danger)':'var(--accent)'};font-size:12px;">${l.ongoing?'нет связи':'восстановлена'}</td></tr>`; });
+        h+=`<tr><td>${esc(l.screen||'—')}</td><td class="muted" style="font-size:12px;">${fmtServerTS(l.lost_at)}</td><td class="muted" style="font-size:12px;">${l.restored_at?fmtServerTS(l.restored_at):'—'}</td><td>${dur}</td><td style="color:${l.ongoing?'var(--danger)':'var(--accent)'};font-size:12px;">${l.ongoing?'нет связи':'восстановлена'}</td></tr>`; });
       h+='</table>'; }
 
     // Версии ПО (ОС и плеер mpv)

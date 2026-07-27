@@ -117,7 +117,7 @@ async function viewSettings(){
             <td>${esc(u.username)}${u.full_name ? '<div class="muted" style="font-size:11px;">' + esc(u.full_name) + '</div>' : ''}</td>
             <td>${roleSel}</td>
             <td style="font-size:12px;">${status}</td>
-            <td class="muted" style="font-size:12px;">${u.last_login ? new Date(u.last_login).toLocaleString('ru-RU') : '—'}</td>
+            <td class="muted" style="font-size:12px;">${u.last_login ? fmtServerTS(u.last_login) : '—'}</td>
             <td style="text-align:right;white-space:nowrap;">${actions}</td>
           </tr>`;
         }).join('') + '</table>';
@@ -367,7 +367,7 @@ async function loadTargetVersions(){
         <div class="fld" style="flex:1;"><label>Целевая версия плеера (mpv)</label><input class="inp" id="tgt-vlc" value="${esc(t.vlc_version || '')}" placeholder="например, 0.35.0" ${editable ? '' : 'readonly'}></div>
       </div>
       ${editable ? '<button class="btn primary" data-action="settings-save-target-versions">Сохранить целевые версии</button>' : ''}
-      ${t.updated_at ? `<div class="muted" style="font-size:11px;margin-top:6px;">Обновлено: ${new Date(t.updated_at).toLocaleString('ru-RU')}${t.updated_by ? ' · ' + esc(t.updated_by) : ''}</div>` : ''}`;
+      ${t.updated_at ? `<div class="muted" style="font-size:11px;margin-top:6px;">Обновлено: ${fmtServerTS(t.updated_at)}${t.updated_by ? ' · ' + esc(t.updated_by) : ''}</div>` : ''}`;
   }catch(e){
     el.innerHTML = '<div class="muted" style="font-size:12px;">Не удалось загрузить целевые версии</div>';
   }

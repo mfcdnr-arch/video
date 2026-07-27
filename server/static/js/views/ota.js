@@ -31,7 +31,7 @@ async function viewOta(){
     if(history.length){
       histHtml = '<table><tr><th>Версия</th><th>Экранов</th><th>Файлы</th><th>Автор</th><th>Дата</th></tr>'+
         history.map(u=>{
-          const dt = u.created_at ? new Date(u.created_at).toLocaleString('ru-RU') : '—';
+          const dt = u.created_at ? fmtServerTS(u.created_at) : '—';
           let filesList = '—';
           try{ const ff = typeof u.files==='string' ? JSON.parse(u.files) : (u.files||[]);
             filesList = ff.map(f=>f.name||f).join(', ') || '—'; }catch(e){}

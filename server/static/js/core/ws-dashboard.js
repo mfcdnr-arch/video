@@ -71,7 +71,7 @@
       // Последний heartbeat
       const seenEl = row.querySelector('.screen-last-seen');
       if (seenEl && sc.last_seen) {
-        const d = new Date(sc.last_seen);
+        const d = parseServerTS(sc.last_seen);
         seenEl.textContent = d.toLocaleTimeString('ru-RU');
       }
     }
