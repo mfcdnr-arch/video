@@ -50,7 +50,14 @@ async function doLogin(){
     const res = await fetch(API + '/token', { method: 'POST', body });
 
     if(!res.ok){
-      err.textContent = 'Неверный логин или пароль';
+      // Сервер различает причины: 401 — неверные данные; 403 — пользователь
+      // заблокирован/деактивирован (показывается только при верном пароле,
+      // чтобы не раскрывать статус учётки постороннему)
+      let detail = '';
+      try{ detail = (await res.json()).detail || ''; }catch(_){}
+      err.textContent = (res.status === 403 && detail)
+        ? detail + '. Обратитесь к администратору.'
+        : 'Неверный логин или пароль';
       return;
     }
 
