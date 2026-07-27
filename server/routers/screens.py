@@ -534,6 +534,36 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
         "night_to": pw.night_to.strftime("%H:%M") if pw and pw.night_to else None,
     }
 
+    # ── Авто-снятие бегущей строки при окончании показа плейлиста ──────────
+    # Сервер запоминает, какой плейлист экран играет сейчас (last_playlist_id).
+    # Когда он меняется (кончился слот, включили другой плейлист/эфир) —
+    # активные бегущие строки снимаются автоматически: задание не «висит»
+    # после показа, при котором его запускали. Команда «Стоп» чистит строку
+    # отдельно (см. /command/stop). Первый запуск показа (NULL → плейлист)
+    # сменой не считается.
+    try:
+        if active_playlist is not None:
+            cur_pid = active_playlist.get("playlist_id")  # None при is_off
+        else:
+            now_msk = datetime.now(MSK)
+            day_rows = [r for r in slots if r.day_of_week == now_msk.weekday()]
+            hit = (next((r for r in day_rows if r.hour == now_msk.hour), None)
+                   or next((r for r in day_rows if r.hour is None), None))
+            cur_pid = hit.playlist_id if hit else None
+        prev_pid = db.execute(text(
+            "SELECT last_playlist_id FROM screens WHERE id = :sid"),
+            {"sid": screen_id}).scalar()
+        if prev_pid != cur_pid:
+            db.execute(text(
+                "UPDATE screens SET last_playlist_id = :p WHERE id = :sid"),
+                {"p": cur_pid, "sid": screen_id})
+            if prev_pid is not None:
+                from routers.ticker import auto_clear_tickers
+                auto_clear_tickers(db, "показ плейлиста завершён (смена расписания)")
+            db.commit()
+    except Exception:
+        db.rollback()
+
     return {
         "screen_id": screen_id,
         "active_playlist": active_playlist,   # что играть прямо сейчас (приоритет)
@@ -716,6 +746,11 @@ async def command_stop_screen(
     db.execute(text(
         "INSERT INTO commands (screen_id, type, payload) VALUES (:sid, 'stop', CAST(:p AS jsonb))"
     ), {"sid": screen_id, "p": _json.dumps({})})
+    # Показ остановлен → активные бегущие строки снимаются автоматически
+    # (задание не должно «висеть» после окончания показа, при котором его
+    # запускали; при новом показе строку запускают заново)
+    from routers.ticker import auto_clear_tickers
+    auto_clear_tickers(db, "показ остановлен командой «Стоп»")
     db.commit()
     connected = ws_manager.connected_screens()
     if screen_id in connected:

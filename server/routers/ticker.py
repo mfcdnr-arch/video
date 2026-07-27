@@ -23,11 +23,40 @@ def _send_ticker_command(db: Session, screen_id: int, cmd_type: str, payload: di
     ), {"sid": screen_id, "t": cmd_type, "p": _json.dumps(payload)})
 
 
+def auto_clear_tickers(db: Session, reason: str):
+    """Снять ВСЕ активные бегущие строки автоматически (без коммита — коммитит
+    вызывающий). Используется при окончании показа плейлиста: команда «Стоп»
+    или смена активного плейлиста экрана — задание не должно «висеть» после
+    показа, при котором его запускали. Каждой строке рассылается ticker_hide,
+    снятие фиксируется в журнале."""
+    active = db.execute(text(
+        "SELECT id, message, is_all FROM tickers WHERE is_active = TRUE")).fetchall()
+    if not active:
+        return 0
+    for t in active:
+        if t.is_all:
+            targets = [r.id for r in db.execute(text("SELECT id FROM screens")).fetchall()]
+        else:
+            targets = [r.screen_id for r in db.execute(text(
+                "SELECT screen_id FROM ticker_screens WHERE ticker_id = :tid"
+            ), {"tid": t.id}).fetchall()]
+        for sid in targets:
+            _send_ticker_command(db, sid, "ticker_hide", {})
+        db.execute(text("DELETE FROM tickers WHERE id = :tid"), {"tid": t.id})
+        db.execute(text("""
+            INSERT INTO audit_log (event_type, title, detail, actor)
+            VALUES ('ticker', 'Бегущая строка снята автоматически', :detail, 'system')
+        """), {"detail": f"{t.message} — {reason}"})
+    return len(active)
+
+
 @router.get("/tickers")
 def get_tickers(db: Session = Depends(get_db), current_admin=Depends(get_current_admin)):
+    # Истёкшие по duration строки агент снимает сам — активными их не показываем
     rows = db.execute(text("""
         SELECT id, message, color, speed, is_all
         FROM tickers WHERE is_active = TRUE
+          AND (expires_at IS NULL OR expires_at > NOW())
         ORDER BY created_at DESC
     """)).fetchall()
     return [dict(r._mapping) for r in rows]

@@ -286,7 +286,54 @@ async function viewReports(){
       h+='</table>'; }
 
     view.innerHTML=h;
+    enhanceReportTables(view);
   }catch(e){ view.innerHTML='<div class="empty">Ошибка: '+esc(e.message)+'</div>'; }
+}
+
+// Каждой таблице отчёта — свой фильтр по строкам и сортировка кликом по
+// заголовку столбца (числа сортируются как числа, текст — по алфавиту).
+function enhanceReportTables(root){
+  root.querySelectorAll('table').forEach(tb=>{
+    if(tb.dataset.enhanced) return;
+    tb.dataset.enhanced='1';
+    const bodyRows=()=>[...tb.querySelectorAll('tr')].filter(tr=>!tr.querySelector('th'));
+    if(bodyRows().length<2) return; // одна строка — фильтровать нечего
+
+    // Фильтр по содержимому строк этой таблицы
+    const inp=document.createElement('input');
+    inp.className='inp';
+    inp.placeholder='🔍 Фильтр по этой таблице…';
+    inp.style.cssText='display:block;margin:2px 0 6px;padding:5px 9px;font-size:12px;max-width:320px;';
+    tb.parentNode.insertBefore(inp,tb);
+    inp.addEventListener('input',()=>{
+      const q=inp.value.trim().toLowerCase();
+      bodyRows().forEach(tr=>{
+        tr.style.display=!q||tr.textContent.toLowerCase().includes(q)?'':'none';
+      });
+    });
+
+    // Сортировка по клику на заголовок
+    const headRow=tb.querySelector('tr');
+    if(!headRow) return;
+    [...headRow.cells].forEach((th,ci)=>{
+      if(!th.textContent.trim()) return;
+      th.style.cursor='pointer';
+      th.title='Сортировать по этому столбцу';
+      th.addEventListener('click',()=>{
+        const dir=th.dataset.dir==='asc'?-1:1;
+        [...headRow.cells].forEach(x=>{ delete x.dataset.dir; x.style.textDecoration=''; });
+        th.dataset.dir=dir===1?'asc':'desc';
+        th.style.textDecoration='underline';
+        const num=v=>parseFloat(String(v).replace(',','.').replace(/[^\d.\-]/g,''));
+        bodyRows().sort((a,b)=>{
+          const av=(a.cells[ci]?.textContent||'').trim(), bv=(b.cells[ci]?.textContent||'').trim();
+          const an=num(av), bn=num(bv);
+          if(!isNaN(an)&&!isNaN(bn)&&av!==''&&bv!=='') return (an-bn)*dir;
+          return av.localeCompare(bv,'ru')*dir;
+        }).forEach(tr=>tb.appendChild(tr));
+      });
+    });
+  });
 }
 function fmtDur(sec){ sec=Math.round(sec||0); if(!sec) return '0 мин'; const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60); return (h?h+' ч ':'')+m+' мин'; }
 async function exportFasReport(){
