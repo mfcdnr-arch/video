@@ -47,7 +47,13 @@ step "Аутентификация"
 TOKEN=$($DC curl -s -X POST "$API/token" -d "username=$ADMIN_USER&password=$ADMIN_PASS" \
         -H "Content-Type: application/x-www-form-urlencoded" 2>/dev/null \
         | python3 -c "import sys,json;print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
-if [ -n "$TOKEN" ]; then ok "вход $ADMIN_USER — токен получен"; else bad "вход не удался"; echo "Дальнейшие проверки невозможны без токена."; exit $((FAIL)); fi
+if [ -n "$TOKEN" ]; then ok "вход $ADMIN_USER — токен получен"; else
+  bad "вход не удался"
+  echo "Дальнейшие проверки невозможны без токена."
+  echo "Если пароль admin был сменён (боевой сервер), передайте его так:"
+  echo '  read -rsp "Пароль admin: " ADMIN_PASS; echo; ADMIN_PASS="$ADMIN_PASS" bash smoke_test.sh; unset ADMIN_PASS'
+  exit $((FAIL))
+fi
 
 # ── 4. Полный цикл: экран → медиа → плейлист → расписание ────────────────────
 step "Основной цикл эфира"
