@@ -713,10 +713,16 @@ def _cell(v):
 
 
 def _build_xlsx(sections):
-    """sections: список (title, columns, rows)"""
+    """sections: список (title, columns, rows). Оформление: жирная шапка с
+    заливкой, закреплённая первая строка, автофильтр, ширины столбцов по
+    содержимому (наименования не обрезаются)."""
     from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
     wb = Workbook()
     wb.remove(wb.active)
+    head_font = Font(bold=True, color="FFFFFF")
+    head_fill = PatternFill("solid", fgColor="2B2F36")
     used_names = set()
     invalid_chars = r'[]:*?/\\'
     for title, columns, rows in sections:
@@ -728,9 +734,23 @@ def _build_xlsx(sections):
             name = f"{base[:28]}~{i}"
         used_names.add(name)
         ws = wb.create_sheet(name)
-        ws.append(columns)
+        ws.append(list(columns))
+        for c in ws[1]:
+            c.font = head_font
+            c.fill = head_fill
+            c.alignment = Alignment(vertical="center")
         for row in rows:
             ws.append([_cell(c) for c in row])
+        # Ширины столбцов: по самому длинному значению (шапка или данные),
+        # с разумным потолком — длинное содержимое переносится внутри ячейки
+        for ci in range(1, len(columns) + 1):
+            longest = max([len(str(columns[ci - 1]))] +
+                          [len(str(_cell(r[ci - 1]))) for r in rows[:200]] or [0])
+            ws.column_dimensions[get_column_letter(ci)].width = min(52, max(10, longest + 2))
+        if len(columns) > 0:
+            last_col = get_column_letter(len(columns))
+            ws.auto_filter.ref = f"A1:{last_col}{max(1, len(rows) + 1)}"
+        ws.freeze_panes = "A2"
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)

@@ -384,19 +384,17 @@ function openExport(){
     <div class="fld"><label>Период</label>
       <select class="inp" id="exp-days"><option value="7">Последние 7 дней</option><option value="30">Последние 30 дней</option><option value="90">Последние 90 дней</option><option value="1">Сегодня</option></select></div>
     <div class="fld"><label>Какие отчёты включить</label>
-      <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><button class="btn" style="padding:4px 10px;font-size:12px;" o<button class="btn" style="padding:4px 10px;font-size:12px;" data-action="reports-exp-all-true">Все</button>
-<button class="btn" style="padding:4px 10px;font-size:12px;" data-action="reports-exp-all-false">Снять</button>
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+        <button class="btn" style="padding:4px 10px;font-size:12px;" data-action="reports-exp-all-true">Все</button>
+        <button class="btn" style="padding:4px 10px;font-size:12px;" data-action="reports-exp-all-false">Снять</button>
+      </div>
       <div style="max-height:190px;overflow:auto;border:0.5px solid var(--border2);border-radius:8px;padding:8px;">
         ${EXPORT_SECTIONS.map(s=>`<label style="display:flex;align-items:center;gap:8px;padding:5px 4px;font-size:13px;cursor:pointer;"><input type="checkbox" class="exp-chk" value="${s[0]}" checked> ${s[1]}</label>`).join('')}
       </div></div>
-    <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
-  <button class="btn" style="padding:4px 10px;font-size:12px;" data-action="reports-exp-all-true">Все</button>
-  <button class="btn" style="padding:4px 10px;font-size:12px;" data-action="reports-exp-all-false">Снять</button>
-</div>
-<button class="btn primary" data-action="reports-do-export-xlsx">Скачать Excel</button>
-<button class="btn primary" data-action="reports-do-export-pdf">Скачать PDF</button>
-<button class="btn" style="margin-left:auto;" data-action="reports-close-export">Отмена</button>
-
+    <div style="display:flex;gap:8px;margin-top:12px;">
+      <button class="btn primary" data-action="reports-do-export-xlsx">Скачать Excel</button>
+      <button class="btn primary" data-action="reports-do-export-pdf">Скачать PDF</button>
+      <button class="btn" style="margin-left:auto;" data-action="reports-close-export">Отмена</button>
     </div>
   </div>`;
   ov.addEventListener('click',e=>{ if(e.target===ov) closeExport(); });
