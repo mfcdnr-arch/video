@@ -1,5 +1,5 @@
 """Плейлисты и их содержимое."""
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -81,6 +81,80 @@ def get_playlist_items(playlist_id: int, admin: dict = Depends(get_current_admin
         WHERE pi.playlist_id = :pid ORDER BY pi.position
     """), {"pid": playlist_id}).fetchall()
     return [dict(r._mapping) for r in rows]
+
+
+@router.patch("/playlists/{playlist_id}/fill")
+def set_playlist_fill(playlist_id: int, body: dict = Body(...),
+                      admin: dict = Depends(require_write), db: Session = Depends(get_db)):
+    """Режим длительности плейлиста: fill_to_hour=true — эфирный блок
+    фиксированной длины (target_minutes, по умолчанию 60), добивается
+    заглушками; false — произвольный плейлист, играет как есть."""
+    if not db.execute(text("SELECT 1 FROM playlists WHERE id=:id"), {"id": playlist_id}).fetchone():
+        raise HTTPException(404, "Плейлист не найден")
+    fill = bool(body.get("fill_to_hour", True))
+    minutes = body.get("target_minutes", 60)
+    try:
+        minutes = int(minutes)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "target_minutes: целое число минут")
+    if not (1 <= minutes <= 24 * 60):
+        raise HTTPException(400, "target_minutes: от 1 до 1440 минут")
+    db.execute(text(
+        "UPDATE playlists SET fill_to_hour=:f, target_seconds=:t WHERE id=:id"
+    ), {"f": fill, "t": minutes * 60, "id": playlist_id})
+    db.commit()
+    return {"status": "ok", "fill_to_hour": fill, "target_minutes": minutes}
+
+
+@router.get("/playlists/{playlist_id}/fill_info")
+def playlist_fill_info(playlist_id: int, admin: dict = Depends(get_current_admin),
+                       db: Session = Depends(get_db)):
+    """Расчёт заполнения эфирного блока: сколько идут основные ролики, сколько
+    заглушек добавится, и предупреждения (нет заглушек / не хватает / перебор)."""
+    pl = db.execute(text(
+        "SELECT COALESCE(fill_to_hour, TRUE) AS fill_to_hour, "
+        "COALESCE(target_seconds, 3600) AS target_seconds "
+        "FROM playlists WHERE id=:id"), {"id": playlist_id}).fetchone()
+    if not pl:
+        raise HTTPException(404, "Плейлист не найден")
+
+    from admin_panel import build_hourly_detail
+    d = build_hourly_detail(db, playlist_id, int(pl.target_seconds))
+
+    warnings = []
+    # Для пустого плейлиста агент не играет ничего (в т.ч. заглушки) —
+    # предупреждать о нехватке заглушек бессмысленно
+    if pl.fill_to_hour and d["main_plays"] > 0:
+        target = float(pl.target_seconds)
+        remaining = target - d["main_seconds"]
+        if d["main_seconds"] > target:
+            warnings.append(
+                f"Основные ролики идут {d['main_seconds']/60:.1f} мин — это БОЛЬШЕ целевых "
+                f"{target/60:.0f} мин. Блок будет длиннее цели, заглушки не добавляются. "
+                "Уберите ролики или увеличьте целевую длительность.")
+        elif remaining > 0 and d["fillers_available"] == 0:
+            warnings.append(
+                f"До {target/60:.0f} мин не хватает {remaining/60:.1f} мин, а заглушек в "
+                "медиатеке нет — эфирный блок будет короче цели. Загрузите ролики в "
+                "Медиатека → Заглушки.")
+        elif remaining > 0 and d["fillers_available_seconds"] < remaining:
+            warnings.append(
+                f"Свободные {remaining/60:.1f} мин заполняются заглушками, но их суммарная "
+                f"длительность всего {d['fillers_available_seconds']/60:.1f} мин — заглушки "
+                "будут повторяться по кругу. Загрузите больше заглушек для разнообразия.")
+
+    return {
+        "fill_to_hour": bool(pl.fill_to_hour),
+        "target_seconds": int(pl.target_seconds),
+        "main_seconds": round(d["main_seconds"], 1),
+        "main_plays": d["main_plays"],
+        "filler_seconds": round(d["filler_seconds"], 1),
+        "filler_plays": d["filler_plays"],
+        "total_seconds": round(d["main_seconds"] + d["filler_seconds"], 1),
+        "fillers_available": d["fillers_available"],
+        "fillers_available_seconds": round(d["fillers_available_seconds"], 1),
+        "warnings": warnings,
+    }
 
 
 @router.delete("/playlists/{playlist_id}")

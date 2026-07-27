@@ -483,6 +483,55 @@ def _data_playtime(db: Session, days: int = 7, advertiser: Optional[str] = None,
     }
 
 
+def _data_fillers(db: Session, days: int = 7, date_from=None, date_to=None,
+                  media_id=None, screen=None):
+    """Отчёт по заглушкам: показы и эфирное время за период (всего и по каждому
+    ролику) + справочно состав папки «Заглушки» в медиатеке."""
+    where, p = _playlog_where(days, date_from, date_to, None, media_id, screen)
+    where += " AND COALESCE(m.is_filler, FALSE) = TRUE"
+
+    air_total = db.execute(text(f"""
+        SELECT COUNT(*) as plays,
+               COALESCE(SUM(EXTRACT(EPOCH FROM (pl.ended_at - pl.started_at))), 0) as seconds
+        FROM play_log pl {_CONTENT_JOINS}
+        WHERE {where}
+    """), p).fetchone()
+
+    air_by_media = db.execute(text(f"""
+        SELECT m.id AS media_id, m.title, m.filename, COUNT(*) as plays,
+               COALESCE(SUM(EXTRACT(EPOCH FROM (pl.ended_at - pl.started_at))), 0) as seconds
+        FROM play_log pl {_CONTENT_JOINS}
+        WHERE {where}
+        GROUP BY m.id, m.title, m.filename
+        ORDER BY seconds DESC
+    """), p).fetchall()
+
+    library = db.execute(text("""
+        SELECT id, title, filename, duration_seconds, status, review_status
+        FROM media WHERE COALESCE(is_filler, FALSE) = TRUE
+        ORDER BY title, filename
+    """)).fetchall()
+    lib_items = [dict(r._mapping) for r in library]
+    lib_ready = [i for i in lib_items
+                 if i["status"] == "ready" and i["review_status"] == "approved"]
+
+    return {
+        "air": {"plays": air_total.plays, "seconds": float(air_total.seconds or 0),
+                "by_media": [dict(r._mapping) for r in air_by_media]},
+        "library": {"count": len(lib_items), "ready_count": len(lib_ready),
+                    "total_seconds": round(sum(i["duration_seconds"] or 0 for i in lib_ready), 1),
+                    "items": lib_items},
+    }
+
+
+@router.get("/reports/fillers")
+def report_fillers(days: int = Query(7),
+                   date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None),
+                   media_id: Optional[int] = Query(None), screen: Optional[str] = Query(None),
+                   admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    return _data_fillers(db, days, date_from, date_to, media_id, screen)
+
+
 @router.get("/reports/playtime")
 def report_playtime(days: int = Query(7), advertiser: Optional[str] = Query(None),
                      date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None),

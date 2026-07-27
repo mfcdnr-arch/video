@@ -112,7 +112,7 @@ async function viewReports(){
     const dq=dashQ();
     const perLabel=(DASH_FROM||DASH_TO)?((DASH_FROM||'…')+'…'+(DASH_TO||'…'))
       :({'1':'сегодня','7':'7 дней','30':'30 дней','90':'90 дней'}[DASH_DAYS]||(DASH_DAYS+' дн.'));
-    const [sum,offline,playtime,byScr,lowDisk,downtime,broken] = await Promise.all([
+    const [sum,offline,playtime,byScr,lowDisk,downtime,broken,fillers] = await Promise.all([
       api('/reports/summary').catch(()=>({})),
       api('/reports/offline-screens').catch(()=>({count:0,screens:[]})),
       api('/reports/playtime?'+dq).catch(()=>({total:{},by_media:[],by_advertiser:[]})),
@@ -120,6 +120,7 @@ async function viewReports(){
       api('/reports/low-disk?threshold_pct=15').catch(()=>[]),
       api('/reports/downtime?hours_full=8').catch(()=>[]),
       api('/reports/broken-media?'+dq).catch(()=>[]),
+      api('/reports/fillers?'+dq).catch(()=>null),
     ]);
     // Единая панель фильтров дашборда (Дата · Рекламодатель · Ролик · Экран)
     let h=`<div class="row" style="flex-wrap:wrap;align-items:end;margin-bottom:6px;">
@@ -203,6 +204,28 @@ async function viewReports(){
     else { h+='<table><tr><th>Рекламодатель</th><th>Повторов</th><th>Время показа</th></tr>';
       playtime.by_advertiser.forEach(a=>{ h+=`<tr><td>${esc(a.advertiser)}</td><td>${a.plays}</td><td>${fmtDur(a.seconds)}</td></tr>`; });
       h+='</table>'; }
+
+    // Заглушки: эфир за период + состав папки
+    if(fillers){
+      h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Заглушки — показы за период и состав папки</div>';
+      h+=`<div class="muted" style="font-size:12px;margin-bottom:8px;">В эфире за ${esc(perLabel)}: <b>${fillers.air.plays} показ(ов) · ${fmtDurMin(fillers.air.seconds)}</b>. В медиатеке: <b>${fillers.library.ready_count} заглуш(ек) · ${fmtDurMin(fillers.library.total_seconds)}</b> (готовы к эфиру).</div>`;
+      if(fillers.air.by_media.length){
+        h+='<table><tr><th>Заглушка</th><th>Показов в эфире</th><th>Время в эфире</th></tr>';
+        fillers.air.by_media.forEach(m=>{ h+=`<tr><td>${esc(m.title||m.filename)}</td><td>${m.plays}</td><td>${fmtDurMin(m.seconds)}</td></tr>`; });
+        h+='</table>';
+      } else {
+        h+='<div class="muted" style="font-size:12px;">Показов заглушек за период не было.</div>';
+      }
+      if(fillers.library.items.length){
+        h+='<table style="margin-top:8px;"><tr><th>В папке «Заглушки»</th><th>Длительность</th><th>Статус</th></tr>';
+        fillers.library.items.forEach(m=>{
+          const st=(m.status==='ready'&&m.review_status==='approved')?'в эфире может играть':'<span style="color:var(--danger);">не готов</span>';
+          h+=`<tr><td>${esc(m.title||m.filename)}</td><td>${fmtDurMin(m.duration_seconds)}</td><td class="muted" style="font-size:11px;">${st}</td></tr>`; });
+        h+='</table>';
+      } else {
+        h+='<div class="muted" style="font-size:12px;">Папка «Заглушки» пуста — плейлисты с целевой длительностью не смогут добиться до цели. Загрузите ролики: Медиатека → Заглушки.</div>';
+      }
+    }
 
     // Заработок по рекламодателям
     h+='<div class="rhead" data-action="reports-toggle-section" style="cursor:pointer;user-select:none;"><span class="rcaret">▾</span>Заработок по рекламодателям</div>';

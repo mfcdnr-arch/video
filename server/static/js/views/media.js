@@ -93,7 +93,31 @@ function initMediaViewActions(){
 
       case 'media-submit-upload':
         return doUpload();
+
+      case 'media-open-fillers':
+        return openFillers();
+
+      case 'media-fillers-upload':
+        document.getElementById('fillers-file')?.click();
+        return;
+
+      case 'media-filler-unmark': {
+        const fileId = Number(el.dataset.fileId);
+        return unmarkFiller(fileId);
+      }
+
+      case 'media-filler-delete': {
+        const fileId = Number(el.dataset.fileId);
+        const fileName = el.dataset.fileName || '';
+        return deleteFillerFile(fileId, fileName);
+      }
     }
+  });
+
+  // Выбор файлов для загрузки заглушек
+  document.addEventListener('change', e => {
+    const el = e.target.closest('#fillers-file');
+    if(el && el.files.length) uploadFillers(el.files);
   });
 
   // Изменение полей формы загрузки
@@ -177,11 +201,19 @@ async function viewMedia(){
   const view = document.getElementById('view');
 
   try{
-    const advs = await api('/advertisers');
+    const [advs, fillers] = await Promise.all([api('/advertisers'), api('/media/fillers')]);
     advs.forEach(a => ADV_COLORS[a.id] = a.color);
 
+    const fillersCard = `<div class="cell" data-action="media-open-fillers"
+        style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:12px;border:0.5px dashed var(--border2);">
+        <span style="font-size:16px;">📼</span>
+        <span style="font-weight:500;width:140px;">Заглушки</span>
+        <span style="color:var(--muted);font-size:12px;">${fillers.ready_count} шт · ${fmtDurMin(fillers.total_seconds)} — добивают эфирный блок плейлиста до целевых 60 минут</span>
+        <span style="flex:1;"></span><span class="dim">›</span>
+      </div>`;
+
     if(!advs.length){
-      view.innerHTML = '<div class="empty">Рекламодателей пока нет.<br>Нажмите «+ Рекламодатель» чтобы создать, или «↑ Загрузить файл» — при загрузке тоже можно создать рекламодателя.</div>';
+      view.innerHTML = fillersCard + '<div class="empty">Рекламодателей пока нет.<br>Нажмите «+ Рекламодатель» чтобы создать, или «↑ Загрузить файл» — при загрузке тоже можно создать рекламодателя.</div>';
       return;
     }
 
@@ -189,6 +221,7 @@ async function viewMedia(){
       <input class="inp" id="media-search" placeholder="🔍 Поиск: название ролика, файл, рекламодатель…" data-action="media-search-input" autocomplete="off">
     </div>
     <div id="media-search-results"></div>
+    ${fillersCard}
     <div id="media-adv-list">`;
     h += '<div class="muted" style="font-size:12px;margin-bottom:11px;">Рекламодатель → папки → файлы. Цена за минуту эфира используется для расчёта заработка в отчётах.</div>';
 
@@ -481,6 +514,92 @@ async function setBannerDuration(id, current){
       headers:{'Content-Type':'application/json'}, body: JSON.stringify({seconds: sec})});
     toast('Длительность обновлена: ' + sec + ' с');
     MEDIA_ADV ? openAdv(MEDIA_ADV.id, MEDIA_ADV.name) : viewMedia();
+  }catch(e){ toast('Ошибка: ' + e.message); }
+}
+
+//=============================================================================
+// ПАПКА «ЗАГЛУШКИ»
+//=============================================================================
+
+function fmtDurMin(sec){
+  sec = Math.round(sec || 0);
+  if(sec < 90) return sec + ' с';
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return s ? `${m} мин ${s} с` : `${m} мин`;
+}
+
+async function openFillers(){
+  MEDIA_ADV = null;
+  document.getElementById('topright').innerHTML = '';
+  const view = document.getElementById('view');
+  try{
+    const d = await api('/media/fillers');
+    let h = `<div style="display:flex;align-items:center;gap:9px;margin-bottom:6px;">
+      <button class="btn" data-action="media-back">← Назад</button>
+      <span style="font-size:16px;">📼</span><span style="font-weight:500;">Заглушки</span>
+      <span style="flex:1;"></span>
+      ${canWrite()?`<button class="btn primary" data-action="media-fillers-upload">↑ Загрузить заглушки</button>
+      <input type="file" id="fillers-file" multiple accept="video/*,image/*" style="display:none;">`:''}
+    </div>
+    <div class="muted" style="font-size:12px;margin-bottom:10px;">Заглушки — служебные ролики (не реклама, без модерации). Ими плейлист автоматически добивается до целевой длительности (по умолчанию 60 минут), равномерно между основными роликами. Итого готово к эфиру: <b>${d.ready_count} шт · ${fmtDurMin(d.total_seconds)}</b>.</div>
+    <div id="fillers-progress" class="muted" style="font-size:12px;margin-bottom:8px;"></div>`;
+
+    if(!d.items.length){
+      h += '<div class="empty">Заглушек пока нет. Загрузите ролики — без них плейлист с целевой длительностью останется короче цели.</div>';
+      view.innerHTML = h; return;
+    }
+
+    h += '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr));">';
+    d.items.forEach(f => {
+      h += `<div class="cell" style="padding:0;overflow:hidden;">
+        <div style="height:88px;background:var(--bg2);display:flex;align-items:center;justify-content:center;color:#454b57;font-size:26px;position:relative;">
+          <img src="${API}/media/${f.id}/thumbnail" alt=""
+               style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;"
+               onerror="this.remove()">▶
+          ${f.status!=='ready'||f.review_status!=='approved'?'<span style="position:absolute;top:6px;right:6px;background:#8a6d00;color:#ffe9a8;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;">не в эфире</span>':''}</div>
+        <div style="padding:9px 10px;">
+          <div style="font-size:12px;font-weight:500;word-break:break-all;">${esc(f.title||f.filename)}</div>
+          <div style="font-size:11px;color:var(--muted);margin:2px 0 7px;">${fmtSize(f.filesize)}${f.duration_seconds?' · '+fmtDurMin(f.duration_seconds):''}</div>
+          ${canWrite()?`<div style="display:flex;gap:5px;align-items:center;border-top:0.5px solid var(--border2);padding-top:7px;">
+            <button class="iconbtn" title="Скачать" data-action="media-download" data-file-id="${f.id}">⤓</button>
+            <button class="iconbtn" title="Перевести в обычные ролики (убрать из заглушек)" data-action="media-filler-unmark" data-file-id="${f.id}">⬚</button>
+            <button class="iconbtn del" title="Удалить" style="margin-left:auto;" data-action="media-filler-delete" data-file-id="${f.id}" data-file-name="${esc(f.title||f.filename)}">🗑</button>
+          </div>`:''}</div></div>`;
+    });
+    view.innerHTML = h + '</div>';
+  }catch(e){ view.innerHTML = '<div class="empty">Ошибка: ' + esc(e.message) + '</div>'; }
+}
+
+async function uploadFillers(files){
+  const prog = document.getElementById('fillers-progress');
+  const list = Array.from(files);
+  let done = 0, failed = [];
+  for(const f of list){
+    if(prog) prog.textContent = `Загрузка ${done+1} из ${list.length}: ${f.name}…`;
+    const fd = new FormData(); fd.append('file', f);
+    const title = f.name.replace(/\.[^.]+$/, '');
+    try{
+      await api('/media/upload?' + new URLSearchParams({title, is_filler:'true'}), {method:'POST', body:fd});
+      done++;
+    }catch(e){ failed.push(`${f.name}: ${e.message}`); }
+  }
+  if(failed.length) alert('Не загружено:\n\n' + failed.join('\n'));
+  toast(`Загружено заглушек: ${done} из ${list.length}`);
+  openFillers();
+}
+
+async function unmarkFiller(id){
+  try{
+    await api('/media/' + id + '/filler', {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({is_filler:false})});
+    toast('Ролик переведён в обычные'); openFillers();
+  }catch(e){ toast('Ошибка: ' + e.message); }
+}
+
+async function deleteFillerFile(id, name){
+  if(!confirm(`Удалить заглушку «${name}»? Файл будет удалён с сервера.`)) return;
+  try{
+    await api('/media/' + id, {method:'DELETE'});
+    toast('Удалено'); openFillers();
   }catch(e){ toast('Ошибка: ' + e.message); }
 }
 

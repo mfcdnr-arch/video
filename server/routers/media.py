@@ -120,12 +120,17 @@ async def upload_media(
     age_rating: Optional[str] = Query(None, description="Возрастная маркировка 0+/6+/12+/16+/18+"),
     disclaimer_text: Optional[str] = Query(None, description="Текст обязательного предупреждения"),
     license_number: Optional[str] = Query(None, description="№ лицензии (финансовые услуги)"),
+    is_filler: bool = Query(False, description="Загрузить как заглушку (папка «Заглушки»)"),
     admin: dict = Depends(require_write)
 ):
     """Загрузить видеофайл на сервер. Категория по 38-ФЗ обязательна;
     табак блокируется; регулируемые категории требуют доп. полей.
     Новый файл попадает на модерацию (review_status='pending') и не
-    выдаётся экранам до одобрения; служебный контент — сразу approved."""
+    выдаётся экранам до одобрения; служебный контент — сразу approved.
+    is_filler=true — файл сразу в «Заглушки»: категория service (не реклама,
+    модерация не нужна), рекламодатель/папка «Служебное»/«Заглушки»."""
+    if is_filler:
+        category = "service"
     category, age_rating = _validate_ad_fields(category, age_rating, disclaimer_text, license_number)
     review_status = "approved" if AD_CATEGORIES[category].get("auto_ok") else "pending"
     # Случайный суффикс защищает от коллизии имён: два файла с одинаковым
@@ -168,15 +173,31 @@ async def upload_media(
         duration = float(image_seconds)
 
     with Session(engine) as db:
+        if is_filler and not advertiser_id:
+            # Заглушки складываются в служебную папку (создана миграцией 009;
+            # на всякий случай добиваем, если её удалили руками)
+            db.execute(text("INSERT INTO advertisers (name, color, note) VALUES "
+                            "('Служебное', '#9298a3', 'Системные материалы: заглушки') "
+                            "ON CONFLICT (name) DO NOTHING"))
+            row = db.execute(text("SELECT id FROM advertisers WHERE name='Служебное'")).fetchone()
+            advertiser_id = row[0]
+            db.execute(text("INSERT INTO media_folders (advertiser_id, name) "
+                            "SELECT :a, 'Заглушки' WHERE NOT EXISTS "
+                            "(SELECT 1 FROM media_folders WHERE advertiser_id=:a AND name='Заглушки')"),
+                       {"a": advertiser_id})
+            frow = db.execute(text("SELECT id FROM media_folders WHERE advertiser_id=:a AND name='Заглушки'"),
+                              {"a": advertiser_id}).fetchone()
+            folder_id = frow[0]
         result = db.execute(text(
             "INSERT INTO media (title, filename, filesize, md5_hash, status, duration_seconds, "
-            "valid_from, valid_until, advertiser_id, folder_id, "
+            "valid_from, valid_until, advertiser_id, folder_id, is_filler, "
             "category, age_rating, disclaimer_text, license_number, review_status) "
-            "VALUES (:t, :f, :s, :m, 'ready', :dur, :vf, :vu, :aid, :fid, "
+            "VALUES (:t, :f, :s, :m, 'ready', :dur, :vf, :vu, :aid, :fid, :fil, "
             ":cat, :age, :disc, :lic, :rev) RETURNING id"
         ), {"t": title, "f": filename, "s": size, "m": md5_hash, "dur": duration,
             "vf": valid_from or None, "vu": valid_until or None,
             "aid": advertiser_id or None, "fid": folder_id or None,
+            "fil": bool(is_filler),
             "cat": category, "age": age_rating,
             "disc": (disclaimer_text or "").strip() or None,
             "lic": (license_number or "").strip() or None,
@@ -200,7 +221,8 @@ async def upload_media(
 @router.get("/media")
 def list_media(admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
     rows = db.execute(text(
-        "SELECT id, title, filename, filesize, md5_hash, duration_seconds, status, created_at "
+        "SELECT id, title, filename, filesize, md5_hash, duration_seconds, status, created_at, "
+        "COALESCE(is_filler, FALSE) AS is_filler "
         "FROM media ORDER BY created_at DESC"
     )).fetchall()
     return [dict(r._mapping) for r in rows]
@@ -222,6 +244,23 @@ def search_media(q: str = Query(..., min_length=2, max_length=100),
         LIMIT 50
     """), {"pat": f"%{q}%"}).fetchall()
     return [dict(r._mapping) for r in rows]
+
+
+@router.get("/media/fillers")
+def list_fillers(admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    """Папка «Заглушки»: все ролики-заглушки с длительностями и итогом."""
+    rows = db.execute(text("""
+        SELECT id, title, filename, filesize, duration_seconds, status,
+               review_status, created_at
+        FROM media WHERE COALESCE(is_filler, FALSE) = TRUE
+        ORDER BY created_at DESC
+    """)).fetchall()
+    items = [dict(r._mapping) for r in rows]
+    ready = [i for i in items if i["status"] == "ready" and i["review_status"] == "approved"]
+    return {"items": items,
+            "count": len(items),
+            "ready_count": len(ready),
+            "total_seconds": round(sum(i["duration_seconds"] or 0 for i in ready), 1)}
 
 
 @router.get("/media/{media_id}")
