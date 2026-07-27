@@ -717,12 +717,14 @@ def _build_xlsx(sections):
     заливкой, закреплённая первая строка, автофильтр, ширины столбцов по
     содержимому (наименования не обрезаются)."""
     from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
     wb = Workbook()
     wb.remove(wb.active)
     head_font = Font(bold=True, color="FFFFFF")
     head_fill = PatternFill("solid", fgColor="2B2F36")
+    thin = Side(style="thin", color="B7BCC4")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
     used_names = set()
     invalid_chars = r'[]:*?/\\'
     for title, columns, rows in sections:
@@ -739,18 +741,31 @@ def _build_xlsx(sections):
             c.font = head_font
             c.fill = head_fill
             c.alignment = Alignment(vertical="center")
+            c.border = box
         for row in rows:
             ws.append([_cell(c) for c in row])
+        if not rows:
+            # Пустой раздел — явная пометка вместо голой шапки
+            ws.append(["Нет данных за выбранный период"] + [""] * (len(columns) - 1))
+            ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=max(1, len(columns)))
+            ws.cell(row=2, column=1).font = Font(italic=True, color="808690")
+        # Рамки вокруг всех ячеек данных — отчёт выглядит законченным блоком
+        for r in ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=len(columns)):
+            for c in r:
+                c.border = box
         # Ширины столбцов: по самому длинному значению (шапка или данные),
         # с разумным потолком — длинное содержимое переносится внутри ячейки
         for ci in range(1, len(columns) + 1):
             longest = max([len(str(columns[ci - 1]))] +
                           [len(str(_cell(r[ci - 1]))) for r in rows[:200]] or [0])
             ws.column_dimensions[get_column_letter(ci)].width = min(52, max(10, longest + 2))
-        if len(columns) > 0:
+        if rows:
             last_col = get_column_letter(len(columns))
-            ws.auto_filter.ref = f"A1:{last_col}{max(1, len(rows) + 1)}"
+            ws.auto_filter.ref = f"A1:{last_col}{len(rows) + 1}"
         ws.freeze_panes = "A2"
+        # Серую «бесконечную» сетку вокруг отчёта не показываем —
+        # виден только сам отчёт в рамках
+        ws.sheet_view.showGridLines = False
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
