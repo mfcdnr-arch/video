@@ -221,9 +221,11 @@ async def upload_media(
 @router.get("/media")
 def list_media(admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
     rows = db.execute(text(
-        "SELECT id, title, filename, filesize, md5_hash, duration_seconds, status, created_at, "
-        "COALESCE(is_filler, FALSE) AS is_filler "
-        "FROM media ORDER BY created_at DESC"
+        "SELECT m.id, m.title, m.filename, m.filesize, m.md5_hash, m.duration_seconds, "
+        "m.status, m.created_at, COALESCE(m.is_filler, FALSE) AS is_filler, "
+        "m.advertiser_id, m.folder_id, a.name AS advertiser "
+        "FROM media m LEFT JOIN advertisers a ON a.id = m.advertiser_id "
+        "ORDER BY m.created_at DESC"
     )).fetchall()
     return [dict(r._mapping) for r in rows]
 
@@ -261,6 +263,90 @@ def list_fillers(admin: dict = Depends(get_current_admin), db: Session = Depends
             "count": len(items),
             "ready_count": len(ready),
             "total_seconds": round(sum(i["duration_seconds"] or 0 for i in ready), 1)}
+
+
+@router.get("/media/common")
+def common_media(admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    """Общая медиатека: файлы без рекламодателя (кроме заглушек) и общие папки
+    (media_folders.advertiser_id IS NULL)."""
+    folders = db.execute(text("""
+        SELECT f.id, f.name, COUNT(m.id) AS files
+        FROM media_folders f
+        LEFT JOIN media m ON m.folder_id = f.id
+        WHERE f.advertiser_id IS NULL
+        GROUP BY f.id ORDER BY f.name
+    """)).fetchall()
+    files = db.execute(text("""
+        SELECT m.id, m.title, m.filename, m.filesize, m.duration_seconds,
+               COALESCE(m.is_filler, FALSE) AS is_filler, m.folder_id,
+               m.category, m.age_rating, m.review_status, m.reject_reason,
+               EXISTS(SELECT 1 FROM playlist_items pi WHERE pi.media_id = m.id) AS in_playlist
+        FROM media m
+        WHERE m.advertiser_id IS NULL AND COALESCE(m.is_filler, FALSE) = FALSE
+          AND m.status = 'ready'
+        ORDER BY m.created_at DESC
+    """)).fetchall()
+    return {"folders": [dict(r._mapping) for r in folders],
+            "files": [dict(r._mapping) for r in files]}
+
+
+@router.post("/media/folders")
+def create_common_folder(body: dict = Body(...),
+                         admin: dict = Depends(require_write), db: Session = Depends(get_db)):
+    """Создать общую папку (без привязки к рекламодателю)."""
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "name обязателен")
+    # UNIQUE(advertiser_id, name) не ловит дубли при NULL — проверяем сами
+    dup = db.execute(text(
+        "SELECT 1 FROM media_folders WHERE advertiser_id IS NULL AND name = :n"),
+        {"n": name}).fetchone()
+    if dup:
+        raise HTTPException(409, "Папка с таким именем уже существует")
+    row = db.execute(text(
+        "INSERT INTO media_folders (advertiser_id, name) VALUES (NULL, :n) RETURNING id, name"
+    ), {"n": name}).fetchone()
+    db.commit()
+    return dict(row._mapping)
+
+
+@router.get("/media/folders-all")
+def list_all_folders(admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    """Все папки медиатеки (общие и рекламодателей) — для выбора папки
+    при наполнении плейлиста и переносе файлов."""
+    rows = db.execute(text("""
+        SELECT f.id, f.name, f.advertiser_id, a.name AS advertiser,
+               COUNT(m.id) AS files
+        FROM media_folders f
+        LEFT JOIN advertisers a ON a.id = f.advertiser_id
+        LEFT JOIN media m ON m.folder_id = f.id
+        GROUP BY f.id, a.name
+        ORDER BY a.name NULLS FIRST, f.name
+    """)).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+@router.patch("/media/{media_id}/folder")
+def move_media_to_folder(media_id: int, body: dict = Body(...),
+                         admin: dict = Depends(require_write), db: Session = Depends(get_db)):
+    """Перенести файл в папку (folder_id=null — «без папки»). Рекламодатель
+    файла подстраивается под владельца папки."""
+    if not db.execute(text("SELECT 1 FROM media WHERE id=:id"), {"id": media_id}).fetchone():
+        raise HTTPException(404, "Ролик не найден")
+    folder_id = body.get("folder_id")
+    adv_id = None
+    if folder_id is not None:
+        f = db.execute(text("SELECT id, advertiser_id FROM media_folders WHERE id=:id"),
+                       {"id": int(folder_id)}).fetchone()
+        if not f:
+            raise HTTPException(404, "Папка не найдена")
+        adv_id = f.advertiser_id
+        db.execute(text("UPDATE media SET folder_id=:f, advertiser_id=:a WHERE id=:id"),
+                   {"f": f.id, "a": adv_id, "id": media_id})
+    else:
+        db.execute(text("UPDATE media SET folder_id=NULL WHERE id=:id"), {"id": media_id})
+    db.commit()
+    return {"status": "ok", "folder_id": folder_id, "advertiser_id": adv_id}
 
 
 @router.get("/media/{media_id}")

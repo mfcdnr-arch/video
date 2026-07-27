@@ -97,6 +97,24 @@ function initMediaViewActions(){
       case 'media-open-fillers':
         return openFillers();
 
+      case 'media-open-common':
+        return openCommonMedia(null);
+
+      case 'media-common-folder': {
+        const fid = el.dataset.folderId ? Number(el.dataset.folderId) : null;
+        return openCommonMedia(fid);
+      }
+
+      case 'media-create-common-folder':
+        return createCommonFolder();
+
+      case 'media-delete-common-folder': {
+        e.stopPropagation();
+        const folderId = Number(el.dataset.folderId);
+        const folderName = el.dataset.folderName || '';
+        return deleteCommonFolder(folderId, folderName);
+      }
+
       case 'media-fillers-upload':
         document.getElementById('fillers-file')?.click();
         return;
@@ -118,6 +136,15 @@ function initMediaViewActions(){
   document.addEventListener('change', e => {
     const el = e.target.closest('#fillers-file');
     if(el && el.files.length) uploadFillers(el.files);
+  });
+
+  // Перенос файла в папку (селект на карточке в «Общей медиатеке»)
+  document.addEventListener('change', e => {
+    const el = e.target.closest('[data-action="media-move-to-folder"]');
+    if(!el) return;
+    const fileId = Number(el.dataset.fileId);
+    const v = el.value;
+    moveMediaToFolder(fileId, v === '' ? null : Number(v));
   });
 
   // Изменение полей формы загрузки
@@ -201,9 +228,17 @@ async function viewMedia(){
   const view = document.getElementById('view');
 
   try{
-    const [advs, fillers] = await Promise.all([api('/advertisers'), api('/media/fillers')]);
+    const [advs, fillers, common] = await Promise.all([
+      api('/advertisers'), api('/media/fillers'), api('/media/common')]);
     advs.forEach(a => ADV_COLORS[a.id] = a.color);
 
+    const commonCard = `<div class="cell" data-action="media-open-common"
+        style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:7px;border:0.5px dashed var(--border2);">
+        <span style="font-size:16px;">🗂</span>
+        <span style="font-weight:500;width:140px;">Общая медиатека</span>
+        <span style="color:var(--muted);font-size:12px;">${common.folders.length} папок · ${common.files.length} файлов — ролики без привязки к рекламодателю</span>
+        <span style="flex:1;"></span><span class="dim">›</span>
+      </div>`;
     const fillersCard = `<div class="cell" data-action="media-open-fillers"
         style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:12px;border:0.5px dashed var(--border2);">
         <span style="font-size:16px;">📼</span>
@@ -213,7 +248,7 @@ async function viewMedia(){
       </div>`;
 
     if(!advs.length){
-      view.innerHTML = fillersCard + '<div class="empty">Рекламодателей пока нет.<br>Нажмите «+ Рекламодатель» чтобы создать, или «↑ Загрузить файл» — при загрузке тоже можно создать рекламодателя.</div>';
+      view.innerHTML = commonCard + fillersCard + '<div class="empty">Рекламодателей пока нет.<br>Нажмите «+ Рекламодатель» чтобы создать, или «↑ Загрузить файл» — при загрузке тоже можно создать рекламодателя.</div>';
       return;
     }
 
@@ -221,6 +256,7 @@ async function viewMedia(){
       <input class="inp" id="media-search" placeholder="🔍 Поиск: название ролика, файл, рекламодатель…" data-action="media-search-input" autocomplete="off">
     </div>
     <div id="media-search-results"></div>
+    ${commonCard}
     ${fillersCard}
     <div id="media-adv-list">`;
     h += '<div class="muted" style="font-size:12px;margin-bottom:11px;">Рекламодатель → папки → файлы. Цена за минуту эфира используется для расчёта заработка в отчётах.</div>';
@@ -413,7 +449,7 @@ async function uploadForm(advId){
         <button class="btn" data-action="media-back">Отмена</button></div>
       <div id="up-progress" class="muted" style="font-size:12px;margin-top:12px;"></div>
     </div>`;
-  if(advId) loadFoldersInForm();
+  loadFoldersInForm();
   loadAdCategories();
 }
 
@@ -452,12 +488,14 @@ async function loadFoldersInForm(){
   const advId = document.getElementById('up-adv')?.value;
   const wrap = document.getElementById('up-folder-wrap');
   if(!wrap) return;
-  if(!advId){ wrap.style.display = 'none'; return; }
   try{
-    const folders = await api('/advertisers/' + advId + '/folders');
+    // Без рекламодателя — общие папки медиатеки, с ним — его папки
+    const folders = advId
+      ? await api('/advertisers/' + advId + '/folders')
+      : (await api('/media/common')).folders;
     document.getElementById('up-folder').innerHTML =
       '<option value="">— без папки —</option>' + folders.map(f=>`<option value="${f.id}">${esc(f.name)}</option>`).join('');
-    wrap.style.display = '';
+    wrap.style.display = folders.length || advId ? '' : 'none';
   }catch(e){ wrap.style.display = 'none'; }
 }
 
@@ -514,6 +552,102 @@ async function setBannerDuration(id, current){
       headers:{'Content-Type':'application/json'}, body: JSON.stringify({seconds: sec})});
     toast('Длительность обновлена: ' + sec + ' с');
     MEDIA_ADV ? openAdv(MEDIA_ADV.id, MEDIA_ADV.name) : viewMedia();
+  }catch(e){ toast('Ошибка: ' + e.message); }
+}
+
+//=============================================================================
+// ОБЩАЯ МЕДИАТЕКА (файлы и папки без рекламодателя)
+//=============================================================================
+
+// null — корень «без папки», число — конкретная общая папка
+async function openCommonMedia(folderId){
+  MEDIA_ADV = null;
+  document.getElementById('topright').innerHTML = '';
+  const view = document.getElementById('view');
+  try{
+    const d = await api('/media/common');
+    const cur = folderId ? d.folders.find(f => f.id === folderId) : null;
+
+    let h = `<div style="display:flex;align-items:center;gap:9px;margin-bottom:6px;">
+      <button class="btn" data-action="media-back">← Назад</button>
+      <span style="font-size:16px;">🗂</span>
+      <span style="font-weight:500;">Общая медиатека${cur ? ' / ' + esc(cur.name) : ''}</span>
+      <span style="flex:1;"></span>
+      ${canWrite()?`<button class="btn primary" data-action="media-open-upload">↑ Загрузить файл</button>`:''}
+    </div>
+    <div class="muted" style="font-size:12px;margin-bottom:10px;">Ролики без привязки к рекламодателю. Раскладывайте их по папкам — при наполнении плейлиста ролики выбираются по папкам.</div>`;
+
+    // Папки: «Без папки» + общие папки + создание
+    h += `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+      <span class="muted" style="font-size:12px;">Папки:</span>
+      <span style="display:inline-flex;align-items:center;gap:4px;background:${folderId?'var(--bg2)':'var(--panel)'};border:0.5px solid ${folderId?'var(--border2)':'var(--accent)'};border-radius:6px;padding:3px 8px;font-size:12px;cursor:pointer;" data-action="media-common-folder">Без папки</span>`;
+    d.folders.forEach(f => {
+      const active = folderId === f.id;
+      h += `<span style="display:inline-flex;align-items:center;gap:4px;background:${active?'var(--panel)':'var(--bg2)'};border:0.5px solid ${active?'var(--accent)':'transparent'};border-radius:6px;padding:3px 8px;font-size:12px;cursor:pointer;" data-action="media-common-folder" data-folder-id="${f.id}">
+        📁 ${esc(f.name)} <span class="muted">(${f.files})</span>
+        ${canWrite()?`<button class="iconbtn del" style="padding:0 2px;font-size:11px;" title="Удалить папку (файлы останутся без папки)" data-action="media-delete-common-folder" data-folder-id="${f.id}" data-folder-name="${esc(f.name)}">✕</button>`:''}
+      </span>`;
+    });
+    if(canWrite()) h += `<button class="btn" style="padding:3px 10px;font-size:12px;" data-action="media-create-common-folder">+ Папка</button>`;
+    h += '</div>';
+
+    const files = d.files.filter(f => folderId ? f.folder_id === folderId : !f.folder_id);
+    if(!files.length){
+      h += `<div class="empty">${cur ? 'В этой папке пока нет файлов.' : 'В общей медиатеке пока нет файлов без папки.'} Нажмите «↑ Загрузить файл» (рекламодателя можно не выбирать).</div>`;
+      view.innerHTML = h; return;
+    }
+
+    const folderOpts = (sel) => `<option value=""${!sel?' selected':''}>— без папки —</option>` +
+      d.folders.map(f => `<option value="${f.id}"${sel===f.id?' selected':''}>${esc(f.name)}</option>`).join('');
+
+    h += '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr));">';
+    files.forEach(f => {
+      h += `<div class="cell" style="padding:0;overflow:hidden;">
+        <div style="height:88px;background:var(--bg2);display:flex;align-items:center;justify-content:center;color:#454b57;font-size:26px;position:relative;">
+          <img src="${API}/media/${f.id}/thumbnail" alt=""
+               style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;"
+               onerror="this.remove()">▶
+          ${f.in_playlist?'<span style="position:absolute;top:6px;left:6px;background:#0f6e56;color:#dffaf0;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;">в эфире</span>':''}
+          ${f.review_status==='pending'?'<span style="position:absolute;top:6px;right:6px;background:#8a6d00;color:#ffe9a8;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;">на модерации</span>':''}
+          ${f.review_status==='rejected'?`<span title="${esc(f.reject_reason||'')}" style="position:absolute;top:6px;right:6px;background:#7a1f1f;color:#ffd7d7;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;">отклонён</span>`:''}
+          ${f.age_rating?`<span style="position:absolute;bottom:6px;right:6px;background:rgba(0,0,0,.65);color:#fff;font-size:10px;padding:1px 6px;border-radius:5px;z-index:1;">${esc(f.age_rating)}</span>`:''}</div>
+        <div style="padding:9px 10px;">
+          <div style="font-size:12px;font-weight:500;word-break:break-all;">${esc(f.title||f.filename)}</div>
+          <div style="font-size:11px;color:var(--muted);margin:2px 0 7px;">${fmtSize(f.filesize)}${f.duration_seconds?' · '+fmtDurMin(f.duration_seconds):''}</div>
+          <div style="display:flex;gap:5px;align-items:center;border-top:0.5px solid var(--border2);padding-top:7px;">
+            <button class="iconbtn" title="Скачать" data-action="media-download" data-file-id="${f.id}">⤓</button>
+            ${canWrite()?`<select class="inp" title="Переложить в папку" data-action="media-move-to-folder" data-file-id="${f.id}" style="flex:1;padding:3px 6px;font-size:11px;">${folderOpts(f.folder_id||null)}</select>
+            <button class="iconbtn del" title="Удалить" data-action="media-delete-file" data-file-id="${f.id}" data-file-name="${esc(f.title||f.filename)}">🗑</button>`:''}
+          </div></div></div>`;
+    });
+    view.innerHTML = h + '</div>';
+  }catch(e){ view.innerHTML = '<div class="empty">Ошибка: ' + esc(e.message) + '</div>'; }
+}
+
+let MEDIA_COMMON_FOLDER = null;
+
+async function createCommonFolder(){
+  const name = prompt('Название папки:');
+  if(!name || !name.trim()) return;
+  try{
+    await api('/media/folders', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:name.trim()})});
+    toast('Папка создана'); openCommonMedia(null);
+  }catch(e){ toast('Ошибка: ' + e.message); }
+}
+
+async function deleteCommonFolder(id, name){
+  if(!confirm(`Удалить папку «${name}»? Файлы из неё останутся в общей медиатеке (без папки).`)) return;
+  try{
+    await api('/folders/' + id, {method:'DELETE'});
+    toast('Папка удалена'); openCommonMedia(null);
+  }catch(e){ toast('Ошибка: ' + e.message); }
+}
+
+async function moveMediaToFolder(fileId, folderId){
+  try{
+    await api('/media/' + fileId + '/folder', {method:'PATCH',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({folder_id:folderId})});
+    toast(folderId ? 'Файл переложен в папку' : 'Файл убран из папки');
   }catch(e){ toast('Ошибка: ' + e.message); }
 }
 

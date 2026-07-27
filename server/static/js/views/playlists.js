@@ -59,7 +59,26 @@ function initPlaylistsViewActions(){
       const wrap = document.getElementById('pl-fill-minutes-wrap');
       if(wrap) wrap.style.display = e.target.checked ? '' : 'none';
     }
+    if(e.target && e.target.id === 'pl-add-folder'){
+      plFillMediaSelect();
+    }
   });
+}
+
+// Ролики выбранной папки → во второй селект
+let PL_PICK_MEDIA = [];
+function plFillMediaSelect(){
+  const folderSel = document.getElementById('pl-add-folder');
+  const mediaSel = document.getElementById('pl-add-media');
+  if(!folderSel || !mediaSel) return;
+  const key = folderSel.value;
+  let list = PL_PICK_MEDIA;
+  if(key === 'root')             list = list.filter(m => !m.advertiser_id && !m.folder_id);
+  else if(key.startsWith('f:'))  { const fid = Number(key.slice(2)); list = list.filter(m => m.folder_id === fid); }
+  else if(key.startsWith('a:'))  { const aid = Number(key.slice(2)); list = list.filter(m => m.advertiser_id === aid && !m.folder_id); }
+  mediaSel.innerHTML = list.length
+    ? list.map(m => `<option value="${m.id}">${esc(m.title || m.filename)}</option>`).join('')
+    : '<option value="">— в этой папке нет роликов —</option>';
 }
 
 async function viewPlaylists(){
@@ -140,9 +159,10 @@ async function openPlaylist(id, name){
   const view = document.getElementById('view');
 
   try{
-    const [items, media] = await Promise.all([
+    const [items, media, folders] = await Promise.all([
       api('/playlists/' + id + '/items'),
-      api('/media')
+      api('/media'),
+      api('/media/folders-all').catch(() => [])
     ]);
 
     let h = `<div style="display:flex;align-items:center;gap:9px;margin-bottom:13px;">
@@ -153,10 +173,30 @@ async function openPlaylist(id, name){
 
     if(canWrite()){
       // Заглушки в выпадашке не показываем: они добавляются в блок автоматически
-      const mediaOpts = media.filter(m => !m.is_filler)
-        .map(m => `<option value="${m.id}">${esc(m.title || m.filename)}</option>`).join('');
-      h += `<div style="display:flex;gap:8px;margin-bottom:14px;align-items:center;">
-        <select class="inp" id="pl-add-media" style="flex:1;">${mediaOpts || '<option value="">нет файлов</option>'}</select>
+      PL_PICK_MEDIA = media.filter(m => !m.is_filler);
+      // Папки для первого селекта: «Все», «Общая медиатека» (без рекламодателя
+      // и папки), общие папки, рекламодатель без папки, папки рекламодателей
+      // Показываем только папки, где есть подходящие ролики (заглушки не в счёт)
+      const hasRoot = PL_PICK_MEDIA.some(m => !m.advertiser_id && !m.folder_id);
+      const folderIds = new Set(PL_PICK_MEDIA.filter(m => m.folder_id).map(m => m.folder_id));
+      const groups = [{key:'all', label:'Все ролики'}];
+      if(hasRoot) groups.push({key:'root', label:'🗂 Общая медиатека (без папки)'});
+      folders.filter(f => !f.advertiser_id && folderIds.has(f.id)).forEach(f =>
+        groups.push({key:'f:'+f.id, label:'🗂 Общая / ' + f.name}));
+      const advSeen = new Set();
+      PL_PICK_MEDIA.forEach(m => {
+        if(m.advertiser_id && !m.folder_id && !advSeen.has(m.advertiser_id)){
+          advSeen.add(m.advertiser_id);
+          groups.push({key:'a:'+m.advertiser_id, label:(m.advertiser||('Рекламодатель '+m.advertiser_id)) + ' (без папки)'});
+        }
+      });
+      folders.filter(f => f.advertiser_id && folderIds.has(f.id)).forEach(f =>
+        groups.push({key:'f:'+f.id, label:(f.advertiser||'') + ' / ' + f.name}));
+
+      h += `<div style="display:flex;gap:8px;margin-bottom:14px;align-items:center;flex-wrap:wrap;">
+        <select class="inp" id="pl-add-folder" style="min-width:220px;" title="Из какой папки выбирать ролик">
+          ${groups.map(g => `<option value="${g.key}">${esc(g.label)}</option>`).join('')}</select>
+        <select class="inp" id="pl-add-media" style="flex:1;min-width:220px;"></select>
         <input class="inp" id="pl-add-repeat" type="number" min="1" max="99" value="1" style="width:60px;" title="Повторов">
         <button class="btn primary" data-action="playlists-add-item" data-playlist-id="${id}">+ Добавить</button>
       </div>`;
@@ -165,6 +205,8 @@ async function openPlaylist(id, name){
     if(!items.length){
       h += '<div class="empty">Плейлист пуст — добавьте ролики выше.</div>';
       view.innerHTML = h;
+      plFillMediaSelect();
+      loadFillPanel(id);
       return;
     }
 
@@ -188,6 +230,7 @@ async function openPlaylist(id, name){
 
     h += '</table>';
     view.innerHTML = h;
+    plFillMediaSelect();
     loadFillPanel(id);
   }catch(e){
     view.innerHTML = '<div class="empty">Ошибка: ' + esc(e.message) + '</div>';
