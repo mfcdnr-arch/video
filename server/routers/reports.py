@@ -704,8 +704,11 @@ except Exception:
 def _cell(v):
     if v is None:
         return "—"
-    if hasattr(v, "strftime"):
-        return v.strftime("%Y-%m-%d %H:%M")
+    if isinstance(v, datetime):
+        # В БД метки времени в UTC; во всех выгрузках показываем МСК
+        return (v + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M")
+    if hasattr(v, "strftime"):  # чистая дата — без сдвига
+        return v.strftime("%Y-%m-%d")
     return v
 
 
@@ -850,7 +853,8 @@ def report_fas_pdf(days: int = Query(90), admin: dict = Depends(get_current_admi
     d = _data_fas(db, days)
 
     def _dt(v):
-        return v.strftime("%d.%m.%Y %H:%M") if v else "—"
+        # UTC из БД → МСК
+        return (v + timedelta(hours=3)).strftime("%d.%m.%Y %H:%M") if v else "—"
 
     st_ru = {"approved": "одобрен", "pending": "на модерации", "rejected": "отклонён"}
     main_rows = []
@@ -859,29 +863,30 @@ def report_fas_pdf(days: int = Query(90), admin: dict = Depends(get_current_admi
         if it["reviewed_by"]:
             decision += f" ({it['reviewed_by']}, {_dt(it['reviewed_at'])})"
         period = f"{_dt(it['first_shown'])} — {_dt(it['last_shown'])}" if it["plays"] else "—"
+        # Текст не обрезаем: ячейки PDF переносят строки (Paragraph в _build_pdf)
         main_rows.append([
-            (it["title"] or "")[:38], (it["advertiser"] or "—")[:20],
-            (it["category_label"] or "")[:34], it["age_rating"] or "—",
-            decision[:44], it["plays"], period,
+            it["title"] or "", it["advertiser"] or "—",
+            it["category_label"] or "", it["age_rating"] or "—",
+            decision, it["plays"], period,
         ])
 
-    reg_rows = [[(it["title"] or "")[:38],
-                 (it["disclaimer_text"] or "—")[:60],
-                 (it["license_number"] or "—")[:24]]
+    reg_rows = [[it["title"] or "",
+                 it["disclaimer_text"] or "—",
+                 it["license_number"] or "—"]
                 for it in d["items"] if it["disclaimer_text"] or it["license_number"]]
 
-    dec_rows = [[_dt(r["created_at"]), (r["title"] or "")[:52],
-                 (r["detail"] or "")[:44], r["actor"]]
+    dec_rows = [[_dt(r["created_at"]), r["title"] or "",
+                 r["detail"] or "", r["actor"]]
                 for r in d["decisions"]]
 
     sections = [
         (f"Реклама в эфире за {days} дн.: декларация и показы",
          ["Ролик", "Рекламодатель", "Категория (38-ФЗ)", "Маркировка",
-          "Решение модератора", "Показов", "Период показа"], main_rows),
+          "Решение модератора", "Показов", "Период показа (МСК)"], main_rows),
         ("Обязательные предупреждения и лицензии",
          ["Ролик", "Текст предупреждения", "№ лицензии"], reg_rows),
         ("Журнал решений модерации",
-         ["Дата", "Решение", "Детали", "Модератор"], dec_rows),
+         ["Дата (МСК)", "Решение", "Детали", "Модератор"], dec_rows),
     ]
     buf = _build_pdf(sections, doc_title=f"Отчёт о соответствии закону «О рекламе» (38-ФЗ) — {days} дн.")
     return StreamingResponse(buf, media_type="application/pdf", headers={
@@ -901,19 +906,49 @@ def _build_pdf(sections, doc_title="Отчёт"):
     heading_style = ParagraphStyle('HeadingRu', parent=styles['Heading2'], fontName='DejaVuSans-Bold')
     normal_style = ParagraphStyle('NormalRu', parent=styles['Normal'], fontName='DejaVuSans')
 
+    # Текст в ячейках оборачиваем в Paragraph: длинные значения ПЕРЕНОСЯТСЯ
+    # на новую строку, а не обрезаются; таблица растягивается на ширину листа.
+    cell_style = ParagraphStyle('CellRu', parent=styles['Normal'],
+                                fontName='DejaVuSans', fontSize=8, leading=10)
+    head_style = ParagraphStyle('CellHeadRu', parent=cell_style,
+                                fontName='DejaVuSans-Bold', textColor=colors.white)
+
     elements = [Paragraph(doc_title, title_style), Spacer(1, 12)]
+    avail_width = A4[0] - doc.leftMargin - doc.rightMargin
     for title, columns, rows in sections:
         elements.append(Paragraph(title, heading_style))
         elements.append(Spacer(1, 4))
         if rows:
-            data = [columns] + [[str(_cell(c)) for c in row] for row in rows]
-            t = Table(data, repeatRows=1)
+            data = [[Paragraph(str(c), head_style) for c in columns]]
+            for row in rows:
+                data.append([Paragraph(str(_cell(c)), cell_style) for c in row])
+            # Ширины столбцов — по длине содержимого (шапка + первые строки),
+            # с минимумом, чтобы узкие столбцы не схлопывались
+            # Каждому столбцу — гарантированный минимум в пунктах под самое
+            # длинное слово заголовка (иначе шапка ломается по буквам:
+            # «Рекла-модат-ель»); остаток ширины делится по длине содержимого.
+            mins, weights = [], []
+            for ci in range(len(columns)):
+                head_word = max(len(w) for w in str(columns[ci]).split())
+                mins.append(head_word * 5.8 + 12)          # ~8pt bold + отступы
+                sample = [len(str(_cell(r[ci]))) for r in rows[:30]]
+                weights.append(max(4, min(60, max(sample))))
+            extra = avail_width - sum(mins)
+            if extra > 0:
+                wsum = sum(weights)
+                col_widths = [mins[i] + extra * weights[i] / wsum
+                              for i in range(len(columns))]
+            else:  # столбцов слишком много — ужимаем пропорционально минимумам
+                col_widths = [avail_width * m / sum(mins) for m in mins]
+            t = Table(data, repeatRows=1, colWidths=col_widths)
             t.setStyle(TableStyle([
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2b2f36')),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-                ('FONTNAME', (0, 0), (-1, -1), 'DejaVuSans'),
-                ('FONTSIZE', (0, 0), (-1, -1), 8),
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                 ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('LEFTPADDING', (0, 0), (-1, -1), 4),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+                ('TOPPADDING', (0, 0), (-1, -1), 3),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
                 ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f2f2f2')]),
             ]))
             elements.append(t)
