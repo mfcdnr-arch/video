@@ -8,4 +8,7 @@ EXPOSE 123/udp
 
 # -d — в форграунде (для Docker), -x — не трогать локальные часы,
 # только раздавать время клиентам (часы контейнера = часы хоста).
-CMD ["chronyd", "-d", "-x"]
+# rm pid-файла обязателен: после docker restart остаётся chronyd.pid со
+# значением 1 (chronyd был PID 1), и новый chronyd отказывается стартовать
+# («Another chronyd may already be running») — контейнер уходит в рестарт-цикл.
+CMD ["sh", "-c", "rm -f /run/chrony/chronyd.pid && exec chronyd -d -x"]

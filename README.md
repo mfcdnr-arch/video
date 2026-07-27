@@ -55,7 +55,7 @@ Video_miniPC_v16.2_modular/
 │   │                          #   backups, broadcast, reports, websockets, billing,
 │   │                          #   campaigns, notifications
 │   ├── static/                # Веб-панель (index.html, js/, css/)
-│   ├── migrations/            # SQL-миграции (001–024; 001 применяется как init при первом старте БД)
+│   ├── migrations/            # SQL-миграции (001–025; 001 применяется как init при первом старте БД)
 │   ├── tasks.py               # Celery-задачи
 │   ├── ws_manager.py          # Реестр WebSocket-подключений
 │   ├── Dockerfile
