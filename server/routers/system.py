@@ -49,6 +49,165 @@ def server_metrics(current_admin=Depends(get_current_admin)):
     return compute_server_metrics()
 
 
+def _check(cid, title, status, detail, action=None):
+    return {"id": cid, "title": title, "status": status,
+            "detail": detail, "action": action}
+
+
+@router.get("/system/selfcheck")
+def system_selfcheck(db: Session = Depends(get_db), current_admin=Depends(get_current_admin)):
+    """Самодиагностика сервера: каждый пункт — статус ok/warn/fail и подсказка
+    «что делать». Проверяет только то, что видно ИЗНУТРИ стека; случай «панель
+    вообще не открывается» ловит selfheal.sh на хосте (runbook §1)."""
+    import os, shutil, socket, urllib.request
+
+    checks = []
+
+    # --- PostgreSQL (если БД лежит, до этой строки запрос не дойдёт — но
+    # замер времени отклика полезен и для «живой» БД)
+    try:
+        t0 = datetime.now(timezone.utc)
+        db.execute(text("SELECT 1"))
+        ms = (datetime.now(timezone.utc) - t0).total_seconds() * 1000
+        st = "ok" if ms < 500 else "warn"
+        checks.append(_check("db", "База данных (PostgreSQL)", st,
+                             f"отклик {ms:.0f} мс",
+                             None if st == "ok" else "БД отвечает медленно: проверьте нагрузку хоста (Дашборд → Метрики) и `docker stats ds_postgres`"))
+    except Exception as e:
+        checks.append(_check("db", "База данных (PostgreSQL)", "fail", str(e)[:200],
+                             "`docker compose restart postgres`, затем логи: `docker compose logs --tail=50 postgres` (runbook §2)"))
+
+    # --- Миграции: файлы в migrations/ vs учёт migrate.sh
+    try:
+        files = sorted(f for f in os.listdir("/app/migrations") if f.endswith(".sql"))
+        applied = {r[0] for r in db.execute(text(
+            "SELECT filename FROM schema_migrations")).fetchall()}
+        pending = [f for f in files if f not in applied]
+        if not pending:
+            checks.append(_check("migrations", "Миграции БД", "ok",
+                                 f"применены все {len(files)}"))
+        else:
+            checks.append(_check("migrations", "Миграции БД", "warn",
+                                 "не отмечены применёнными: " + ", ".join(pending[:5]),
+                                 "на сервере выполнить `bash migrate.sh` (идемпотентно, безопасно повторять)"))
+    except Exception as e:
+        checks.append(_check("migrations", "Миграции БД", "warn", str(e)[:200],
+                             "таблицы учёта нет — выполните `bash migrate.sh` на сервере"))
+
+    # --- Redis
+    try:
+        import redis as _redis
+        r = _redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379"),
+                                  socket_timeout=2, socket_connect_timeout=2)
+        r.ping()
+        checks.append(_check("redis", "Redis (кеш/очереди)", "ok", "отвечает"))
+    except Exception as e:
+        checks.append(_check("redis", "Redis (кеш/очереди)", "fail", str(e)[:200],
+                             "`docker compose restart redis` (runbook §4); без Redis не работают Celery-задачи (бэкапы, уведомления)"))
+
+    # --- Celery-воркер (бэкапы, уведомления MAX, архив журнала показов)
+    try:
+        from tasks import celery_app
+        pong = celery_app.control.inspect(timeout=1.5).ping()
+        if pong:
+            checks.append(_check("celery", "Celery (фоновые задачи)", "ok",
+                                 "воркер отвечает: " + ", ".join(pong.keys())))
+        else:
+            checks.append(_check("celery", "Celery (фоновые задачи)", "fail",
+                                 "воркер не отвечает на ping",
+                                 "`docker compose restart celery`, логи: `docker compose logs --tail=50 celery`; без него не идут авто-бэкапы и уведомления MAX"))
+    except Exception as e:
+        checks.append(_check("celery", "Celery (фоновые задачи)", "fail", str(e)[:200],
+                             "`docker compose restart celery`; без него не идут авто-бэкапы и уведомления MAX"))
+
+    # --- MinIO (бэкап медиатеки): health-эндпоинт без авторизации
+    try:
+        url = "http://" + os.getenv("MINIO_ENDPOINT", "minio:9000") + "/minio/health/live"
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            if resp.status == 200:
+                checks.append(_check("minio", "MinIO (бэкап медиа)", "ok", "живой"))
+            else:
+                raise RuntimeError(f"HTTP {resp.status}")
+    except Exception as e:
+        checks.append(_check("minio", "MinIO (бэкап медиа)", "fail", str(e)[:200],
+                             "`docker compose restart minio`; если в логах «CPU does not support x86-64-v2» — см. 01_УСТАНОВКА_СЕРВЕР (пиновка старого релиза)"))
+
+    # --- NTP: короткий SNTP-запрос контейнеру ntp (UDP 123)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2)
+        s.sendto(b"\x1b" + 47 * b"\0", ("ntp", 123))
+        s.recvfrom(48)
+        s.close()
+        checks.append(_check("ntp", "NTP (время для мини-ПК)", "ok", "отвечает"))
+    except Exception as e:
+        checks.append(_check("ntp", "NTP (время для мини-ПК)", "fail", str(e)[:200],
+                             "`docker compose up -d --build ntp` (именно --build: известный баг pid-файла chronyd чинится пересборкой); без NTP часы мини-ПК уплывают → расписание и отчёты врут"))
+
+    # --- Диск: каталоги данных
+    for cid, env, default, name in (
+            ("disk_media", "MEDIA_PATH", "/data/media", "Диск: медиатека"),
+            ("disk_backup", "BACKUP_DIR", "/data/backups", "Диск: бэкапы")):
+        path = os.getenv(env, default)
+        try:
+            u = shutil.disk_usage(path)
+            pct = u.used / u.total * 100
+            st = "ok" if pct < 85 else ("warn" if pct < 95 else "fail")
+            checks.append(_check(cid, name, st,
+                                 f"занято {pct:.0f}% (свободно {u.free/1024**3:.1f} ГБ)",
+                                 None if st == "ok" else "освободите место: удалите старые бэкапы/неиспользуемые ролики или расширьте диск"))
+        except Exception as e:
+            checks.append(_check(cid, name, "fail", str(e)[:200],
+                                 f"каталог {path} недоступен — проверьте тома Docker"))
+
+    # --- Свежесть бэкапа БД (celery делает раз в 24 ч)
+    try:
+        age_h = db.execute(text(
+            "SELECT EXTRACT(EPOCH FROM (NOW() - MAX(created_at)))/3600 FROM backups")).scalar()
+        if age_h is None:
+            checks.append(_check("backup_age", "Свежесть бэкапа БД", "warn",
+                                 "бэкапов ещё не было",
+                                 "нажмите «Создать бэкап сейчас» ниже и проверьте Celery"))
+        else:
+            st = "ok" if age_h < 26 else "warn"
+            checks.append(_check("backup_age", "Свежесть бэкапа БД", st,
+                                 f"последний {age_h:.0f} ч назад",
+                                 None if st == "ok" else "авто-бэкап отстаёт: проверьте Celery (выше) и нажмите «Создать бэкап сейчас»"))
+    except Exception as e:
+        checks.append(_check("backup_age", "Свежесть бэкапа БД", "warn", str(e)[:200], None))
+
+    # --- Эфир: офлайн-экраны и битые ролики (краткая сводка, детали на Дашборде)
+    try:
+        row = db.execute(text("""
+            SELECT COUNT(*) FILTER (WHERE last_seen IS NULL
+                                     OR last_seen <= NOW() - INTERVAL '5 minutes') AS offline,
+                   COUNT(*) AS total FROM screens""")).fetchone()
+        broken = db.execute(text(
+            "SELECT COUNT(*) FROM media WHERE is_broken = TRUE")).scalar()
+        if row.total and row.offline:
+            checks.append(_check("screens", "Экраны", "warn",
+                                 f"офлайн {row.offline} из {row.total}",
+                                 "см. Дашборд и runbook §6 (агент не выходит на связь)"))
+        else:
+            checks.append(_check("screens", "Экраны", "ok",
+                                 f"онлайн {row.total - row.offline} из {row.total}" if row.total else "экранов пока нет"))
+        if broken:
+            checks.append(_check("media", "Ролики", "warn",
+                                 f"битых роликов: {broken}",
+                                 "см. Дашборд → «Нерабочие ролики»: перезалейте файл или снимите с эфира"))
+    except Exception:
+        pass
+
+    worst = "ok"
+    if any(c["status"] == "warn" for c in checks):
+        worst = "warn"
+    if any(c["status"] == "fail" for c in checks):
+        worst = "fail"
+    return {"status": worst,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "checks": checks}
+
+
 @router.get("/dashboard")
 def dashboard(db: Session = Depends(get_db), current_admin=Depends(get_current_admin)):
     """Сводка для стартового экрана панели."""

@@ -84,6 +84,7 @@ req GET "/billing/invoices";       [ "$HTTP" = "200" ] && ok "биллинг" ||
 req GET "/campaigns";              [ "$HTTP" = "200" ] && ok "кампании" || bad "кампании: HTTP $HTTP"
 req GET "/moderation/pending";     [ "$HTTP" = "200" ] && ok "модерация" || bad "модерация: HTTP $HTTP"
 req GET "/notifications/settings"; [ "$HTTP" = "200" ] && ok "настройки уведомлений" || bad "уведомления: HTTP $HTTP"
+req GET "/system/selfcheck";       [ "$HTTP" = "200" ] && ok "самодиагностика" || bad "самодиагностика: HTTP $HTTP"
 
 # ── 6. Уборка тестовых данных ────────────────────────────────────────────────
 step "Уборка"

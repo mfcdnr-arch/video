@@ -41,6 +41,11 @@ async function viewSettings(){
       <div class="sec">Сервер</div>
       <div class="fld"><label>Адрес сервера (для агентов мини ПК)</label><input class="inp" readonly value="${location.origin}/api"></div>
 
+      ${canWrite() ? `<div class="sec">Диагностика сервера</div>
+      <div class="muted" style="font-size:12px;margin-bottom:8px;">Проверка всех служб стека (БД, Redis, Celery, MinIO, NTP, диски, миграции, бэкапы). Для каждой проблемы — подсказка, что сделать. Если панель вообще не открывается — диагностику с хоста делает <code>selfheal.sh</code> (см. runbook §1).</div>
+      <div style="margin-bottom:10px;"><button class="btn primary" data-action="settings-run-selfcheck">&#9889; Запустить проверку</button></div>
+      <div id="selfcheck-block"></div>` : ''}
+
       <div class="sec">Целевые версии ПО</div>
       <div class="muted" style="font-size:12px;margin-bottom:8px;">Эталонные версии для сравнения с мини ПК. Где версия не совпадает — панель пометит «требует обновления». Само обновление выполняется администратором на ПК вручную.</div>
       <div id="ver-block" class="muted">Загрузка…</div>
@@ -195,6 +200,36 @@ async function testNotification(){
   }catch(e){ toast('Не доставлено: ' + e.message); }
 }
 
+async function runSelfcheck(){
+  const el = document.getElementById('selfcheck-block');
+  if(!el) return;
+  el.innerHTML = '<div class="muted" style="font-size:12px;">Проверяю… (до 10 секунд: опрашиваются все службы)</div>';
+  try{
+    const r = await api('/system/selfcheck');
+    const ico = s => s==='ok' ? '&#10003;' : (s==='warn' ? '&#9888;' : '&#10007;');
+    const col = s => s==='ok' ? 'var(--accent)' : (s==='warn' ? 'var(--c-nike)' : 'var(--danger)');
+    const head = r.status==='ok'
+      ? 'Все проверки пройдены'
+      : (r.status==='warn' ? 'Есть предупреждения' : 'Есть проблемы — нужны действия');
+    el.innerHTML = `
+      <div class="cell" style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+        <span style="color:${col(r.status)};font-weight:600;">${ico(r.status)} ${head}</span>
+        <span class="muted" style="font-size:11px;margin-left:auto;">${new Date(r.checked_at).toLocaleTimeString('ru-RU')}</span>
+      </div>
+      ${r.checks.map(c => `
+        <div class="cell" style="margin-bottom:6px;">
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span style="color:${col(c.status)};min-width:14px;">${ico(c.status)}</span>
+            <span style="font-weight:500;">${esc(c.title)}</span>
+            <span class="muted" style="font-size:12px;margin-left:auto;">${esc(c.detail||'')}</span>
+          </div>
+          ${c.action ? `<div style="font-size:12px;color:var(--txt2);margin:6px 0 0 22px;">&#8627; ${esc(c.action)}</div>` : ''}
+        </div>`).join('')}`;
+  }catch(e){
+    el.innerHTML = `<div style="color:var(--danger);font-size:12px;">Не удалось выполнить проверку: ${esc(e.message||String(e))}. Если панель работает, а проверка падает — смотрите логи API: <code>docker compose logs --tail=50 api</code></div>`;
+  }
+}
+
 function initSettingsViewActions(){
   if(window.__settingsViewActionsInitialized) return;
   window.__settingsViewActionsInitialized = true;
@@ -215,6 +250,9 @@ function initSettingsViewActions(){
 
       case 'settings-create-backup':
         return createBackup();
+
+      case 'settings-run-selfcheck':
+        return runSelfcheck();
 
       case 'settings-save-notifications':
         return saveNotifications();
