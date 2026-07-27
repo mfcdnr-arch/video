@@ -10,7 +10,7 @@ from typing import Optional
 # У Москвы нет сезонного перевода часов, поэтому фиксированное смещение корректно.
 MSK = timezone(timedelta(hours=3))
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query, UploadFile
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -756,6 +756,93 @@ async def command_stop_screen(
     if screen_id in connected:
         _asyncio.create_task(ws_manager.send(screen_id, {"type": "new_command", "count": 1}))
     return {"status": "ok", "ws_sent": screen_id in connected}
+
+
+# ─── Диагностика экрана: агент собирает архив логов по команде ──────────────
+
+import os as _os
+DIAG_DIR = _os.path.join(_os.getenv("BACKUP_DIR", "/data/backups"), "diagnostics")
+_os.makedirs(DIAG_DIR, exist_ok=True)
+DIAG_KEEP_PER_SCREEN = 5
+
+
+@router.post("/minipc/{screen_id}/collect-diag")
+async def collect_diag(screen_id: int, admin: dict = Depends(require_write),
+                       db: Session = Depends(get_db)):
+    """Поставить агенту команду собрать архив диагностики и прислать на сервер."""
+    if not db.execute(text("SELECT 1 FROM screens WHERE id=:id"), {"id": screen_id}).fetchone():
+        raise HTTPException(404, "Экран не найден")
+    db.execute(text(
+        "INSERT INTO commands (screen_id, type, payload) VALUES (:sid, 'collect_diag', '{}'::jsonb)"
+    ), {"sid": screen_id})
+    db.commit()
+    connected = ws_manager.connected_screens()
+    if screen_id in connected:
+        asyncio.create_task(ws_manager.send(screen_id, {"type": "new_command", "count": 1}))
+    return {"status": "ok", "ws_sent": screen_id in connected}
+
+
+@router.get("/minipc/{screen_id}/diagnostics")
+def list_diagnostics(screen_id: int, admin: dict = Depends(get_current_admin),
+                     db: Session = Depends(get_db)):
+    rows = db.execute(text("""
+        SELECT id, filename, size_bytes, created_at FROM screen_diagnostics
+        WHERE screen_id = :sid ORDER BY created_at DESC LIMIT 20
+    """), {"sid": screen_id}).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+@router.post("/diagnostics/upload/{screen_id}")
+async def upload_diagnostics(screen_id: int, file: UploadFile = File(...),
+                             db: Session = Depends(get_db),
+                             _screen=Depends(verify_device_token)):
+    """Агент загружает собранный архив (X-Token). Храним последние
+    DIAG_KEEP_PER_SCREEN архивов на экран, старые удаляем."""
+    safe = "diag_scr{}_{}.tar.gz".format(
+        screen_id, datetime.now(MSK).strftime("%Y%m%d_%H%M%S"))
+    path = _os.path.join(DIAG_DIR, safe)
+    size = 0
+    with open(path, "wb") as f:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+            size += len(chunk)
+            if size > 50 * 1024 * 1024:   # защита от бесконечного файла
+                f.close()
+                _os.remove(path)
+                raise HTTPException(413, "Архив диагностики больше 50 МБ")
+    db.execute(text(
+        "INSERT INTO screen_diagnostics (screen_id, filename, size_bytes) "
+        "VALUES (:sid, :fn, :sz)"), {"sid": screen_id, "fn": safe, "sz": size})
+    old = db.execute(text("""
+        SELECT id, filename FROM screen_diagnostics WHERE screen_id = :sid
+        ORDER BY created_at DESC OFFSET :keep
+    """), {"sid": screen_id, "keep": DIAG_KEEP_PER_SCREEN}).fetchall()
+    for r in old:
+        try:
+            _os.remove(_os.path.join(DIAG_DIR, r.filename))
+        except OSError:
+            pass
+        db.execute(text("DELETE FROM screen_diagnostics WHERE id=:id"), {"id": r.id})
+    db.commit()
+    return {"status": "ok", "filename": safe, "size_bytes": size}
+
+
+@router.get("/diagnostics/{diag_id}/download")
+def download_diagnostics(diag_id: int, db: Session = Depends(get_db)):
+    # Как и у бэкапов/медиа: скачивание по непрозрачному id без заголовка
+    # авторизации (панель открывает ссылку в новой вкладке; наружу порт закрыт)
+    from fastapi.responses import FileResponse
+    row = db.execute(text("SELECT filename FROM screen_diagnostics WHERE id=:id"),
+                     {"id": diag_id}).fetchone()
+    if not row:
+        raise HTTPException(404, "Архив не найден")
+    path = _os.path.join(DIAG_DIR, row.filename)
+    if not _os.path.exists(path):
+        raise HTTPException(404, "Файл архива отсутствует на диске")
+    return FileResponse(path, media_type="application/gzip", filename=row.filename)
 
 
 @router.post("/sync/start/{group_id}")

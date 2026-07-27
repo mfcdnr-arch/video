@@ -55,6 +55,12 @@ function initScreensViewActions(){
         case 'screen-offline-diagnostics':
           return toast('Экран офлайн — проверьте питание и сеть');
 
+        case 'screen-collect-diag':
+          return collectScreenDiag(Number(btn.dataset.screenId));
+
+        case 'screen-refresh-diag':
+          return showScreenDiagList(Number(btn.dataset.screenId));
+
         case 'delete-screen':
           return delScreen(Number(btn.dataset.screenId), btn.dataset.screenName || '');
 
@@ -274,9 +280,11 @@ async function viewScreens(tab){
             data-vday="${s.volume_day!=null?s.volume_day:100}" data-vnight="${s.volume_night!=null?s.volume_night:100}"
             data-nfrom="${s.night_from?String(s.night_from).slice(0,5):''}" data-nto="${s.night_to?String(s.night_to).slice(0,5):''}"
             data-venue="${s.venue_type||'other'}">⏻ Настройки</button>
+          <button class="btn" title="Агент соберёт архив логов и пришлёт на сервер (~15–30 с)" data-action="screen-collect-diag" data-screen-id="${s.id}">🧾 Диагностика</button>
           <button class="btn danger" data-action="delete-screen" data-screen-id="${s.id}" data-screen-name="${esc(s.name)}">Удалить</button>
         </div>
         <div id="scr-settings-${s.id}"></div>
+        <div id="scr-diag-${s.id}"></div>
       </div>`;
     });
 
@@ -451,6 +459,43 @@ async function playScreen(id, name){
     toast('Показ возобновляется…');
   }catch(e){
     toast('Ошибка: '+e.message);
+  }
+}
+
+// Диагностика экрана: команда агенту + список присланных архивов
+async function collectScreenDiag(id){
+  try{
+    await api('/minipc/' + id + '/collect-diag', {method:'POST'});
+    toast('Команда отправлена — агент собирает архив (~15–30 с)');
+    showScreenDiagList(id);
+    setTimeout(() => showScreenDiagList(id), 20000);
+  }catch(e){ toast('Ошибка: ' + e.message); }
+}
+
+async function showScreenDiagList(id){
+  const el = document.getElementById('scr-diag-' + id);
+  if(!el) return;
+  try{
+    const rows = await api('/minipc/' + id + '/diagnostics');
+    let h = `<div style="border-top:0.5px solid var(--border2);margin-top:9px;padding-top:8px;">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+        <span class="muted" style="font-size:12px;">Архивы диагностики (последние ${rows.length})</span>
+        <button class="btn" style="padding:3px 10px;font-size:11px;margin-left:auto;" data-action="screen-refresh-diag" data-screen-id="${id}">↻ Обновить</button>
+      </div>`;
+    if(!rows.length){
+      h += '<div class="muted" style="font-size:12px;">Пока нет — нажмите «🧾 Диагностика» и обновите через полминуты.</div>';
+    } else {
+      rows.forEach(r => {
+        h += `<div style="display:flex;align-items:center;gap:10px;font-size:12px;margin-bottom:4px;">
+          <span>🧾 ${fmtServerTS(r.created_at)}</span>
+          <span class="muted">${(r.size_bytes/1024).toFixed(0)} КБ</span>
+          <a class="btn" style="padding:2px 10px;font-size:11px;margin-left:auto;" href="${API}/diagnostics/${r.id}/download">⤓ Скачать</a>
+        </div>`;
+      });
+    }
+    el.innerHTML = h + '</div>';
+  }catch(e){
+    el.innerHTML = `<div class="muted" style="font-size:12px;">Диагностика: ${esc(e.message)}</div>`;
   }
 }
 

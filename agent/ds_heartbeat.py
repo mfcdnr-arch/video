@@ -64,7 +64,7 @@ class Heartbeat:
             "playing_file": playing_file,
             "disk_free_gb": self._disk_free_gb(),
             "disk_total_gb": self._disk_total_gb(),
-            "agent_version": "1.0.0",
+            "agent_version": "1.1.2",
             "os_version": self.os_version,
             "vlc_version": self.vlc_version,
             # Время агента (UNIX, UTC) — сервер сравнивает со своим и хранит

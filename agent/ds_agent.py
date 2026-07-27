@@ -270,7 +270,7 @@ def main():
                 json={
                     "restart_count": count,
                     "reason": "unknown",   # TODO: улучшить определение причины
-                    "agent_version": "1.0.0",
+                    "agent_version": "1.1.2",
                 },
                 headers={"X-Token": TOKEN},
                 timeout=5

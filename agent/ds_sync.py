@@ -128,6 +128,17 @@ class SyncHandler:
             self.ack_command(cmd_id)
             return True
 
+        elif cmd_type == "collect_diag":
+            # Панель запросила архив диагностики: собираем и загружаем на
+            # сервер. ack — в любом случае, чтобы команда не зациклилась.
+            log.info("Команда: COLLECT_DIAG")
+            self.ack_command(cmd_id)
+            try:
+                self._collect_and_upload_diag()
+            except Exception as e:
+                log.warning("Диагностика не собрана: {}".format(e))
+            return True
+
         elif cmd_type == "update_agent":
             log.info("Команда: UPDATE_AGENT")
             self.ack_command(cmd_id)
@@ -170,3 +181,65 @@ class SyncHandler:
             self.ack_command(cmd_id)
 
         return False
+
+    # ── Диагностика по запросу из панели ────────────────────────────────────
+
+    def _collect_and_upload_diag(self):
+        """Собрать архив диагностики (та же логика, что collect_diag_agent.sh)
+        и загрузить на сервер. Только stdlib; каждый источник — независимо,
+        ошибка одного не срывает остальные."""
+        import io, os, subprocess, tarfile, time
+
+        def run(cmd, timeout=15):
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+                out = r.stdout.decode(errors="ignore")
+                err = r.stderr.decode(errors="ignore")
+                return out + (("\n[stderr]\n" + err) if err.strip() else "")
+            except Exception as e:
+                return "ошибка выполнения {}: {}\n".format(cmd, e)
+
+        parts = {
+            "journalctl_ds-agent.txt": run(
+                ["journalctl", "-u", "ds-agent", "-n", "500", "--no-pager"]),
+            "system.txt": (run(["uname", "-a"]) + "\n" + run(["uptime"]) +
+                           "\n" + run(["df", "-h"]) + "\n" + run(["free", "-m"])),
+            "player.txt": (run(["pgrep", "-a", "mpv"]) +
+                           "\n" + run(["mpv", "--version"]).split("\n")[0]),
+            "clock.txt": run(["chronyc", "tracking"]) + "\n" + run(["date"]),
+        }
+        try:
+            with open("/var/log/ds-agent/ds-agent.log", "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 200_000))     # хвост ~200 КБ
+                parts["ds-agent.log.tail.txt"] = f.read().decode(errors="ignore")
+        except Exception as e:
+            parts["ds-agent.log.tail.txt"] = "лог недоступен: {}".format(e)
+        try:
+            with open(os.getenv("DS_CONFIG", "/etc/ds-agent/config.ini")) as f:
+                cfg = []
+                for line in f:
+                    # токен устройства в архив не попадает
+                    cfg.append("token = ***СКРЫТ***\n"
+                               if line.strip().lower().startswith("token") else line)
+                parts["config.ini.txt"] = "".join(cfg)
+        except Exception as e:
+            parts["config.ini.txt"] = "конфиг недоступен: {}".format(e)
+
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for name, content in parts.items():
+                data = content.encode(errors="ignore")
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                info.mtime = int(time.time())
+                tar.addfile(info, io.BytesIO(data))
+        buf.seek(0)
+
+        r = self.session.post(
+            self._url("/api/diagnostics/upload/{}".format(self.screen_id)),
+            files={"file": ("diag.tar.gz", buf, "application/gzip")},
+            timeout=60)
+        r.raise_for_status()
+        log.info("Диагностика загружена на сервер: {}".format(
+            r.json().get("filename", "?")))

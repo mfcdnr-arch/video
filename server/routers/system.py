@@ -132,14 +132,36 @@ def system_selfcheck(db: Session = Depends(get_db), current_admin=Depends(get_cu
         checks.append(_check("minio", "MinIO (бэкап медиа)", "fail", str(e)[:200],
                              "`docker compose restart minio`; если в логах «CPU does not support x86-64-v2» — см. 01_УСТАНОВКА_СЕРВЕР (пиновка старого релиза)"))
 
-    # --- NTP: короткий SNTP-запрос контейнеру ntp (UDP 123)
+    # --- NTP: короткий SNTP-запрос контейнеру ntp (UDP 123).
+    # Заодно меряем СМЕЩЕНИЕ ЧАСОВ ХОСТА: chronyd отдаёт скомпенсированное
+    # истинное время, а часы контейнера = часы хоста. Разница = ошибка часов
+    # сервера (история 27.07.2026: хост жил на −3 часа, службы времени нет).
     try:
+        import struct, time as _time
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(2)
+        t0 = _time.time()
         s.sendto(b"\x1b" + 47 * b"\0", ("ntp", 123))
-        s.recvfrom(48)
+        data, _ = s.recvfrom(48)
+        t1 = _time.time()
         s.close()
-        checks.append(_check("ntp", "NTP (время для мини-ПК)", "ok", "отвечает"))
+        li = (data[0] >> 6) & 0x3          # 3 = источник не синхронизирован
+        secs, frac = struct.unpack("!II", data[40:48])
+        server_time = secs - 2208988800 + frac / 2**32
+        offset = server_time - (t0 + t1) / 2
+        if li == 3:
+            checks.append(_check("ntp", "NTP (время для мини-ПК)", "ok",
+                                 "отвечает (без внешнего эталона — изолированная сеть)"))
+        elif abs(offset) < 3:
+            checks.append(_check("ntp", "NTP (время для мини-ПК)", "ok",
+                                 f"отвечает; часы сервера точны ({offset:+.1f} с)"))
+        else:
+            st = "warn" if abs(offset) < 60 else "fail"
+            checks.append(_check("ntp", "NTP (время для мини-ПК)", st,
+                                 f"часы сервера расходятся с эталоном на {offset:+.0f} с",
+                                 "поправьте часы ХОСТА и настройте службу времени (chrony) — "
+                                 "см. 01_УСТАНОВКА_СЕРВЕР, раздел «Часы хоста»; быстрое лечение: "
+                                 "`sudo date -s \"now {} seconds\"`".format(int(-offset))))
     except Exception as e:
         checks.append(_check("ntp", "NTP (время для мини-ПК)", "fail", str(e)[:200],
                              "`docker compose up -d --build ntp` (именно --build: известный баг pid-файла chronyd чинится пересборкой); без NTP часы мини-ПК уплывают → расписание и отчёты врут"))
