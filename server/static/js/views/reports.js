@@ -47,10 +47,11 @@ function initReportsViewActions(){
         DASH_ADV=(document.getElementById('dash-adv')||{}).value||'';
         DASH_MEDIA=(document.getElementById('dash-media')||{}).value||'';
         DASH_SCREEN=(document.getElementById('dash-screen')||{}).value||'';
+        DASH_DOW=(document.getElementById('dash-dow')||{}).value||'';
         return viewReports();
 
       case 'reports-dash-reset':
-        DASH_DAYS='7'; DASH_FROM=''; DASH_TO=''; DASH_ADV=''; DASH_MEDIA=''; DASH_SCREEN='';
+        DASH_DAYS='7'; DASH_FROM=''; DASH_TO=''; DASH_ADV=''; DASH_MEDIA=''; DASH_SCREEN=''; DASH_DOW='';
         return viewReports();
 
       case 'reports-toggle-section':
@@ -137,10 +138,12 @@ async function viewReports(){
         <option value="">Все</option>${(DASH_MEDIA_LIST||[]).map(m=>`<option value="${m.id}"${String(m.id)===DASH_MEDIA?' selected':''}>${esc(m.title||m.filename)}</option>`).join('')}</select></div>
       <div class="fld" style="min-width:150px;"><label>Экран</label><select class="inp" id="dash-screen">
         <option value="">Все</option>${(DASH_SCREEN_LIST||[]).map(s=>`<option${s===DASH_SCREEN?' selected':''}>${esc(s)}</option>`).join('')}</select></div>
+      <div class="fld" style="min-width:110px;"><label>День недели</label><select class="inp" id="dash-dow">
+        <option value="">Все</option>${[['1','Пн'],['2','Вт'],['3','Ср'],['4','Чт'],['5','Пт'],['6','Сб'],['7','Вс']].map(d=>`<option value="${d[0]}"${DASH_DOW===d[0]?' selected':''}>${d[1]}</option>`).join('')}</select></div>
       <div class="fld" style="flex:0;"><button class="btn primary" data-action="reports-dash-apply">Применить</button></div>
       <div class="fld" style="flex:0;"><button class="btn" data-action="reports-dash-reset">Сбросить</button></div>
     </div>
-    <div class="muted" style="font-size:11px;margin-bottom:12px;">Фильтры применяются ко всем отчётам по их полям. «Дата с/по» перебивает период. Ролик/рекламодатель/экран — где такие столбцы есть.</div>`;
+    <div class="muted" style="font-size:11px;margin-bottom:12px;">Фильтры применяются ко всем отчётам по их полям. «Дата с/по» перебивает период. «День недели» — только показы в этот день (по МСК). Ролик/рекламодатель/экран — где такие столбцы есть.</div>`;
     h+='<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));">';
     h+=kpi('Всего экранов', sum.total_screens??'—','');
     h+=kpi('Не работают', offline.count??0, offline.count?'см. список ниже':'все онлайн','var(--danger)');
@@ -428,6 +431,7 @@ let PLAYLOG_SCREENS=null;
 let DASH_DAYS='7';       // период дашборда (пресет, если не задан диапазон дат)
 let DASH_FROM='';        // дата с (диапазон перебивает период)
 let DASH_TO='';          // дата по
+let DASH_DOW='';         // день недели (1=Пн … 7=Вс, ''=все)
 let DASH_ADV='';         // фильтр по рекламодателю ('' = все)
 let DASH_MEDIA='';       // фильтр по ролику (media_id)
 let DASH_SCREEN='';      // фильтр по экрану (имя)
@@ -444,6 +448,7 @@ function dashQ(){
   if(DASH_ADV) q.append('advertiser', DASH_ADV);
   if(DASH_MEDIA) q.append('media_id', DASH_MEDIA);
   if(DASH_SCREEN) q.append('screen', DASH_SCREEN);
+  if(DASH_DOW) q.append('dow', DASH_DOW);
   return q.toString();
 }
 
@@ -471,6 +476,7 @@ async function openPlaylog(){
       <div class="fld" style="min-width:180px;"><label>Рекламодатель</label><select class="inp" id="pl-adv"><option value="">Все</option>${PLAYLOG_ADVS.map(a=>`<option>${esc(a)}</option>`).join('')}</select></div>
       <div class="fld" style="min-width:200px;"><label>Ролик</label><select class="inp" id="pl-media"><option value="">Все</option>${PLAYLOG_MEDIA.map(m=>`<option value="${m.id}">${esc(m.title||m.filename)}</option>`).join('')}</select></div>
       <div class="fld" style="min-width:170px;"><label>Экран</label><select class="inp" id="pl-screen"><option value="">Все</option>${PLAYLOG_SCREENS.map(s=>`<option>${esc(s)}</option>`).join('')}</select></div>
+      <div class="fld" style="min-width:110px;"><label>День недели</label><select class="inp" id="pl-dow"><option value="">Все</option><option value="1">Пн</option><option value="2">Вт</option><option value="3">Ср</option><option value="4">Чт</option><option value="5">Пт</option><option value="6">Сб</option><option value="7">Вс</option></select></div>
       <div class="fld" style="flex:0;"><button class="btn primary" data-action="reports-load-playlog">Показать</button></div>
 <div class="fld" style="flex:0;"><button class="btn" data-action="reports-export-playlog-xlsx">Excel</button></div>
 <div class="fld" style="flex:0;"><button class="btn" data-action="reports-export-playlog-pdf">PDF</button></div>
@@ -489,6 +495,7 @@ function playlogParams(){
   const adv=document.getElementById('pl-adv').value; if(adv) q.append('advertiser',adv);
   const media=(document.getElementById('pl-media')||{}).value; if(media) q.append('media_id',media);
   const screen=(document.getElementById('pl-screen')||{}).value; if(screen) q.append('screen',screen);
+  const dow=(document.getElementById('pl-dow')||{}).value; if(dow) q.append('dow',dow);
   return q;
 }
 async function loadPlaylog(){
@@ -510,8 +517,8 @@ async function loadPlaylog(){
     if(!rows.length){ h+='<div class="muted" style="font-size:12px;">Нет показов за выбранный период. Если экраны работают, но журнал пуст — проверьте, что агент отправляет логи показов.</div>'; }
     else {
       h+=`<div class="muted" style="font-size:11px;margin-bottom:6px;">Показано записей: ${rows.length}${rows.length>=500?' (показаны последние 500 — уточните фильтр или выгрузите файл)':''}</div>`;
-      h+='<table><tr><th>Дата</th><th>Время</th><th>Экран</th><th>Ролик</th><th>Рекламодатель</th></tr>';
-      rows.forEach(r=>{ h+=`<tr><td class="muted">${esc(r.day)}</td><td class="muted">${esc(r.time)}</td><td>${esc(r.screen||'—')}</td><td>${esc(r.media)}</td><td class="muted">${esc(r.advertiser||'—')}</td></tr>`; });
+      h+='<table><tr><th>Дата</th><th>День</th><th>Время</th><th>Экран</th><th>Ролик</th><th>Рекламодатель</th></tr>';
+      rows.forEach(r=>{ h+=`<tr><td class="muted">${esc(r.day)}</td><td>${esc(r.dow||'')}</td><td class="muted">${esc(r.time)}</td><td>${esc(r.screen||'—')}</td><td>${esc(r.media)}</td><td class="muted">${esc(r.advertiser||'—')}</td></tr>`; });
       h+='</table>';
     }
     document.getElementById('pl-result').innerHTML=h;

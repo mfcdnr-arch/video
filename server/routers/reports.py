@@ -14,6 +14,8 @@ from deps import get_db, get_current_admin
 
 log = logging.getLogger(__name__)
 
+DOW_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
 router = APIRouter()
 
 
@@ -449,8 +451,8 @@ _CONTENT_JOINS = ("LEFT JOIN media m ON m.id = pl.media_id "
 
 
 def _data_playtime(db: Session, days: int = 7, advertiser: Optional[str] = None,
-                   date_from=None, date_to=None, media_id=None, screen=None):
-    where, p = _playlog_where(days, date_from, date_to, advertiser, media_id, screen)
+                   date_from=None, date_to=None, media_id=None, screen=None, dow=None):
+    where, p = _playlog_where(days, date_from, date_to, advertiser, media_id, screen, dow)
     total = db.execute(text(f"""
         SELECT COUNT(*) as plays,
                COALESCE(SUM(EXTRACT(EPOCH FROM (pl.ended_at - pl.started_at))), 0) as seconds
@@ -484,10 +486,10 @@ def _data_playtime(db: Session, days: int = 7, advertiser: Optional[str] = None,
 
 
 def _data_fillers(db: Session, days: int = 7, date_from=None, date_to=None,
-                  media_id=None, screen=None):
+                  media_id=None, screen=None, dow=None):
     """Отчёт по заглушкам: показы и эфирное время за период (всего и по каждому
     ролику) + справочно состав папки «Заглушки» в медиатеке."""
-    where, p = _playlog_where(days, date_from, date_to, None, media_id, screen)
+    where, p = _playlog_where(days, date_from, date_to, None, media_id, screen, dow)
     where += " AND COALESCE(m.is_filler, FALSE) = TRUE"
 
     air_total = db.execute(text(f"""
@@ -528,21 +530,23 @@ def _data_fillers(db: Session, days: int = 7, date_from=None, date_to=None,
 def report_fillers(days: int = Query(7),
                    date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None),
                    media_id: Optional[int] = Query(None), screen: Optional[str] = Query(None),
+                   dow: Optional[int] = Query(None),
                    admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    return _data_fillers(db, days, date_from, date_to, media_id, screen)
+    return _data_fillers(db, days, date_from, date_to, media_id, screen, dow)
 
 
 @router.get("/reports/playtime")
 def report_playtime(days: int = Query(7), advertiser: Optional[str] = Query(None),
                      date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None),
                      media_id: Optional[int] = Query(None), screen: Optional[str] = Query(None),
+                   dow: Optional[int] = Query(None),
                      admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    return _data_playtime(db, days, advertiser, date_from, date_to, media_id, screen)
+    return _data_playtime(db, days, advertiser, date_from, date_to, media_id, screen, dow)
 
 
 def _data_by_screen_advertiser(db: Session, days: int = 7, advertiser: Optional[str] = None,
-                               date_from=None, date_to=None, media_id=None, screen=None):
-    where, p = _playlog_where(days, date_from, date_to, advertiser, media_id, screen)
+                               date_from=None, date_to=None, media_id=None, screen=None, dow=None):
+    where, p = _playlog_where(days, date_from, date_to, advertiser, media_id, screen, dow)
     rows = db.execute(text(f"""
         SELECT s.name AS screen, a.name AS advertiser, m.title, COUNT(*) as plays
         FROM play_log pl
@@ -560,13 +564,14 @@ def _data_by_screen_advertiser(db: Session, days: int = 7, advertiser: Optional[
 def report_by_screen_advertiser(days: int = Query(7), advertiser: Optional[str] = Query(None),
                                  date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None),
                                  media_id: Optional[int] = Query(None), screen: Optional[str] = Query(None),
+                   dow: Optional[int] = Query(None),
                                  admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    return _data_by_screen_advertiser(db, days, advertiser, date_from, date_to, media_id, screen)
+    return _data_by_screen_advertiser(db, days, advertiser, date_from, date_to, media_id, screen, dow)
 
 
 def _data_earnings(db: Session, days: int = 30, advertiser: Optional[str] = None,
-                   date_from=None, date_to=None, media_id=None, screen=None):
-    where, p = _playlog_where(days, date_from, date_to, advertiser, media_id, screen)
+                   date_from=None, date_to=None, media_id=None, screen=None, dow=None):
+    where, p = _playlog_where(days, date_from, date_to, advertiser, media_id, screen, dow)
     rows = db.execute(text(f"""
         SELECT a.name AS advertiser, COUNT(*) as plays,
                COALESCE(SUM(EXTRACT(EPOCH FROM (pl.ended_at - pl.started_at))), 0) / 60.0 as minutes,
@@ -599,12 +604,13 @@ def _data_earnings(db: Session, days: int = 30, advertiser: Optional[str] = None
 def report_earnings(days: int = Query(30), advertiser: Optional[str] = Query(None),
                      date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None),
                      media_id: Optional[int] = Query(None), screen: Optional[str] = Query(None),
+                   dow: Optional[int] = Query(None),
                      admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    return _data_earnings(db, days, advertiser, date_from, date_to, media_id, screen)
+    return _data_earnings(db, days, advertiser, date_from, date_to, media_id, screen, dow)
 
 
 def _playlog_where(days=7, date_from=None, date_to=None, advertiser=None,
-                   media_id=None, screen=None):
+                   media_id=None, screen=None, dow=None):
     """Собрать WHERE и параметры для журнала показов из белого списка фильтров.
     Если задан диапазон дат (date_from/date_to) — используется он; иначе — период
     в днях (days). Все значения передаются как bind-параметры (без вставки в SQL)."""
@@ -628,16 +634,21 @@ def _playlog_where(days=7, date_from=None, date_to=None, advertiser=None,
     if screen:
         where.append("s.name = :screen")
         params["screen"] = screen
+    if dow:
+        # День недели по МСК: 1 = понедельник … 7 = воскресенье (ISO)
+        where.append("EXTRACT(ISODOW FROM pl.started_at + INTERVAL '3 hours') = :dow")
+        params["dow"] = int(dow)
     return " AND ".join(where), params
 
 
 def _data_playlog(db: Session, days: int = 7, advertiser: Optional[str] = None, limit: int = 500,
                   date_from: Optional[str] = None, date_to: Optional[str] = None,
-                  media_id: Optional[int] = None, screen: Optional[str] = None):
-    where, params = _playlog_where(days, date_from, date_to, advertiser, media_id, screen)
+                  media_id: Optional[int] = None, screen: Optional[str] = None, dow=None):
+    where, params = _playlog_where(days, date_from, date_to, advertiser, media_id, screen, dow)
     params["limit"] = limit
     rows = db.execute(text(f"""
         SELECT to_char(pl.started_at + INTERVAL '3 hours', 'YYYY-MM-DD') as day,
+               EXTRACT(ISODOW FROM pl.started_at + INTERVAL '3 hours')::int AS dow_num,
                to_char(pl.started_at + INTERVAL '3 hours', 'HH24:MI:SS') as time,
                s.name AS screen, COALESCE(m.title, pl.filename) AS media, a.name AS advertiser
         FROM play_log pl
@@ -648,7 +659,12 @@ def _data_playlog(db: Session, days: int = 7, advertiser: Optional[str] = None, 
         ORDER BY pl.started_at DESC
         LIMIT :limit
     """), params).fetchall()
-    return [dict(r._mapping) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r._mapping)
+        d["dow"] = DOW_RU[(d.pop("dow_num") or 1) - 1]
+        out.append(d)
+    return out
 
 
 @router.get("/playlog")
@@ -656,13 +672,14 @@ def get_playlog(days: int = Query(7), advertiser: Optional[str] = Query(None),
                  limit: int = Query(500), date_from: Optional[str] = Query(None),
                  date_to: Optional[str] = Query(None), media_id: Optional[int] = Query(None),
                  screen: Optional[str] = Query(None),
+                   dow: Optional[int] = Query(None),
                  admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    return _data_playlog(db, days, advertiser, limit, date_from, date_to, media_id, screen)
+    return _data_playlog(db, days, advertiser, limit, date_from, date_to, media_id, screen, dow)
 
 
 def _data_playlog_by_advertiser(db: Session, days: int = 7, date_from=None, date_to=None,
-                                media_id=None, screen=None):
-    where, params = _playlog_where(days, date_from, date_to, None, media_id, screen)
+                                media_id=None, screen=None, dow=None):
+    where, params = _playlog_where(days, date_from, date_to, None, media_id, screen, dow)
     rows = db.execute(text(f"""
         SELECT a.name AS advertiser, COUNT(*) as plays,
                COUNT(DISTINCT DATE(pl.started_at)) as days,
@@ -684,8 +701,9 @@ def _data_playlog_by_advertiser(db: Session, days: int = 7, date_from=None, date
 def get_playlog_by_advertiser(days: int = Query(7), date_from: Optional[str] = Query(None),
                                date_to: Optional[str] = Query(None), media_id: Optional[int] = Query(None),
                                screen: Optional[str] = Query(None),
+                   dow: Optional[int] = Query(None),
                                admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    return _data_playlog_by_advertiser(db, days, date_from, date_to, media_id, screen)
+    return _data_playlog_by_advertiser(db, days, date_from, date_to, media_id, screen, dow)
 
 
 # ─── Экспорт отчётов в Excel/PDF ─────────────────────────────────────────────
@@ -1072,10 +1090,11 @@ def export_reports_pdf(days: int = Query(7), sections: str = Query(""),
 def export_playlog_xlsx(days: int = Query(7), advertiser: Optional[str] = Query(None),
                          date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None),
                          media_id: Optional[int] = Query(None), screen: Optional[str] = Query(None),
+                   dow: Optional[int] = Query(None),
                          admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    rows = _data_playlog(db, days, advertiser, 5000, date_from, date_to, media_id, screen)
-    columns = ["Дата", "Время", "Экран", "Ролик", "Рекламодатель"]
-    data_rows = [[r["day"], r["time"], r["screen"], r["media"], r["advertiser"]] for r in rows]
+    rows = _data_playlog(db, days, advertiser, 5000, date_from, date_to, media_id, screen, dow)
+    columns = ["Дата", "День", "Время", "Экран", "Ролик", "Рекламодатель"]
+    data_rows = [[r["day"], r["dow"], r["time"], r["screen"], r["media"], r["advertiser"]] for r in rows]
     buf = _build_xlsx([("Журнал показов", columns, data_rows)])
     return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                               headers={"Content-Disposition": 'attachment; filename="playlog.xlsx"'})
@@ -1085,10 +1104,11 @@ def export_playlog_xlsx(days: int = Query(7), advertiser: Optional[str] = Query(
 def export_playlog_pdf(days: int = Query(7), advertiser: Optional[str] = Query(None),
                         date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None),
                         media_id: Optional[int] = Query(None), screen: Optional[str] = Query(None),
+                   dow: Optional[int] = Query(None),
                         admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    rows = _data_playlog(db, days, advertiser, 2000, date_from, date_to, media_id, screen)
-    columns = ["Дата", "Время", "Экран", "Ролик", "Рекламодатель"]
-    data_rows = [[r["day"], r["time"], r["screen"], r["media"], r["advertiser"]] for r in rows]
+    rows = _data_playlog(db, days, advertiser, 2000, date_from, date_to, media_id, screen, dow)
+    columns = ["Дата", "День", "Время", "Экран", "Ролик", "Рекламодатель"]
+    data_rows = [[r["day"], r["dow"], r["time"], r["screen"], r["media"], r["advertiser"]] for r in rows]
     buf = _build_pdf([("Журнал показов", columns, data_rows)], doc_title="Журнал показов")
     return StreamingResponse(buf, media_type="application/pdf",
                              headers={"Content-Disposition": 'attachment; filename="playlog.pdf"'})

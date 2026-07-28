@@ -13,7 +13,10 @@ function parseServerTS(ts) {
 function fmtServerTS(ts) {
   if (!ts) return '—';
   const d = parseServerTS(ts);
-  return isNaN(d) ? String(ts) : d.toLocaleString('ru-RU');
+  if (isNaN(d)) return String(ts);
+  // с днём недели: «пн, 28.07.2026, 09:15:00»
+  return d.toLocaleDateString('ru-RU', {weekday: 'short'}) + ', ' +
+         d.toLocaleString('ru-RU');
 }
 
 function kpi(l, v, s, col) {
