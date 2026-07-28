@@ -124,9 +124,12 @@ def billing_preview(period_start: str = Query(...), period_end: str = Query(...)
     if d_to < d_from:
         raise HTTPException(400, "period_end раньше period_start")
 
-    where, params = "", {}
+    # Госорганы в расчёт не берём: тарифа у них нет, счета им не выставляются
+    # (миграция 030). Иначе они висели бы в списке нулевыми строками.
+    where = "WHERE COALESCE(a.kind, 'advertiser') <> 'gov'"
+    params = {}
     if advertiser_id is not None:
-        where = "WHERE a.id = :aid"
+        where += " AND a.id = :aid"
         params["aid"] = advertiser_id
     advertisers = db.execute(text(f"""
         SELECT a.id, a.name, COALESCE(a.billing_mode, 'per_minute') AS billing_mode,
@@ -309,11 +312,14 @@ def create_invoice(body: dict = Body(...), admin: dict = Depends(require_write),
     adv = db.execute(text("""
         SELECT id, name, COALESCE(billing_mode, 'per_minute') AS billing_mode,
                COALESCE(price_per_minute, 0) AS price_per_minute,
-               COALESCE(price_per_play, 0) AS price_per_play
+               COALESCE(price_per_play, 0) AS price_per_play,
+               COALESCE(kind, 'advertiser') AS kind
         FROM advertisers WHERE id = :id
     """), {"id": adv_id}).fetchone()
     if not adv:
         raise HTTPException(404, "Рекламодатель не найден")
+    if adv.kind == "gov":
+        raise HTTPException(400, "Это госорган: счета ему не выставляются")
 
     plays, minutes = _period_stats(db, adv.id, d_from, d_to)
     price = float(adv.price_per_play if adv.billing_mode == "per_play" else adv.price_per_minute)

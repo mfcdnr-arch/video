@@ -129,10 +129,22 @@ async def upload_media(
     выдаётся экранам до одобрения; служебный контент — сразу approved.
     is_filler=true — файл сразу в «Заглушки»: категория service (не реклама,
     модерация не нужна), рекламодатель/папка «Служебное»/«Заглушки»."""
-    if is_filler:
-        category = "service"
-    category, age_rating = _validate_ad_fields(category, age_rating, disclaimer_text, license_number)
-    review_status = "approved" if AD_CATEGORIES[category].get("auto_ok") else "pending"
+    # Куда грузим, выясняем ДО проверок 38-ФЗ: скан договора — не реклама,
+    # требовать у него возрастную маркировку и категорию бессмысленно.
+    is_document = False
+    if folder_id:
+        with Session(engine) as db_chk:
+            fname = db_chk.execute(text("SELECT name FROM media_folders WHERE id = :id"),
+                                   {"id": folder_id}).scalar()
+        is_document = (fname or "").strip().lower() == DOCS_FOLDER.lower()
+
+    if is_document:
+        category, age_rating, review_status = "service", None, "approved"
+    else:
+        if is_filler:
+            category = "service"
+        category, age_rating = _validate_ad_fields(category, age_rating, disclaimer_text, license_number)
+        review_status = "approved" if AD_CATEGORIES[category].get("auto_ok") else "pending"
     # Случайный суффикс защищает от коллизии имён: два файла с одинаковым
     # исходным именем, загруженные в одну секунду, раньше перезаписывали
     # друг друга на диске (обнаружено при тестировании модерации).
@@ -151,6 +163,33 @@ async def upload_media(
             size += len(chunk)
 
     md5_hash = md5.hexdigest()
+
+    # Файл из папки «Документы» — это не эфирный контент, а скан договора,
+    # декларации или согласования. Такие файлы:
+    #   • не проходят проверку плеером (PDF ffprobe не откроет);
+    #   • получают status='document' — а весь эфир строго фильтруется по
+    #     status='ready', поэтому в плейлист и на экран они не попадут никак.
+    if is_document:
+        if not filename.lower().endswith(DOC_EXTS):
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+            raise HTTPException(400, "В папку «Документы» принимаются файлы "
+                                     + ", ".join(DOC_EXTS))
+        with Session(engine) as db:
+            media_id = db.execute(text(
+                "INSERT INTO media (title, filename, filesize, md5_hash, status, "
+                "duration_seconds, advertiser_id, folder_id, category, review_status) "
+                "VALUES (:t, :f, :s, :m, 'document', 0, :aid, :fid, 'service', 'approved') "
+                "RETURNING id"
+            ), {"t": title, "f": filename, "s": size, "m": md5_hash,
+                "aid": advertiser_id or None, "fid": folder_id}).fetchone()[0]
+            db.commit()
+        return {"id": media_id, "title": title, "filename": filename, "filesize": size,
+                "md5_hash": md5_hash, "status": "document", "duration_seconds": 0,
+                "category": "service", "age_rating": None, "review_status": "approved",
+                "note": "Документ сохранён в папке «Документы» и в эфир не выдаётся"}
 
     # Проверка файла на работоспособность (отсекаем заведомо нерабочие).
     from media_check import check_video
@@ -225,6 +264,10 @@ def list_media(admin: dict = Depends(get_current_admin), db: Session = Depends(g
         "m.status, m.created_at, COALESCE(m.is_filler, FALSE) AS is_filler, "
         "m.advertiser_id, m.folder_id, a.name AS advertiser "
         "FROM media m LEFT JOIN advertisers a ON a.id = m.advertiser_id "
+        # Это список ЭФИРНОГО контента (из него же выбирают ролик в плейлист),
+        # поэтому сканы из папки «Документы» сюда не попадают. Их видно в самой
+        # папке — /advertisers/{id}/media.
+        "WHERE m.status <> 'document' "
         "ORDER BY m.created_at DESC"
     )).fetchall()
     return [dict(r._mapping) for r in rows]
@@ -511,6 +554,7 @@ def list_advertisers(admin: dict = Depends(get_current_admin), db: Session = Dep
         SELECT a.id, a.name, a.color, a.price_per_minute,
                COALESCE(a.price_per_play, 0) AS price_per_play,
                COALESCE(a.billing_mode, 'per_minute') AS billing_mode,
+               COALESCE(a.kind, 'advertiser') AS kind,
                a.note, a.inn, a.contact_person,
                COUNT(DISTINCT f.id) AS folders,
                COUNT(DISTINCT m.id) AS files
@@ -522,21 +566,54 @@ def list_advertisers(admin: dict = Depends(get_current_admin), db: Session = Dep
     return [dict(r._mapping) for r in rows]
 
 
+# Папки, которые заводятся владельцу контента сразу при регистрации, чтобы
+# администратору не приходилось создавать их руками перед первой загрузкой.
+# «Видеореклама» — то, что идёт в эфир; «Документы» — сканы договоров,
+# деклараций и согласований (в эфир не попадают, см. upload_media).
+DEFAULT_OWNER_FOLDERS = ("Видеореклама", "Документы")
+DOCS_FOLDER = "Документы"
+# Что принимаем в папку «Документы»: сканы и файлы согласований.
+DOC_EXTS = (".pdf", ".jpg", ".jpeg", ".png", ".doc", ".docx", ".xls", ".xlsx", ".odt", ".rtf")
+
+
+def ensure_owner_folders(db: Session, advertiser_id: int):
+    """Создать стандартные папки владельца, если их ещё нет (идемпотентно)."""
+    for folder in DEFAULT_OWNER_FOLDERS:
+        db.execute(text("""
+            INSERT INTO media_folders (advertiser_id, name) VALUES (:a, :n)
+            ON CONFLICT (advertiser_id, name) DO NOTHING
+        """), {"a": advertiser_id, "n": folder})
+
+
 @router.post("/advertisers")
 def create_advertiser(body: dict = Body(...), admin: dict = Depends(require_write),
                       db: Session = Depends(get_db)):
+    """
+    Завести владельца контента. kind='gov' — госорган: ролики крутятся так же,
+    но денег с него не берут (тарифа нет, счета не выставляются, в дебиторке
+    не участвует). Коммерческие рекламодатели заводятся автоматически при
+    создании пользователя с ролью «рекламодатель», поэтому руками здесь
+    создают в основном госорганы.
+    """
     name = (body.get("name") or "").strip()
     color = body.get("color") or "#7fe3c4"
+    kind = (body.get("kind") or "advertiser").strip()
     if not name:
         raise HTTPException(400, "name обязателен")
+    if kind not in ("advertiser", "gov"):
+        raise HTTPException(400, "kind: advertiser или gov")
     try:
         row = db.execute(text(
-            "INSERT INTO advertisers (name, color) VALUES (:n, :c) RETURNING id, name, color, price_per_minute"
-        ), {"n": name, "c": color}).fetchone()
+            "INSERT INTO advertisers (name, color, kind) VALUES (:n, :c, :k) "
+            "RETURNING id, name, color, kind, price_per_minute"
+        ), {"n": name, "c": color, "k": kind}).fetchone()
+        ensure_owner_folders(db, row.id)
         db.commit()
+    except HTTPException:
+        raise
     except Exception:
         db.rollback()
-        raise HTTPException(409, "Рекламодатель с таким именем уже существует")
+        raise HTTPException(409, "Владелец с таким именем уже существует")
     return dict(row._mapping)
 
 
@@ -604,11 +681,15 @@ def list_adv_media(adv_id: int, admin: dict = Depends(get_current_admin),
                COALESCE(m.is_filler, FALSE) AS is_filler,
                m.folder_id,
                m.category, m.age_rating, m.review_status, m.reject_reason,
+               m.status,
                EXISTS(
                    SELECT 1 FROM playlist_items pi WHERE pi.media_id = m.id
                ) AS in_playlist
         FROM media m
-        WHERE m.advertiser_id = :aid AND m.status = 'ready'
+        -- Здесь показываем содержимое папок владельца целиком, включая сканы
+        -- из «Документов» (status='document'): администратор должен видеть в
+        -- папке то, что в неё положил. В эфир они всё равно не идут.
+        WHERE m.advertiser_id = :aid AND m.status IN ('ready', 'document')
         ORDER BY m.created_at DESC
     """), {"aid": adv_id}).fetchall()
     return [dict(r._mapping) for r in rows]

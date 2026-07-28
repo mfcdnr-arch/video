@@ -37,6 +37,7 @@ services:
       - ./server/migrations/027_screen_diagnostics.sql:/docker-entrypoint-initdb.d/27_screen_diagnostics.sql:ro
       - ./server/migrations/028_display_signal.sql:/docker-entrypoint-initdb.d/28_display_signal.sql:ro
       - ./server/migrations/029_advertiser_office.sql:/docker-entrypoint-initdb.d/29_advertiser_office.sql:ro
+      - ./server/migrations/030_gov_owners.sql:/docker-entrypoint-initdb.d/30_gov_owners.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s

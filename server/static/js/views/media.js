@@ -221,7 +221,7 @@ async function viewMedia(){
   // Верхние кнопки
   document.getElementById('topright').innerHTML = canWrite()
     ? `
-      <button class="btn" data-action="media-create-adv" style="margin-right:6px;">+ Рекламодатель</button>
+      <button class="btn" data-action="media-create-adv" style="margin-right:6px;" title="Госорган — владелец контента без биллинга: тарифа нет, счета не выставляются">+ Госорганы</button>
       <button class="btn primary" data-action="media-open-upload">↑ Загрузить файл</button>`
     : '';
 
@@ -248,7 +248,7 @@ async function viewMedia(){
       </div>`;
 
     if(!advs.length){
-      view.innerHTML = commonCard + fillersCard + '<div class="empty">Рекламодателей пока нет.<br>Нажмите «+ Рекламодатель» чтобы создать, или «↑ Загрузить файл» — при загрузке тоже можно создать рекламодателя.</div>';
+      view.innerHTML = commonCard + fillersCard + '<div class="empty">Владельцев контента пока нет.<br>Рекламодатели появляются автоматически при создании пользователя с ролью «Рекламодатель» (Настройки). Госорган заводится кнопкой «+ Госорганы».</div>';
       return;
     }
 
@@ -259,10 +259,15 @@ async function viewMedia(){
     ${commonCard}
     ${fillersCard}
     <div id="media-adv-list">`;
-    h += '<div class="muted" style="font-size:12px;margin-bottom:11px;">Рекламодатель → папки → файлы. Цена за минуту эфира используется для расчёта заработка в отчётах.</div>';
+    h += '<div class="muted" style="font-size:12px;margin-bottom:11px;">Владелец → папки → файлы. Папки «Видеореклама» и «Документы» заводятся автоматически;'
+       + ' файлы из «Документов» в эфир не выдаются. Цена за минуту эфира — для расчёта заработка в отчётах;'
+       + ' у госорганов её нет, счета им не выставляются.</div>';
 
     advs.forEach(a => {
-      const priceCtl = canWrite()
+      const isGov = a.kind === 'gov';
+      const priceCtl = isGov
+        ? `<span class="muted" style="font-size:12px;">без биллинга</span>`
+        : canWrite()
         ? `<span style="display:inline-flex;align-items:center;gap:4px;">
              <input class="inp" id="price-${a.id}" value="${a.price_per_minute||0}" style="width:80px;padding:5px 8px;text-align:right;" title="Цена за минуту эфира">
              <span class="muted" style="font-size:11px;">₽/мин</span>
@@ -279,6 +284,7 @@ async function viewMedia(){
                data-adv-name="${esc(a.name)}">
                <span class="dot" style="background:${a.color};"></span>
                <span style="font-weight:500;width:140px;">${esc(a.name)}</span>
+               ${isGov ? '<span style="font-size:10px;background:rgba(108,117,125,0.15);color:var(--muted);border-radius:4px;padding:1px 6px;">госорган</span>' : ''}
                <span style="color:var(--muted);font-size:12px;">${a.folders} папок · ${a.files} файлов</span>
                <span style="flex:1;"></span>
                ${priceCtl}<span class="dim">›</span>
@@ -292,12 +298,15 @@ async function viewMedia(){
   }
 }
 
+// Кнопка заводит ГОСОРГАН: коммерческие рекламодатели появляются сами при
+// создании пользователя с ролью «Рекламодатель», руками их больше не создают.
 async function createAdvPrompt(){
-  const name = prompt('Название рекламодателя:');
+  const name = prompt('Наименование госоргана:');
   if(!name || !name.trim()) return;
   try{
-    await api('/advertisers', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:name.trim()})});
-    toast('Рекламодатель создан'); viewMedia();
+    await api('/advertisers', {method:'POST', headers:{'Content-Type':'application/json'},
+                               body:JSON.stringify({name:name.trim(), kind:'gov'})});
+    toast('Госорган создан, папки «Видеореклама» и «Документы» заведены'); viewMedia();
   }catch(e){ toast('Ошибка: ' + e.message); }
 }
 
@@ -354,11 +363,16 @@ async function openAdv(id, name){
     files.forEach(f => {
       h += `<div class="cell" style="padding:0;overflow:hidden;">
         <div style="height:88px;background:var(--bg2);display:flex;align-items:center;justify-content:center;color:#454b57;font-size:26px;position:relative;">
-          <img src="${API}/media/${f.id}/thumbnail" alt=""
+          ${f.status==='document'
+            // У документа миниатюры нет и быть не может — запрос за ней давал
+            // 404 в консоли на каждую карточку. Рисуем расширение файла.
+            ? `<span style="font-size:13px;color:var(--muted);letter-spacing:1px;">${esc((f.filename||'').split('.').pop().toUpperCase())}</span>`
+            : `<img src="${API}/media/${f.id}/thumbnail" alt=""
                style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;"
-               onerror="this.remove()">▶
+               onerror="this.remove()">▶`}
+          ${f.status==='document'?'<span style="position:absolute;top:6px;left:6px;background:#2b2f36;color:#c9ced7;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;" title="Документ: в эфир не выдаётся">документ</span>':''}
           ${f.in_playlist?'<span style="position:absolute;top:6px;left:6px;background:#0f6e56;color:#dffaf0;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;">в эфире</span>':''}
-          ${f.review_status==='pending'?'<span style="position:absolute;top:6px;right:6px;background:#8a6d00;color:#ffe9a8;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;">на модерации</span>':''}
+          ${f.status!=='document'&&f.review_status==='pending'?'<span style="position:absolute;top:6px;right:6px;background:#8a6d00;color:#ffe9a8;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;">на модерации</span>':''}
           ${f.review_status==='rejected'?`<span title="${esc(f.reject_reason||'')}" style="position:absolute;top:6px;right:6px;background:#7a1f1f;color:#ffd7d7;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;">отклонён</span>`:''}
           ${f.age_rating?`<span style="position:absolute;bottom:6px;right:6px;background:rgba(0,0,0,.65);color:#fff;font-size:10px;padding:1px 6px;border-radius:5px;z-index:1;">${esc(f.age_rating)}</span>`:''}</div>
         <div style="padding:9px 10px;">
@@ -414,10 +428,9 @@ async function uploadForm(advId){
         <label>Папка (необязательно)</label>
         <select class="inp" id="up-folder"><option value="">— без папки —</option></select>
       </div>
-      <div class="fld" style="display:flex;align-items:center;gap:8px;margin-top:4px;">
-        <input class="inp" id="up-new-adv" placeholder="Создать нового рекламодателя…" style="flex:1;">
-        <button class="btn" data-action="media-create-adv-in-form">+ Создать</button>
-      </div>`;
+      <div class="muted" style="font-size:11px;margin-top:4px;">Нужного владельца нет в списке?
+        Рекламодатель заводится сам при создании пользователя с ролью «Рекламодатель» (Настройки),
+        госорган — кнопкой «+ Госорганы» в Медиатеке.</div>`;
 
   document.getElementById('view').innerHTML = `
     <div style="max-width:460px;">
@@ -443,7 +456,7 @@ async function uploadForm(advId){
       <div class="muted" style="font-size:11px;margin-bottom:8px;">Период, в течение которого ролик разрешён к показу. Пусто = без ограничения.</div>
       <div class="row"><div class="fld" style="flex:1;"><label>Показывать с</label><input class="inp" id="up-from" type="datetime-local"></div>
         <div class="fld" style="flex:1;"><label>Показывать по</label><input class="inp" id="up-until" type="datetime-local"></div></div>
-      <div class="sec" style="font-size:12px;margin:14px 0 6px;">Рекламодатель</div>
+      <div class="sec" style="font-size:12px;margin:14px 0 6px;">Владелец контента</div>
       ${advSel}
       <div style="display:flex;gap:8px;margin-top:12px;"><button class="btn primary" data-action="media-submit-upload">↑ Загрузить</button>
         <button class="btn" data-action="media-back">Отмена</button></div>

@@ -554,7 +554,7 @@ def advertiser_creatives(aid: int = Depends(advertiser_scope),
                (SELECT MAX(pl.started_at) FROM play_log pl WHERE pl.media_id = m.id) AS last_play,
                (SELECT COUNT(*) FROM play_log pl WHERE pl.media_id = m.id) AS plays_total
         FROM media m
-        WHERE m.advertiser_id = :aid
+        WHERE m.advertiser_id = :aid AND m.status <> 'document'
         ORDER BY m.created_at DESC
     """), {"aid": aid}).fetchall()
 

@@ -32,10 +32,14 @@ def add_to_playlist(
     db: Session = Depends(get_db)
 ):
     # 38-ФЗ: неодобренный или отклонённый контент не попадает в эфирные плейлисты
-    m = db.execute(text("SELECT title, review_status FROM media WHERE id = :id"),
+    m = db.execute(text("SELECT title, review_status, status FROM media WHERE id = :id"),
                    {"id": media_id}).fetchone()
     if not m:
         raise HTTPException(404, "Ролик не найден")
+    # Файлы из папки «Документы» (сканы договоров и деклараций) хранятся со
+    # status='document' и модерацию не проходят — в эфирный плейлист их нельзя.
+    if m.status == "document":
+        raise HTTPException(409, f"«{m.title}» — документ, а не ролик: в плейлист добавить нельзя")
     if m.review_status != "approved":
         status_ru = {"pending": "ещё на модерации", "rejected": "отклонён модератором"}.get(
             m.review_status, m.review_status)

@@ -13,21 +13,27 @@ ROLES = ("admin", "auditor", "moderator", "advertiser")
 def _ensure_advertiser(db: Session, name: str, actor: str) -> int:
     """
     Кабинет рекламодателя под учётную запись: одноимённый рекламодатель уже
-    есть — привязываемся к нему, нет — заводим.
+    есть — привязываемся к нему, нет — заводим вместе с папками медиатеки.
 
     Так «кабинет» не дублирует рекламодателя, который уже ведётся в медиатеке
     (иначе ролики и счета остались бы у одной записи, а кабинет смотрел бы в
     другую, пустую).
     """
+    from routers.media import ensure_owner_folders
+
     name = (name or "").strip()
     if not name:
         raise HTTPException(400, "Укажите наименование рекламодателя")
     row = db.execute(text("SELECT id FROM advertisers WHERE lower(name) = lower(:n)"),
                      {"n": name}).fetchone()
     if row:
+        # Кабинет уже был — папки могли не создаваться (запись из старой
+        # версии), поэтому добиваем их и здесь.
+        ensure_owner_folders(db, row.id)
         return row.id
     new_id = db.execute(text(
         "INSERT INTO advertisers (name) VALUES (:n) RETURNING id"), {"n": name}).fetchone()[0]
+    ensure_owner_folders(db, new_id)
     db.execute(text("""
         INSERT INTO audit_log (event_type, title, detail, actor)
         VALUES ('user', 'Создан кабинет рекламодателя', :d, :who)

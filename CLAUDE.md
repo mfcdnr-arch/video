@@ -26,7 +26,7 @@
 - `server/routers/` — роутеры по доменам: auth, users, screens, media, playlists,
   schedule, campaigns, broadcast, billing, advertiser_office, reports,
   notifications, backups, ticker, system, agent_ota, websockets
-- `server/migrations/` — SQL-миграции с номерами `001`…`029`, применяются
+- `server/migrations/` — SQL-миграции с номерами `001`…`030`, применяются
   автоматически при первом старте Postgres
 - `server/tests/` — pytest (billing, campaigns, контроль монитора), запуск через `run_tests.sh`
 - `ui_tests/ui_test.js` — браузерный E2E-прогон панели (puppeteer), запуск через `ui_test.sh`
