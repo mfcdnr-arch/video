@@ -82,8 +82,10 @@ for pair in $SERVICES; do
 done
 
 # --- 2. «Чёрная панель»: api жив, но через nginx 502 -------------------------
-# nginx резолвит имя апстрима один раз при старте; если api пересоздавался,
-# а nginx нет — прокси бьёт по устаревшему IP. Лечение — рестарт nginx.
+# Штатно этого больше не случается: в nginx.conf апстрим задан переменной
+# ($ds_api) при живом resolver 127.0.0.11, поэтому имя перепроверяется на ходу.
+# Проверка остаётся страховкой — на случай старого nginx.conf на сервере или
+# другой причины, по которой api виден изнутри, но не через прокси.
 inside_ok=0;  docker exec ds_api curl -fsS -m 3 http://localhost:8000/health >/dev/null 2>&1 && inside_ok=1
 outside_ok=0; curl -fsS -m 3 http://localhost/health >/dev/null 2>&1 && outside_ok=1
 
