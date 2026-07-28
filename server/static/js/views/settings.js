@@ -59,6 +59,12 @@ async function viewSettings(){
 
       ${usersBlock}
 
+      ${isSuper() ? `<div class="sec">Реквизиты организации</div>
+      <div class="muted" style="font-size:12px;margin-bottom:8px;">Ваши реквизиты как исполнителя.
+      Подставляются в акт оказанных услуг и эфирную справку. Расчёты ведутся по УСН —
+      в документах печатается «НДС не облагается».</div>
+      <div id="company-block" class="muted">Загрузка…</div>` : ''}
+
       ${isSuper() ? `<div class="sec">Уведомления в MAX</div>
       <div class="muted" style="font-size:12px;margin-bottom:8px;">Сервер проверяет состояние сети раз в минуту и присылает боту MAX сообщение, когда экран уходит офлайн, заканчивается место на диске или ролик перестаёт воспроизводиться. Одно событие = одно сообщение (без спама), по возвращении экрана онлайн приходит уведомление о восстановлении.</div>
       <div id="notif-block" class="muted">Загрузка…</div>` : ''}
@@ -198,6 +204,7 @@ async function saveNotifications(){
   try{
     await api('/notifications/settings', {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
     toast('Настройки уведомлений сохранены');
+    loadCompany();
     loadNotifications();
   }catch(e){ toast('Ошибка: ' + e.message); }
 }
@@ -254,6 +261,9 @@ function initSettingsViewActions(){
     switch(action){
       case 'settings-create-user':
         return createUser();
+
+      case 'settings-save-company':
+        return saveCompany();
 
       case 'settings-open-my-password-form':
         return myPasswordForm();
@@ -663,3 +673,58 @@ window.Signage.testNotification = testNotification;
 
 initSettingsViewActions();
 
+
+
+// ─── Реквизиты организации (исполнителя) ──────────────────────────────────
+// Нужны для акта и эфирной справки: без них документы сформируются с пустой
+// шапкой, поэтому сервер прямо просит их заполнить перед первой генерацией.
+async function loadCompany(){
+  const el = document.getElementById('company-block');
+  if(!el) return;
+  try{
+    const c = await api('/company/settings');
+    const f = (id, label, val, ph) =>
+      `<div class="fld" style="flex:1;"><label>${label}</label>
+        <input class="inp" id="co-${id}" value="${esc(val || '')}" placeholder="${ph || ''}"></div>`;
+    el.innerHTML = `<div class="cell">
+      <div class="row">
+        ${f('legal_name', 'Полное наименование', c.legal_name, 'ООО «Цифровые Экраны»')}
+        ${f('short_name', 'Краткое', c.short_name, 'ООО «ЦЭ»')}
+      </div>
+      <div class="row">
+        ${f('inn', 'ИНН', c.inn)}${f('kpp', 'КПП', c.kpp)}${f('ogrn', 'ОГРН', c.ogrn)}
+      </div>
+      ${f('legal_address', 'Юридический адрес', c.legal_address)}
+      <div class="row">
+        ${f('bank_name', 'Банк', c.bank_name)}${f('bank_bik', 'БИК', c.bank_bik)}
+      </div>
+      <div class="row">
+        ${f('bank_account', 'Расчётный счёт', c.bank_account)}${f('corr_account', 'Корр. счёт', c.corr_account)}
+      </div>
+      <div class="row">
+        ${f('director_post', 'Должность подписанта', c.director_post, 'Генеральный директор')}
+        ${f('director_name', 'ФИО подписанта', c.director_name, 'Иванов И.И.')}
+      </div>
+      <div class="row">
+        ${f('phone', 'Телефон', c.phone)}${f('email', 'E-mail', c.email)}
+      </div>
+      <div class="muted" style="font-size:11px;margin:4px 0 8px;">Налоговый режим: УСН, НДС не начисляется.</div>
+      <button class="btn primary" data-action="settings-save-company">Сохранить реквизиты</button>
+    </div>`;
+  }catch(e){
+    el.innerHTML = '<div class="muted" style="font-size:12px;">Не удалось загрузить реквизиты</div>';
+  }
+}
+
+async function saveCompany(){
+  const ids = ['legal_name','short_name','inn','kpp','ogrn','legal_address','bank_name',
+               'bank_bik','bank_account','corr_account','director_post','director_name','phone','email'];
+  const body = {};
+  ids.forEach(i => body[i] = val('co-' + i));
+  try{
+    await api('/company/settings', {method:'PATCH', headers:{'Content-Type':'application/json'},
+                                    body: JSON.stringify(body)});
+    toast('Реквизиты сохранены');
+  }catch(e){ toast('Ошибка: ' + e.message); }
+}
+window.Signage.saveCompany = saveCompany;

@@ -66,7 +66,7 @@ async def advertiser_guard(request: Request, call_next):
 from routers import (
     auth, system, media, screens, playlists, schedule,
     ticker, agent_ota, users, backups, broadcast, reports, websockets,
-    billing, campaigns, notifications, advertiser_office,
+    billing, campaigns, notifications, advertiser_office, advertiser_docs,
 )
 
 app.include_router(auth.router)
@@ -86,6 +86,7 @@ app.include_router(billing.router)
 app.include_router(campaigns.router)
 app.include_router(notifications.router)
 app.include_router(advertiser_office.router)
+app.include_router(advertiser_docs.router)
 
 # Роутеры-заглушки из более ранней версии проекта (по одному /health на модуль).
 from admin_panel import router as admin_router

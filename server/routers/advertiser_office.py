@@ -159,6 +159,26 @@ def advertiser_overview(date_from: str = Query(...), date_to: str = Query(...),
     comm_plays = int(sov.commercial_plays or 0)
     own_plays = int(sov.own_plays or 0)
 
+    # Предыдущий период такой же длины, впритык перед текущим: рекламодателю
+    # важно «стало больше или меньше», а не абсолютная цифра в вакууме.
+    prev_to = d_from - timedelta(days=1)
+    prev_from = prev_to - timedelta(days=days - 1)
+    ps, pe = _utc_bounds(prev_from, prev_to)
+    prev = db.execute(text("""
+        SELECT COUNT(*) AS plays,
+               COALESCE(SUM(EXTRACT(EPOCH FROM (pl.ended_at - pl.started_at))), 0) / 60.0 AS minutes
+        FROM play_log pl JOIN media m ON m.id = pl.media_id
+        WHERE m.advertiser_id = :aid AND pl.started_at >= :start AND pl.started_at < :end
+    """), {"aid": aid, "start": ps, "end": pe}).fetchone()
+    prev_plays = int(prev.plays or 0)
+    prev_minutes = round(float(prev.minutes or 0), 1)
+
+    def _delta(now_v, was_v):
+        """Прирост в процентах. None, если сравнивать не с чем (было 0)."""
+        if not was_v:
+            return None
+        return round(100.0 * (now_v - was_v) / was_v, 1)
+
     invoices = db.execute(text("""
         SELECT id, period_start, period_end, amount, adjustment_amount, status, due_date, paid_at
         FROM invoices WHERE advertiser_id = :aid
@@ -166,7 +186,8 @@ def advertiser_overview(date_from: str = Query(...), date_to: str = Query(...),
     """), {"aid": aid}).fetchall()
 
     return {
-        "advertiser": {"id": adv.id, "name": adv.name, "inn": adv.inn,
+        "advertiser": {"id": adv.id, "name": adv.name, "legal_name": adv.legal_name,
+                       "inn": adv.inn, "kpp": adv.kpp, "legal_address": adv.legal_address,
                        "contact_person": adv.contact_person, "phone": adv.phone,
                        "email": adv.email},
         "period": {"date_from": d_from.isoformat(), "date_to": d_to.isoformat(), "days": days},
@@ -186,6 +207,12 @@ def advertiser_overview(date_from: str = Query(...), date_to: str = Query(...),
             "pct_commercial": round(100.0 * own_plays / comm_plays, 1) if comm_plays else None,
         },
         "money": {"billing_mode": adv.billing_mode, "price": price, "amount": amount},
+        "previous": {
+            "date_from": prev_from.isoformat(), "date_to": prev_to.isoformat(),
+            "plays": prev_plays, "minutes": prev_minutes,
+            "plays_delta_pct": _delta(plays, prev_plays),
+            "minutes_delta_pct": _delta(minutes, prev_minutes),
+        },
         "by_day": [{"date": r.on_date.isoformat(), "plays": int(r.plays),
                     "minutes": round(float(r.minutes), 1)} for r in by_day],
         "heatmap": [{"dow": r.dow, "hour": r.hour, "plays": int(r.plays)} for r in heat],
@@ -356,6 +383,154 @@ def advertiser_delivery(date_from: str = Query(...), date_to: str = Query(...),
         "screens": screens,
         "campaigns": campaigns,
     }
+
+
+@router.get("/advertisers/{aid}/now-playing")
+def advertiser_now_playing(aid: int = Depends(advertiser_scope),
+                           admin: dict = Depends(get_current_admin),
+                           db: Session = Depends(get_db)):
+    """
+    Что из роликов рекламодателя идёт прямо сейчас и на каких экранах.
+
+    Самый частый вопрос клиента — «меня вообще показывают?». Берём
+    playing_file из heartbeat: экран считается живым, если выходил на связь
+    последние 2 минуты (heartbeat раз в 30 секунд).
+    """
+    _get_advertiser(db, aid)
+    rows = db.execute(text("""
+        SELECT s.id, s.name, s.city, s.location, s.last_seen, s.display_connected,
+               COALESCE(m.title, m.filename) AS creative
+        FROM screens s
+        JOIN media m ON m.filename = s.playing_file
+        WHERE m.advertiser_id = :aid
+          AND s.last_seen > NOW() - INTERVAL '2 minutes'
+        ORDER BY s.name
+    """), {"aid": aid}).fetchall()
+    return {"checked_at": datetime.utcnow().isoformat(),
+            "screens": [dict(r._mapping) for r in rows]}
+
+
+@router.get("/advertisers/{aid}/alerts")
+def advertiser_alerts(aid: int = Depends(advertiser_scope),
+                      admin: dict = Depends(get_current_admin),
+                      db: Session = Depends(get_db)):
+    """
+    Что требует внимания рекламодателя: ролик отклонён модерацией (и почему),
+    ждёт проверки, скоро истекает срок показа, ролик не воспроизводится,
+    выставлен или просрочен счёт, готовы документы за период.
+
+    Считается на лету по текущим данным — отдельного хранилища уведомлений
+    нет намеренно: «прочитанность» тут не нужна, важно текущее состояние.
+    """
+    _get_advertiser(db, aid)
+    out = []
+
+    creatives = db.execute(text("""
+        SELECT id, COALESCE(title, filename) AS title, review_status, reject_reason,
+               valid_until, is_broken
+        FROM media WHERE advertiser_id = :aid
+    """), {"aid": aid}).fetchall()
+    now = datetime.utcnow()
+    for c in creatives:
+        if c.review_status == "rejected":
+            out.append({"level": "danger", "kind": "rejected",
+                        "text": f"Ролик «{c.title}» отклонён модерацией"
+                                + (f": {c.reject_reason}" if c.reject_reason else ""),
+                        "media_id": c.id})
+        elif c.review_status == "pending":
+            out.append({"level": "info", "kind": "pending",
+                        "text": f"Ролик «{c.title}» ждёт проверки — в эфир пойдёт после одобрения",
+                        "media_id": c.id})
+        if c.is_broken:
+            out.append({"level": "danger", "kind": "broken",
+                        "text": f"Ролик «{c.title}» не воспроизводится на экранах",
+                        "media_id": c.id})
+        if c.valid_until and now <= c.valid_until <= now + timedelta(days=3):
+            out.append({"level": "warn", "kind": "expiring",
+                        "text": f"У ролика «{c.title}» {c.valid_until.strftime('%d.%m.%Y')} "
+                                f"истекает срок показа — после этой даты он пропадёт из эфира",
+                        "media_id": c.id})
+
+    invoices = db.execute(text("""
+        SELECT id, period_start, period_end, amount, adjustment_amount, status, due_date
+        FROM invoices WHERE advertiser_id = :aid AND status = 'issued'
+        ORDER BY period_start DESC
+    """), {"aid": aid}).fetchall()
+    today = (now + timedelta(hours=3)).date()
+    for i in invoices:
+        total = float(i.amount) + float(i.adjustment_amount or 0)
+        overdue = i.due_date and i.due_date < today
+        out.append({
+            "level": "danger" if overdue else "info",
+            "kind": "invoice",
+            "text": (f"Счёт за {i.period_start.strftime('%d.%m.%Y')}—{i.period_end.strftime('%d.%m.%Y')} "
+                     f"на {total:.2f} ₽ "
+                     + (f"просрочен (оплатить до {i.due_date.strftime('%d.%m.%Y')})" if overdue
+                        else (f"— оплатить до {i.due_date.strftime('%d.%m.%Y')}" if i.due_date else "выставлен"))),
+            "invoice_id": i.id})
+
+    # Документы группируем по периоду: пакет — это 4 файла (справка PDF+Excel,
+    # акт, отчёт), и четыре одинаковых строки в списке были бы просто шумом.
+    docs = db.execute(text("""
+        SELECT period_start, period_end, COUNT(*) AS files, MAX(created_at) AS created_at
+        FROM advertiser_documents
+        WHERE advertiser_id = :aid AND created_at > NOW() - INTERVAL '30 days'
+        GROUP BY period_start, period_end
+        ORDER BY MAX(created_at) DESC LIMIT 5
+    """), {"aid": aid}).fetchall()
+    for d in docs:
+        out.append({"level": "info", "kind": "document",
+                    "text": f"Готовы документы за "
+                            f"{d.period_start.strftime('%d.%m.%Y')}—{d.period_end.strftime('%d.%m.%Y')} "
+                            f"({d.files} файл{'а' if 2 <= d.files <= 4 else 'ов'}) — "
+                            f"вкладка «Документы»"})
+
+    order = {"danger": 0, "warn": 1, "info": 2}
+    out.sort(key=lambda x: order.get(x["level"], 3))
+    return {"total": len(out),
+            "danger": sum(1 for x in out if x["level"] == "danger"),
+            "items": out}
+
+
+@router.get("/advertisers/{aid}/airtime.xlsx")
+def advertiser_airtime_xlsx(date_from: str = Query(...), date_to: str = Query(...),
+                            aid: int = Depends(advertiser_scope),
+                            admin: dict = Depends(get_current_admin),
+                            db: Session = Depends(get_db)):
+    """
+    Журнал выходов в Excel — рекламодатель выгружает сам, не дёргая
+    администратора. Тот же набор строк, что и на вкладке «Эфир».
+    """
+    from fastapi.responses import StreamingResponse
+    from routers.reports import _build_xlsx
+
+    adv = _get_advertiser(db, aid)
+    d_from, d_to = _period(date_from, date_to)
+    start, end = _utc_bounds(d_from, d_to)
+    rows = db.execute(text("""
+        SELECT pl.started_at + INTERVAL '3 hours' AS started_msk,
+               EXTRACT(ISODOW FROM pl.started_at + INTERVAL '3 hours')::int AS dow,
+               ROUND(EXTRACT(EPOCH FROM (pl.ended_at - pl.started_at))::numeric, 1) AS seconds,
+               COALESCE(m.title, m.filename) AS creative,
+               s.name AS screen, s.city, s.location
+        FROM play_log pl
+        JOIN media m ON m.id = pl.media_id
+        JOIN screens s ON s.id = pl.screen_id
+        WHERE m.advertiser_id = :aid AND pl.started_at >= :start AND pl.started_at < :end
+        ORDER BY pl.started_at
+    """), {"aid": aid, "start": start, "end": end}).fetchall()
+
+    dow = ["", "пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+    data = [[r.started_msk.strftime("%d.%m.%Y %H:%M:%S"), dow[r.dow], r.creative,
+             r.screen, ", ".join(x for x in (r.city, r.location) if x), float(r.seconds or 0)]
+            for r in rows]
+    buf = _build_xlsx([(f"Выходы {d_from:%d.%m.%Y}-{d_to:%d.%m.%Y}",
+                        ["Дата и время (МСК)", "День", "Ролик", "Экран", "Адрес", "Длительность, с"],
+                        data)])
+    fname = f"airtime_{aid}_{d_from:%Y%m%d}_{d_to:%Y%m%d}.xlsx"
+    return StreamingResponse(
+        buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 
 @router.get("/advertisers/{aid}/creatives")

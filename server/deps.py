@@ -149,7 +149,9 @@ _ADV_ALLOWED = [
     re.compile(r"^/me/password/?$"),
     re.compile(r"^/session/ping/?$"),
     re.compile(r"^/advertisers/me/?$"),
-    re.compile(r"^/advertisers/\d+/(overview|airtime|delivery|creatives|documents)(/.*)?$"),
+    re.compile(r"^/advertisers/\d+/"
+               r"(overview|airtime|airtime\.xlsx|delivery|creatives|documents|alerts|now-playing)"
+               r"(/.*)?$"),
 ]
 
 

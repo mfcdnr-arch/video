@@ -13,6 +13,7 @@ const ADV_TABS = [
   ['airtime', 'Эфир'],
   ['delivery', 'Качество доставки'],
   ['creatives', 'Ролики и 38-ФЗ'],
+  ['docs', 'Документы'],
 ];
 
 const ADV_DOW = ['', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс'];
@@ -56,8 +57,116 @@ function initAdvertisersViewActions(){
         ADV_STATE.from = val('adv-from');
         ADV_STATE.to = val('adv-to');
         return advRender();
+      case 'adv-export-xlsx':
+        return advExportAirtime();
+      case 'adv-gen-docs':
+        return advGenerateDocs(false);
+      case 'adv-regen-docs':
+        return advGenerateDocs(true);
+      case 'adv-doc-download':
+        return advDownload(
+          `/advertisers/${ADV_STATE.id}/documents/${el.dataset.docId}/download`,
+          el.dataset.docName || 'document');
+      case 'adv-save-note':
+        return advSaveNote();
+      case 'adv-save-req':
+        return advSaveRequisites();
+      case 'adv-add-contract':
+        return advAddContract();
+      case 'adv-del-contract':
+        return advDeleteContract(Number(el.dataset.contractId), el.dataset.number || '');
     }
   });
+}
+
+// Скачивание защищённого файла: обычная ссылка не подходит — нужен заголовок
+// с токеном, поэтому тянем через fetch и отдаём браузеру как blob.
+async function advDownload(path, filename){
+  try{
+    const r = await fetch('/api' + path, {headers: TOKEN ? {'Authorization': 'Bearer ' + TOKEN} : {}});
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }catch(e){ toast('Не удалось скачать: ' + e.message); }
+}
+
+async function advExportAirtime(){
+  toast('Готовим выгрузку…');
+  await advDownload(
+    `/advertisers/${ADV_STATE.id}/airtime.xlsx?${advPeriodQuery()}`,
+    `Выходы_${ADV_STATE.from}_${ADV_STATE.to}.xlsx`);
+}
+
+async function advGenerateDocs(regenerate){
+  if(regenerate && !confirm('Собрать НОВУЮ версию документов за этот период?\n\n'
+      + 'Прежние останутся в реестре — так подписанный экземпляр не разойдётся с копией.')) return;
+  try{
+    toast('Формируем документы…');
+    const r = await api(`/advertisers/${ADV_STATE.id}/documents`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({date_from: ADV_STATE.from, date_to: ADV_STATE.to, regenerate})
+    });
+    toast(r.reused ? 'Документы за этот период уже были сформированы' : 'Документы готовы');
+    advRender();
+  }catch(e){ toast('Ошибка: ' + e.message); }
+}
+
+async function advSaveNote(){
+  try{
+    await api(`/advertisers/${ADV_STATE.id}/note`, {
+      method:'PATCH', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({note: document.getElementById('adv-note').value})
+    });
+    toast('Заметка сохранена');
+  }catch(e){ toast('Ошибка: ' + e.message); }
+}
+
+async function advSaveRequisites(){
+  const body = {};
+  ['legal_name','inn','kpp','legal_address','contact_person','phone','email']
+    .forEach(f => body[f] = val('advreq-' + f));
+  try{
+    await api(`/advertisers/${ADV_STATE.id}/requisites`, {
+      method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    toast('Реквизиты сохранены');
+    advRender();
+  }catch(e){ toast('Ошибка: ' + e.message); }
+}
+
+async function advAddContract(){
+  const body = {
+    number: val('ctr-number'),
+    signed_on: val('ctr-signed') || null,
+    valid_from: val('ctr-from') || null,
+    valid_to: val('ctr-to') || null,
+    period_kind: document.getElementById('ctr-kind').value,
+    period_days: val('ctr-days') || null,
+    period_anchor: val('ctr-anchor') || null,
+    payment_days: Number(val('ctr-pay') || 5),
+  };
+  if(!body.number){ toast('Укажите номер договора'); return; }
+  try{
+    await api(`/advertisers/${ADV_STATE.id}/contracts`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    toast('Договор добавлен');
+    advRender();
+  }catch(e){ toast('Ошибка: ' + e.message); }
+}
+
+async function advDeleteContract(id, number){
+  if(!confirm(`Удалить договор № ${number}?`)) return;
+  try{
+    await api('/contracts/' + id, {method:'DELETE'});
+    toast('Договор удалён');
+    advRender();
+  }catch(e){ toast('Ошибка: ' + e.message); }
 }
 initAdvertisersViewActions();
 
@@ -111,6 +220,7 @@ async function advRender(){
     if(ADV_STATE.tab === 'overview')      body = await advOverview();
     else if(ADV_STATE.tab === 'airtime')  body = await advAirtime();
     else if(ADV_STATE.tab === 'delivery') body = await advDelivery();
+    else if(ADV_STATE.tab === 'docs')     body = await advDocs();
     else                                  body = await advCreatives();
     view.innerHTML = head + body;
   }catch(e){
@@ -153,11 +263,44 @@ function advPeriodQuery(){
 
 // ─── Вкладка «Обзор» ──────────────────────────────────────────────────────
 async function advOverview(){
-  const d = await api(`/advertisers/${ADV_STATE.id}/overview?${advPeriodQuery()}`);
-  const t = d.totals, s = d.share;
+  const [d, alerts, live] = await Promise.all([
+    api(`/advertisers/${ADV_STATE.id}/overview?${advPeriodQuery()}`),
+    api(`/advertisers/${ADV_STATE.id}/alerts`).catch(() => ({items: [], total: 0})),
+    api(`/advertisers/${ADV_STATE.id}/now-playing`).catch(() => ({screens: []})),
+  ]);
+  const t = d.totals, s = d.share, prev = d.previous || {};
 
   let h = `<div class="sec" style="margin-top:0;">${esc(d.advertiser.name)} · ${d.period.date_from} — ${d.period.date_to} (${d.period.days} дн.)</div>`;
+
+  // Что требует внимания — самым верхом: отклонённый ролик или просроченный
+  // счёт важнее любых цифр ниже.
+  if(alerts.items && alerts.items.length){
+    const col = {danger: 'var(--danger)', warn: '#ffd34d', info: 'var(--muted)'};
+    const ico = {danger: '⛔', warn: '⏳', info: 'ⓘ'};
+    h += '<div class="cell" style="margin-bottom:10px;">';
+    h += `<div style="font-size:12px;font-weight:600;margin-bottom:6px;">Требует внимания (${alerts.items.length})</div>`;
+    alerts.items.forEach(a => {
+      h += `<div style="display:flex;gap:8px;font-size:12px;padding:3px 0;color:${col[a.level] || 'var(--txt2)'};">
+        <span>${ico[a.level] || '•'}</span><span>${esc(a.text)}</span></div>`;
+    });
+    h += '</div>';
+  }
+
+  // Сейчас в эфире — ответ на самый частый вопрос клиента
+  const liveScreens = (live && live.screens) || [];
+  h += `<div class="cell" style="margin-bottom:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+    <span class="dot" style="background:${liveScreens.length ? 'var(--accent)' : 'var(--dim)'};"></span>
+    <span style="font-size:12px;font-weight:600;">Сейчас в эфире</span>
+    <span style="font-size:12px;color:var(--muted);flex:1;">${
+      liveScreens.length
+        ? liveScreens.map(x => esc(x.creative) + ' → ' + esc(x.name)
+            + (x.display_connected === false ? ' <span style="color:var(--danger);" title="Монитор отключён от видеовыхода">📺</span>' : '')).join(' · ')
+        : 'в эту минуту ни один ролик не воспроизводится'}</span>
+  </div>`;
+
   h += '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));">';
+  const arrow = (v) => v == null ? '' : (v > 0 ? `▲ ${v}%` : (v < 0 ? `▼ ${Math.abs(v)}%` : '= без изменений'));
+  const acol = (v) => v == null ? undefined : (v > 0 ? 'var(--accent)' : (v < 0 ? 'var(--danger)' : undefined));
   h += kpi('Выходов', t.plays, t.plays_per_day + ' в среднем в день');
   h += kpi('Минут в эфире', t.minutes, '');
   h += kpi('Экранов', t.screens, t.creatives + ' роликов');
@@ -166,6 +309,18 @@ async function advOverview(){
   h += kpi('К оплате', Number(d.money.amount).toFixed(2) + ' ₽',
            d.money.billing_mode === 'per_play' ? d.money.price + ' ₽/показ' : d.money.price + ' ₽/мин');
   h += '</div>';
+
+  // Сравнение с предыдущим периодом такой же длины
+  if(prev.plays != null){
+    h += `<div class="cell" style="margin-top:8px;font-size:12px;display:flex;gap:18px;flex-wrap:wrap;align-items:center;">
+      <span class="muted">К предыдущему периоду (${prev.date_from} — ${prev.date_to})${
+        prev.plays === 0 ? ' — в нём показов не было, сравнивать не с чем' : ''}:</span>
+      <span>выходы <b>${prev.plays}</b> → <b>${t.plays}</b>
+        <span style="color:${acol(prev.plays_delta_pct) || 'var(--muted)'};">${arrow(prev.plays_delta_pct) || '—'}</span></span>
+      <span>минуты <b>${prev.minutes}</b> → <b>${t.minutes}</b>
+        <span style="color:${acol(prev.minutes_delta_pct) || 'var(--muted)'};">${arrow(prev.minutes_delta_pct) || '—'}</span></span>
+    </div>`;
+  }
 
   // По дням
   h += '<div class="sec">Выходы по дням</div>';
@@ -229,6 +384,10 @@ async function advOverview(){
     h += '</table></div>';
   }
 
+  // Блок для администратора: договор, долги, тариф, заметки. Рекламодателю
+  // это не показываем — ему нужны его выходы и документы, а не наша кухня.
+  if(canWrite()) h += await advAdminBlock();
+
   // Счета
   h += '<div class="sec">Счета</div>';
   if(!d.invoices.length){
@@ -252,10 +411,14 @@ async function advOverview(){
 // ─── Вкладка «Эфир» (сырой журнал выходов) ────────────────────────────────
 async function advAirtime(){
   const d = await api(`/advertisers/${ADV_STATE.id}/airtime?${advPeriodQuery()}&limit=500`);
-  let h = `<div class="sec" style="margin-top:0;">Журнал выходов — ${d.total} записей за период`
-        + (d.total > d.items.length ? ` (показаны первые ${d.items.length})` : '') + '</div>';
+  let h = `<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      <div class="sec" style="margin-top:0;flex:1;">Журнал выходов — ${d.total} записей за период`
+        + (d.total > d.items.length ? ` (показаны первые ${d.items.length})` : '') + `</div>
+      <button class="btn" data-action="adv-export-xlsx" title="Выгрузить все выходы за период в Excel">↓ Excel</button>
+    </div>`;
   h += '<div class="muted" style="font-size:11px;margin-bottom:8px;">Каждая строка — один фактический показ.'
-     + ' Это и есть подтверждение размещения: на его основе формируется эфирная справка.</div>';
+     + ' Это и есть подтверждение размещения: на его основе формируется эфирная справка.'
+     + ' В Excel выгружается весь период целиком, без ограничения на число строк.</div>';
   if(!d.items.length) return h + '<div class="empty">За период показов не было</div>';
 
   h += '<div class="cell" style="overflow-x:auto;"><table style="font-size:12px;">'
@@ -356,5 +519,183 @@ async function advCreatives(){
   h += '</table></div>';
   h += '<div class="muted" style="font-size:11px;margin-top:6px;">«Хранить до» — срок хранения подтверждений'
      + ' по ст. 12 ФЗ «О рекламе»: год со дня последнего распространения. Раньше этой даты удалять материалы нельзя.</div>';
+  return h;
+}
+
+// ─── Вкладка «Документы» ──────────────────────────────────────────────────
+// Рекламодателю здесь только его документы; реквизиты, договоры и кнопка
+// формирования — администратору (сервер закрывает эти пути для роли
+// advertiser независимо от того, что нарисовано в панели).
+async function advDocs(){
+  const isAdmin = canWrite();
+  const [docs, contracts, adv] = await Promise.all([
+    api(`/advertisers/${ADV_STATE.id}/documents`),
+    isAdmin ? api(`/advertisers/${ADV_STATE.id}/contracts`).catch(() => []) : Promise.resolve([]),
+    isAdmin ? api(`/advertisers/${ADV_STATE.id}/overview?${advPeriodQuery()}`).then(x => x.advertiser)
+            : Promise.resolve(null),
+  ]);
+
+  let h = '';
+
+  if(isAdmin){
+    h += '<div class="sec" style="margin-top:0;">Сформировать документы за период</div>';
+    h += `<div class="cell" style="margin-bottom:10px;">
+      <div class="muted" style="font-size:12px;margin-bottom:8px;">За выбранный вверху период
+      (${ADV_STATE.from} — ${ADV_STATE.to}) собираются сразу три документа: эфирная справка
+      (PDF и Excel), акт оказанных услуг и сводный отчёт. Повторное нажатие ничего не
+      пересобирает — отдаются уже сформированные, чтобы подписанный экземпляр не разошёлся с копией.</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn primary" data-action="adv-gen-docs">Сформировать за период</button>
+        <button class="btn" data-action="adv-regen-docs" title="Собрать новую версию; прежняя останется в реестре">↻ Новая версия</button>
+      </div></div>`;
+  }
+
+  h += '<div class="sec">Документы</div>';
+  if(!docs.length){
+    h += '<div class="empty">Документов пока нет</div>';
+  }else{
+    h += '<div class="cell" style="overflow-x:auto;"><table style="font-size:12px;">'
+       + '<tr><th style="text-align:left;">Документ</th><th>Номер</th><th>Период</th><th>Формат</th>'
+       + '<th style="text-align:right;">Размер</th><th>Сформирован</th><th></th></tr>';
+    docs.forEach(x => {
+      const kb = x.size_bytes ? Math.max(1, Math.round(x.size_bytes / 1024)) + ' КБ' : '—';
+      const fname = `${x.title} ${x.number}.${x.doc_format}`.replace(/[\\/:*?"<>|]/g, '-');
+      h += `<tr><td>${esc(x.title)}</td>
+        <td style="text-align:center;" class="muted">${esc(x.number || '—')}</td>
+        <td style="text-align:center;" class="muted">${x.period_start} — ${x.period_end}</td>
+        <td style="text-align:center;">${x.doc_format.toUpperCase()}</td>
+        <td style="text-align:right;">${kb}</td>
+        <td style="text-align:center;" class="muted">${esc(fmtServerTS(x.created_at))}</td>
+        <td style="text-align:right;"><button class="btn" style="padding:3px 8px;font-size:12px;"
+          data-action="adv-doc-download" data-doc-id="${x.id}" data-doc-name="${esc(fname)}">↓ Скачать</button></td></tr>`;
+    });
+    h += '</table></div>';
+    h += '<div class="muted" style="font-size:11px;margin-top:6px;">Скачивание отдаёт именно тот файл,'
+       + ' который был сформирован: документы не пересобираются заново.</div>';
+  }
+
+  if(!isAdmin) return h;
+
+  // ── Реквизиты рекламодателя (идут в акт) ──
+  h += '<div class="sec">Реквизиты заказчика</div>';
+  h += `<div class="cell">
+    <div class="muted" style="font-size:12px;margin-bottom:8px;">Попадают в акт и эфирную справку.
+    Без них документы сформируются, но реквизиты заказчика в них будут пустыми.</div>
+    <div class="row">
+      <div class="fld" style="flex:2;"><label>Полное наименование</label>
+        <input class="inp" id="advreq-legal_name" value="${esc(adv && adv.legal_name || '')}" placeholder='ООО «Кофейня Утро»'></div>
+      <div class="fld" style="flex:1;"><label>ИНН</label>
+        <input class="inp" id="advreq-inn" value="${esc(adv && adv.inn || '')}"></div>
+      <div class="fld" style="flex:1;"><label>КПП</label>
+        <input class="inp" id="advreq-kpp" value="${esc(adv && adv.kpp || '')}"></div>
+    </div>
+    <div class="fld"><label>Юридический адрес</label>
+      <input class="inp" id="advreq-legal_address" value="${esc(adv && adv.legal_address || '')}"></div>
+    <div class="row">
+      <div class="fld" style="flex:1;"><label>Контактное лицо</label>
+        <input class="inp" id="advreq-contact_person" value="${esc(adv && adv.contact_person || '')}"></div>
+      <div class="fld" style="flex:1;"><label>Телефон</label>
+        <input class="inp" id="advreq-phone" value="${esc(adv && adv.phone || '')}"></div>
+      <div class="fld" style="flex:1;"><label>E-mail</label>
+        <input class="inp" id="advreq-email" value="${esc(adv && adv.email || '')}"></div>
+    </div>
+    <button class="btn primary" data-action="adv-save-req">Сохранить реквизиты</button>
+  </div>`;
+
+  // ── Договоры ──
+  h += '<div class="sec">Договоры</div>';
+  if(contracts.length){
+    h += '<div class="cell" style="margin-bottom:10px;overflow-x:auto;"><table style="font-size:12px;">'
+       + '<tr><th style="text-align:left;">Номер</th><th>Подписан</th><th>Действует</th>'
+       + '<th>Расчётный период</th><th>Оплата, дн.</th><th>Статус</th><th></th></tr>';
+    contracts.forEach(c => {
+      const period = c.period_kind === 'days'
+        ? `каждые ${c.period_days} дн.${c.period_anchor ? ' от ' + c.period_anchor : ''}`
+        : 'календарный месяц';
+      const active = c.is_active
+        ? '<span style="color:var(--accent);">действует</span>'
+        : '<span class="muted">закрыт</span>';
+      h += `<tr><td>${esc(c.number)}</td>
+        <td style="text-align:center;" class="muted">${c.signed_on || '—'}</td>
+        <td style="text-align:center;" class="muted">${(c.valid_from || '…') + ' — ' + (c.valid_to || '…')}</td>
+        <td style="text-align:center;">${period}</td>
+        <td style="text-align:center;">${c.payment_days}</td>
+        <td style="text-align:center;">${active}</td>
+        <td style="text-align:right;"><button class="btn danger" style="padding:3px 8px;font-size:12px;"
+          data-action="adv-del-contract" data-contract-id="${c.id}" data-number="${esc(c.number)}">Удалить</button></td></tr>`;
+    });
+    h += '</table></div>';
+  }else{
+    h += '<div class="empty" style="margin-bottom:10px;">Договоров нет. Акт сформируется и без договора, но ссылки на основание в нём не будет.</div>';
+  }
+  h += `<div class="cell">
+    <div style="font-size:12px;font-weight:600;margin-bottom:8px;">Добавить договор</div>
+    <div class="row">
+      <div class="fld" style="flex:1;"><label>Номер</label><input class="inp" id="ctr-number" placeholder="12/2026"></div>
+      <div class="fld" style="flex:1;"><label>Подписан</label><input class="inp" type="date" id="ctr-signed"></div>
+      <div class="fld" style="flex:1;"><label>Действует с</label><input class="inp" type="date" id="ctr-from"></div>
+      <div class="fld" style="flex:1;"><label>по</label><input class="inp" type="date" id="ctr-to"></div>
+    </div>
+    <div class="row">
+      <div class="fld" style="flex:1;"><label>Расчётный период</label>
+        <select class="inp" id="ctr-kind">
+          <option value="month">Календарный месяц</option>
+          <option value="days">Произвольный, каждые N дней</option>
+        </select></div>
+      <div class="fld" style="flex:1;"><label>N дней</label><input class="inp" type="number" min="1" id="ctr-days" placeholder="30"></div>
+      <div class="fld" style="flex:1;"><label>Отсчёт от даты</label><input class="inp" type="date" id="ctr-anchor"></div>
+      <div class="fld" style="flex:1;"><label>Срок оплаты, дн.</label><input class="inp" type="number" min="1" id="ctr-pay" value="5"></div>
+    </div>
+    <button class="btn primary" data-action="adv-add-contract">Добавить договор</button>
+  </div>`;
+  return h;
+}
+
+// ─── Блок администратора в «Обзоре»: договор, дебиторка, тариф, заметки ────
+async function advAdminBlock(){
+  const [contracts, receivables, tariff, advInfo] = await Promise.all([
+    api(`/advertisers/${ADV_STATE.id}/contracts`).catch(() => []),
+    api('/billing/receivables').catch(() => []),
+    api(`/advertisers/${ADV_STATE.id}/tariff-history`).catch(() => []),
+    api('/advertisers').then(list => list.find(a => a.id === ADV_STATE.id) || {}).catch(() => ({})),
+  ]);
+  const debt = receivables.find(r => r.advertiser_id === ADV_STATE.id);
+  const today = new Date().toISOString().slice(0, 10);
+  const active = contracts.find(c => c.is_active
+    && (!c.valid_from || c.valid_from <= today) && (!c.valid_to || c.valid_to >= today));
+
+  let h = '<div class="sec">Договор и расчёты</div><div class="cell">';
+  h += '<div style="display:flex;gap:22px;flex-wrap:wrap;font-size:12px;">';
+  h += active
+    ? `<span>Договор <b>№ ${esc(active.number)}</b> <span style="color:var(--accent);">действует</span>
+        ${active.valid_to ? '<span class="muted">до ' + active.valid_to + '</span>' : ''}
+        <span class="muted">· оплата ${active.payment_days} дн.</span></span>`
+    : `<span style="color:#ffd34d;">Действующего договора нет</span>
+       <span class="muted">— акт сформируется без ссылки на основание</span>`;
+  if(debt){
+    const over = debt.days_overdue > 0;
+    h += `<span>Не оплачено: <b style="color:${over ? 'var(--danger)' : 'var(--txt)'};">
+      ${Number(debt.unpaid_amount).toFixed(2)} ₽</b> (${debt.unpaid_count} сч.)
+      ${over ? `<span style="color:var(--danger);">· просрочка ${debt.days_overdue} дн.</span>` : ''}</span>`;
+    h += `<span class="muted">Оплачено всего: ${Number(debt.paid_amount).toFixed(2)} ₽</span>`;
+  }else{
+    h += '<span class="muted">Неоплаченных счетов нет</span>';
+  }
+  h += '</div>';
+
+  if(tariff.length){
+    h += '<div style="margin-top:10px;font-size:12px;"><span class="muted">Изменения тарифа:</span>';
+    tariff.slice(0, 5).forEach(t => {
+      h += `<div class="muted" style="font-size:11px;padding:2px 0;">${esc(fmtServerTS(t.created_at))} · ${esc(t.actor || '—')} · ${esc(t.detail || t.title)}</div>`;
+    });
+    h += '</div>';
+  }
+
+  h += `<div style="margin-top:10px;">
+    <label class="muted" style="font-size:11px;">Заметки по клиенту (договорённости, особенности размещения)</label>
+    <textarea class="inp" id="adv-note" rows="2" style="width:100%;resize:vertical;">${esc(advInfo.note || '')}</textarea>
+    <button class="btn" style="margin-top:6px;" data-action="adv-save-note">Сохранить заметку</button>
+  </div>`;
+  h += '</div>';
   return h;
 }

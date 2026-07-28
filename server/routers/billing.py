@@ -89,10 +89,21 @@ def update_advertiser_billing(adv_id: int, body: dict = Body(...),
     if not sets:
         raise HTTPException(400, "Нечего обновлять")
 
+    was = db.execute(text("SELECT name, billing_mode, price_per_minute, price_per_play "
+                          "FROM advertisers WHERE id = :id"), {"id": adv_id}).fetchone()
     row = db.execute(text(
         f"UPDATE advertisers SET {', '.join(sets)} WHERE id = :id "
         "RETURNING id, name, billing_mode, price_per_minute, price_per_play"
     ), params).fetchone()
+    # Отдельная запись в журнал: изменение цены — денежное решение, и в карточке
+    # рекламодателя должно быть видно, кто и когда его принял.
+    db.execute(text("""
+        INSERT INTO audit_log (event_type, title, detail, actor)
+        VALUES ('billing', 'Изменён тариф', :d, :who)
+    """), {"d": f"{row.name}: {was.billing_mode} {float(was.price_per_minute or 0):g}/"
+                f"{float(was.price_per_play or 0):g} → {row.billing_mode} "
+                f"{float(row.price_per_minute or 0):g}/{float(row.price_per_play or 0):g}",
+           "who": admin.get("username", "admin")})
     db.commit()
     return dict(row._mapping)
 
@@ -317,18 +328,32 @@ def create_invoice(body: dict = Body(...), admin: dict = Depends(require_write),
             raise HTTPException(400, "adjustment_amount: ожидается число")
         adj_note = (body.get("adjustment_note") or "").strip() or None
 
+    # Срок оплаты берём из действующего договора (payment_days). Без договора
+    # срок не выдумываем — в дебиторке такой счёт просто не будет «просроченным».
+    contract = db.execute(text("""
+        SELECT id, payment_days FROM contracts
+        WHERE advertiser_id = :aid AND is_active
+          AND (valid_from IS NULL OR valid_from <= :de)
+          AND (valid_to IS NULL OR valid_to >= :ds)
+        ORDER BY id DESC LIMIT 1
+    """), {"aid": adv.id, "ds": d_from, "de": d_to}).fetchone()
+    contract_id = contract.id if contract else None
+    due_date = (d_to + timedelta(days=int(contract.payment_days))) if contract else None
+
     try:
         row = db.execute(text("""
             INSERT INTO invoices (advertiser_id, period_start, period_end,
                                   billing_mode, price, plays_total, minutes_total, amount,
-                                  adjustment_amount, adjustment_note, note)
+                                  adjustment_amount, adjustment_note, note,
+                                  contract_id, due_date)
             VALUES (:aid, :ds, :de, :mode, :price, :plays, :minutes, :amount,
-                    :adj, :adjn, :note)
+                    :adj, :adjn, :note, :ctr, :due)
             RETURNING id
         """), {"aid": adv.id, "ds": d_from, "de": d_to, "mode": adv.billing_mode,
                "price": price, "plays": plays, "minutes": minutes, "amount": amount,
                "adj": adjustment, "adjn": adj_note,
-               "note": (body.get("note") or "").strip() or None})
+               "note": (body.get("note") or "").strip() or None,
+               "ctr": contract_id, "due": due_date})
         invoice_id = row.fetchone()[0]
         db.commit()
     except Exception:

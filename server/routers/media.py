@@ -511,6 +511,7 @@ def list_advertisers(admin: dict = Depends(get_current_admin), db: Session = Dep
         SELECT a.id, a.name, a.color, a.price_per_minute,
                COALESCE(a.price_per_play, 0) AS price_per_play,
                COALESCE(a.billing_mode, 'per_minute') AS billing_mode,
+               a.note, a.inn, a.contact_person,
                COUNT(DISTINCT f.id) AS folders,
                COUNT(DISTINCT m.id) AS files
         FROM advertisers a
