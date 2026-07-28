@@ -36,8 +36,8 @@ const SECTIONS = [
   ['dash', 'Дашборд'], ['broadcast', 'Эфир сети'], ['ticker', 'Бегущая строка'],
   ['screens', 'Экраны'], ['media', 'Медиатека'], ['playlists', 'Плейлисты'],
   ['schedule', 'Расписание'], ['campaigns', 'Кампании'], ['moderation', 'Модерация'],
-  ['reports', 'Отчёты'], ['billing', 'Биллинг'], ['ota', 'Обновление агентов'],
-  ['settings', 'Настройки'],
+  ['reports', 'Отчёты'], ['advertisers', 'Рекламодатели'], ['billing', 'Биллинг'],
+  ['ota', 'Обновление агентов'], ['settings', 'Настройки'],
 ];
 
 // БЕЛЫЙ список кнопок для слепого прогона: только то, что открывает форму,
@@ -71,6 +71,7 @@ const SAFE_ACTIONS = new Set([
   'settings-close-edit-user-modal',
   'ticker-target-all', 'ticker-target-one', 'ticker-pick-color', 'ticker-toggle-screen',
   'dashboard-open-broadcast',
+  'adv-open', 'adv-back', 'adv-tab', 'adv-apply-period',
 ]);
 
 // Шум, который не является дефектом панели.
@@ -297,6 +298,32 @@ async function clickNth(page, action, n) {
         await gotoSection(page, 'playlists');
         const still = await page.evaluate(n => document.getElementById('view').innerText.includes(n), PLAYLIST_NAME);
         still ? bad('плейлист остался в списке после удаления') : ok('плейлист удалён, список обновился');
+      }
+    }
+
+    // ── 5а. Карточка рекламодателя: все вкладки открываются ────────────────
+    head('Карточка рекламодателя');
+    step = 'открытие карточки';
+    dialogMode = 'dismiss';
+    await gotoSection(page, 'advertisers');
+    const advCard = await page.$('[data-action="adv-open"]');
+    if (!advCard) {
+      bad('в списке нет ни одного рекламодателя — карточку проверить не на чем');
+    } else {
+      await advCard.click();
+      await waitViewReady(page);
+      const tabs = await page.$$eval('[data-action="adv-tab"]', els => els.map(e => e.dataset.tab));
+      if (!tabs.length) bad('вкладки карточки не отрисовались');
+      else ok(`карточка открылась, вкладок ${tabs.length}`);
+      for (const t of tabs) {
+        step = `карточка → вкладка ${t}`;
+        const before = problems.length;
+        await page.click(`[data-action="adv-tab"][data-tab="${t}"]`).catch(() => {});
+        await sleep(900);
+        const txt = await page.$eval('#view', el => el.innerText).catch(() => '');
+        if (problems.length > before) bad(`вкладка «${t}»: ошибка при открытии`);
+        else if (/^Ошибка:/m.test(txt)) bad(`вкладка «${t}» отдала ошибку`);
+        else ok(`вкладка «${t}» открылась`);
       }
     }
 

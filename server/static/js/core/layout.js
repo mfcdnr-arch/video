@@ -4,7 +4,8 @@
 const NAVS = [
   ['dash','Дашборд','▤'],['broadcast','Эфир сети','⇄'],['ticker','Бегущая строка','▦'],
   ['screens','Экраны','▣'],['media','Медиатека','◫'],['playlists','Плейлисты','▶'],['schedule','Расписание','▦'],
-  ['campaigns','Кампании','📣'],['moderation','Модерация','☑'],['reports','Отчёты','◳'],['billing','Биллинг','₽'],['ota','Обновление агентов','⟳'],['settings','Настройки','⚙']
+  ['campaigns','Кампании','📣'],['moderation','Модерация','☑'],['reports','Отчёты','◳'],
+  ['advertisers','Рекламодатели','◍'],['billing','Биллинг','₽'],['ota','Обновление агентов','⟳'],['settings','Настройки','⚙']
 ];
 
 let CUR = 'dash';
@@ -62,6 +63,7 @@ function nav(v){
     campaigns:'Кампании',
     moderation:'Модерация',
     reports:'Отчёты',
+    advertisers:'Рекламодатели',
     billing:'Биллинг',
     ota:'Обновление агентов',
     settings:'Настройки'
@@ -81,6 +83,7 @@ function nav(v){
     campaigns:viewCampaigns,
     moderation:viewModeration,
     reports:viewReports,
+    advertisers:viewAdvertisers,
     billing:viewBilling,
     ota:viewOta,
     settings:viewSettings

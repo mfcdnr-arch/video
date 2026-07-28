@@ -19,7 +19,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 from routers import (
     auth, system, media, screens, playlists, schedule,
     ticker, agent_ota, users, backups, broadcast, reports, websockets,
-    billing, campaigns, notifications,
+    billing, campaigns, notifications, advertiser_office,
 )
 
 app.include_router(auth.router)
@@ -38,6 +38,7 @@ app.include_router(websockets.router)
 app.include_router(billing.router)
 app.include_router(campaigns.router)
 app.include_router(notifications.router)
+app.include_router(advertiser_office.router)
 
 # Роутеры-заглушки из более ранней версии проекта (по одному /health на модуль).
 from admin_panel import router as admin_router

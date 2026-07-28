@@ -50,12 +50,12 @@ Video_miniPC_v16.2_modular/
 ├── server/                    # СЕРВЕР (FastAPI + Celery)
 │   ├── main.py                # Точка сборки приложения (только подключение роутеров)
 │   ├── deps.py                # Общие зависимости: БД-сессия, JWT, токены устройств
-│   ├── routers/               # 16 модулей эндпоинтов: auth, system, media, screens,
+│   ├── routers/               # 17 модулей эндпоинтов: auth, system, media, screens,
 │   │                          #   playlists, schedule, ticker, agent_ota, users,
 │   │                          #   backups, broadcast, reports, websockets, billing,
-│   │                          #   campaigns, notifications
+│   │                          #   campaigns, notifications, advertiser_office
 │   ├── static/                # Веб-панель (index.html, js/, css/)
-│   ├── migrations/            # SQL-миграции (001–028; 001 применяется как init при первом старте БД)
+│   ├── migrations/            # SQL-миграции (001–029; 001 применяется как init при первом старте БД)
 │   ├── tasks.py               # Celery-задачи
 │   ├── ws_manager.py          # Реестр WebSocket-подключений
 │   ├── Dockerfile
@@ -86,7 +86,7 @@ Video_miniPC_v16.2_modular/
 
 ## Что нового в v16.2
 
-✅ Модульный сервер: монолитный `main.py` разнесён на 16 роутеров в `server/routers/`,
+✅ Модульный сервер: монолитный `main.py` разнесён на 17 роутеров в `server/routers/`,
 `main.py` теперь только собирает приложение  
 ✅ Каталоги переименованы: `app/` → `server/`, `client/` → `agent/`;
 инсталлятор агента `install.sh` перенесён в корень проекта  
@@ -116,6 +116,12 @@ Video_miniPC_v16.2_modular/
 признак в heartbeat; в панели бейдж 📺 у экрана и блок «Монитор не подключён»
 на дашборде, в MAX — уведомление (миграция 028). Ловит отсоединённый кабель
 HDMI/DisplayPort, когда мини-ПК «онлайн и играет», а на мониторе пусто  
+✅ Раздел «Рекламодатели»: карточка одного рекламодателя — объёмы и доля эфира,
+тепловая карта «день × час», сырой журнал выходов (proof of play), качество
+доставки (простои экранов и часы без монитора), ролики со статусом модерации
+38-ФЗ и сроком хранения материалов (`routers/advertiser_office.py`,
+миграция `029_advertiser_office.sql`). Контакты/охват намеренно не считаются —
+только доказуемый факт  
 
 Подробная история изменений — в `docs/CHANGES_2026-07-01.md`.
 
