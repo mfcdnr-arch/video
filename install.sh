@@ -228,6 +228,8 @@ token = $TOKEN
 [player]
 media_dir = $MEDIA_DIR
 player_bin = /usr/bin/mpv
+# Видео поверх окон окружения и без рамки (fly-wm перекрывает fullscreen).
+player_ontop = true
 
 [schedule]
 poll_interval = 60

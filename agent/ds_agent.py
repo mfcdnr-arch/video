@@ -52,6 +52,9 @@ MEDIA_DIR   = cfg["player"]["media_dir"]
 # Плеер — mpv (управляется через IPC-сокет). Путь к бинарнику берём из конфига;
 # .get() с дефолтом — на случай старого config.ini без ключа player_bin.
 PLAYER_BIN  = cfg["player"].get("player_bin", "/usr/bin/mpv")
+# Держать видео поверх окон окружения (fly-wm иногда перекрывает fullscreen).
+# По умолчанию включено; выключается строкой player_ontop = false в config.ini.
+PLAYER_ONTOP = cfg["player"].get("player_ontop", "true").strip().lower() not in ("false", "0", "no")
 
 POLL_INTERVAL = int(cfg["schedule"]["poll_interval"])
 HB_INTERVAL   = int(cfg["schedule"]["heartbeat_interval"])
@@ -284,7 +287,7 @@ def main():
     sess = requests.Session()
     sess.headers["X-Token"] = TOKEN
 
-    player     = VLCPlayer(player_bin=PLAYER_BIN, media_dir=MEDIA_DIR)
+    player     = VLCPlayer(player_bin=PLAYER_BIN, media_dir=MEDIA_DIR, ontop=PLAYER_ONTOP)
     downloader = Downloader(SERVER_URL, TOKEN, MEDIA_DIR)
     sync_hdl   = SyncHandler(SERVER_URL, TOKEN, player, screen_id)
     hb         = Heartbeat(SERVER_URL, TOKEN, screen_id, MEDIA_DIR)

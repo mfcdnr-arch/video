@@ -12,9 +12,14 @@ class VLCPlayer:
     """Обёртка над mpv с тем же API что был у VLC."""
 
     def __init__(self, player_bin='/usr/bin/mpv',
-                 media_dir='/opt/ds-agent/media'):
+                 media_dir='/opt/ds-agent/media', ontop=True):
         self.player_bin = player_bin or '/usr/bin/mpv'
         self.media_dir = Path(media_dir)
+        # Держать окно плеера поверх остальных и без рамки. На fly-wm (Astra)
+        # одного --fullscreen мало: панель окружения и всплывающие окна
+        # перекрывают видео. Отключается в config.ini (player_ontop = false),
+        # если на конкретном железе поверх-режим мешает.
+        self.ontop = ontop
         self._mpv_proc = None
         self._current_file = None
         self._lock = threading.Lock()
@@ -101,6 +106,10 @@ class VLCPlayer:
             '--idle=yes',
             f'--input-ipc-server={MPV_SOCKET}',
         ]
+        if self.ontop:
+            # --ontop: не давать окружению перекрывать видео;
+            # --no-border: без заголовка окна, если WM не отдал полный экран.
+            cmd += ['--ontop', '--no-border']
         log.info("Запуск mpv")
         self._mpv_proc = subprocess.Popen(
             cmd, env=env,
