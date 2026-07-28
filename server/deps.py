@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Generator, Optional
 
@@ -98,7 +99,62 @@ def get_current_admin(
     if user.get("is_blocked", False):
         raise HTTPException(status_code=403, detail="User is blocked")
 
+    # Привязка к рекламодателю (роль advertiser). Отдельным запросом, а не в
+    # основном SELECT: на базе без миграции 029 колонки ещё нет, и падение
+    # общего запроса увело бы вход в аварийный фолбэк с ролью admin.
+    user = dict(user)
+    user["advertiser_id"] = None
+    try:
+        row = db.execute(text("SELECT advertiser_id FROM users WHERE username = :u"),
+                         {"u": username}).fetchone()
+        if row:
+            user["advertiser_id"] = row.advertiser_id
+    except Exception:
+        pass
     return user
+
+
+# ─── Роль «рекламодатель»: доступ только к своему кабинету ──────────────────
+# Скрытие пунктов меню в панели защитой НЕ является: рекламодатель может
+# позвать API напрямую. Поэтому доступ режется на сервере в двух местах —
+# здесь (совпадение id) и в middleware main.py (белый список путей).
+
+ADVERTISER_ROLE = "advertiser"
+
+
+def advertiser_scope(aid: int, current_admin: dict = Depends(get_current_admin)) -> int:
+    """
+    Разрешить работу с карточкой рекламодателя `aid`.
+
+    Для роли advertiser id в пути ИГНОРИРУЕТСЯ как источник истины: работать
+    можно только со своим кабинетом, любой другой id — 403, чтобы перебором
+    номеров нельзя было прочитать чужой эфир и чужие деньги.
+    """
+    if str(current_admin.get("role", "")).lower() != ADVERTISER_ROLE:
+        return aid
+    own = current_admin.get("advertiser_id")
+    if not own:
+        raise HTTPException(403, "Учётная запись не привязана к рекламодателю")
+    if int(aid) != int(own):
+        raise HTTPException(403, "Доступ только к своему кабинету")
+    return int(own)
+
+
+# Пути, разрешённые роли advertiser. Всё, чего здесь нет, закрыто (принцип
+# «запрещено по умолчанию»): дописывать сюда — осознанное действие.
+_ADV_ALLOWED = [
+    re.compile(r"^/token/?$"),
+    re.compile(r"^/health/?$"),
+    re.compile(r"^/me/?$"),
+    re.compile(r"^/me/password/?$"),
+    re.compile(r"^/session/ping/?$"),
+    re.compile(r"^/advertisers/me/?$"),
+    re.compile(r"^/advertisers/\d+/(overview|airtime|delivery|creatives|documents)(/.*)?$"),
+]
+
+
+def is_path_allowed_for_advertiser(path: str) -> bool:
+    return any(rx.match(path) for rx in _ADV_ALLOWED)
 
 
 def verify_device_token(
@@ -170,7 +226,8 @@ def require_write(current_admin=Depends(get_current_admin)):
     role = str(current_admin.get("role", "")).lower()
     # moderator — специализированная роль 38-ФЗ: может только одобрять/отклонять
     # рекламу (см. require_moderator), контент и настройки не меняет.
-    if role in {"viewer", "observer", "auditor", "read_only", "readonly", "moderator"}:
+    if role in {"viewer", "observer", "auditor", "read_only", "readonly", "moderator",
+                ADVERTISER_ROLE}:
         raise HTTPException(status_code=403, detail="Write access required")
     return current_admin
 
@@ -178,7 +235,7 @@ def require_write(current_admin=Depends(get_current_admin)):
 def require_moderator(current_admin=Depends(get_current_admin)):
     """Право модерировать рекламу (38-ФЗ): модератор и любой пишущий админ."""
     role = str(current_admin.get("role", "")).lower()
-    if role in {"viewer", "observer", "auditor", "read_only", "readonly"}:
+    if role in {"viewer", "observer", "auditor", "read_only", "readonly", ADVERTISER_ROLE}:
         raise HTTPException(status_code=403, detail="Требуется право модерации")
     return current_admin
 

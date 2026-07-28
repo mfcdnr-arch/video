@@ -39,7 +39,8 @@ async function boot(){
   }catch(e){ /* токен невалиден — api() уже покажет логин */ return; }
   // Форс-смена пароля по умолчанию: панель не открываем, пока не сменён.
   if(ME && ME.must_change_password){ renderForcePassword(); return; }
-  renderApp(); nav('dash');
+  // Рекламодателю дашборд сети не положен — сразу его кабинет.
+  renderApp(); nav(ME.role === 'advertiser' ? 'advertisers' : 'dash');
   // отметка активности (для отчёта по сессиям): сразу и каждые 2 минуты
   api('/session/ping',{method:'POST'}).catch(()=>{});
   setInterval(()=>{ if(TOKEN) api('/session/ping',{method:'POST'}).catch(()=>{}); }, 120000);

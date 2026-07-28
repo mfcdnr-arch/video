@@ -17,7 +17,14 @@ async function viewSettings(){
       <div class="row">
         <div class="fld" style="flex:1;"><label>Логин</label><input class="inp" id="nu-login" placeholder="ivanov"></div>
         <div class="fld" style="flex:1;"><label>Пароль</label><input class="inp" id="nu-pass" type="password" placeholder="мин. 6 символов"></div>
-        <div class="fld" style="flex:1;"><label>Роль</label><select class="inp" id="nu-role"><option value="auditor">Аудитор (просмотр и отчёты)</option><option value="moderator">Модератор (проверка рекламы)</option><option value="admin">Админ (все права)</option></select></div>
+        <div class="fld" style="flex:1;"><label>Роль</label><select class="inp" id="nu-role" data-action="settings-role-changed"><option value="auditor">Аудитор (просмотр и отчёты)</option><option value="moderator">Модератор (проверка рекламы)</option><option value="admin">Админ (все права)</option><option value="advertiser">Рекламодатель (только свой кабинет)</option></select></div>
+      </div>
+      <div class="row" id="nu-adv-row" style="display:none;">
+        <div class="fld" style="flex:1;"><label>Наименование рекламодателя</label>
+          <input class="inp" id="nu-advname" placeholder="Кофейня «Утро»">
+          <div class="muted" style="font-size:11px;margin-top:4px;">Под этим именем заводится кабинет и оно попадёт в акт и эфирную справку.
+          Если рекламодатель с таким именем уже есть в медиатеке — учётка привяжется к нему, а не создаст дубль.
+          Оставите пустым — возьмём фамилию и имя из учётной записи.</div></div>
       </div>
       <button class="btn primary" data-action="settings-create-user">Добавить пользователя</button>`;
   } else {
@@ -82,7 +89,8 @@ async function viewSettings(){
                 <option value="auditor"${u.role === 'auditor' ? ' selected' : ''}>Аудитор</option>
                 <option value="moderator"${u.role === 'moderator' ? ' selected' : ''}>Модератор</option>
                 <option value="admin"${u.role === 'admin' ? ' selected' : ''}>Админ</option>
-              </select>`;
+                <option value="advertiser"${u.role === 'advertiser' ? ' selected' : ''}>Рекламодатель</option>
+              </select>${u.advertiser_name ? `<div class="muted" style="font-size:11px;margin-top:3px;">кабинет: ${esc(u.advertiser_name)}</div>` : ''}`;
 
           const status = isSuperRow
             ? '<span class="muted">—</span>'
@@ -325,7 +333,20 @@ function initSettingsViewActions(){
     switch(action){
       case 'settings-change-role': {
         const id = Number(el.dataset.userId);
+        // Смена роли на «рекламодатель» требует наименования кабинета:
+        // спрашиваем сразу, иначе кабинет назовётся логином.
+        if(el.value === 'advertiser'){
+          const name = prompt('Наименование рекламодателя для кабинета:');
+          if(name === null){ viewSettings(); return; }   // отменили — вернуть прежнюю роль
+          return changeRole(id, el.value, name);
+        }
         return changeRole(id, el.value);
+      }
+      case 'settings-role-changed': {
+        // Поле наименования нужно только рекламодателю
+        const row = document.getElementById('nu-adv-row');
+        if(row) row.style.display = (el.value === 'advertiser') ? '' : 'none';
+        return;
       }
     }
   });
@@ -432,6 +453,7 @@ async function createUser(){
   const role = document.getElementById('nu-role').value;
   const first_name = val('nu-firstname') || '';
   const last_name = val('nu-lastname') || '';
+  const advertiser_name = val('nu-advname') || '';
 
   if(!username || !password){
     toast('Введите логин и пароль');
@@ -442,7 +464,7 @@ async function createUser(){
     await api('/users', {
       method:'POST',
       headers:{ 'Content-Type':'application/json' },
-      body:JSON.stringify({ username, password, role, first_name, last_name })
+      body:JSON.stringify({ username, password, role, first_name, last_name, advertiser_name })
     });
     toast('Пользователь добавлен');
     viewSettings();
@@ -451,14 +473,15 @@ async function createUser(){
   }
 }
 
-async function changeRole(id, role){
+async function changeRole(id, role, advertiser_name){
   try{
     await api('/users/' + id + '/role', {
       method:'PATCH',
       headers:{ 'Content-Type':'application/json' },
-      body:JSON.stringify({ role })
+      body:JSON.stringify({ role, advertiser_name: advertiser_name || '' })
     });
-    toast('Роль изменена');
+    toast(role === 'advertiser' ? 'Роль изменена, кабинет привязан' : 'Роль изменена');
+    if(role === 'advertiser') viewSettings();   // показать привязанный кабинет
   }catch(e){
     toast('Ошибка: ' + e.message);
     viewSettings();

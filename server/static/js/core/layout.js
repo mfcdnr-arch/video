@@ -33,11 +33,20 @@ function initLayoutViewActions(){
   });
 }
 
+// Рекламодателю доступен ровно один раздел — его кабинет. Это только внешний
+// вид: сервер режет доступ независимо от меню (deps.advertiser_scope и
+// middleware в main.py), потому что скрытая ссылка защитой не является.
+function navsForRole(){
+  return ME.role === 'advertiser'
+    ? [['advertisers', 'Мой кабинет', '◍']]
+    : NAVS;
+}
+
 function renderApp(){
   document.getElementById('app').innerHTML = `
     <nav>
       <div class="brand">◉ DS Admin</div>
-      ${NAVS.map(n => `<a class="nav" data-v="${n[0]}" data-action="layout-nav" data-nav="${n[0]}"><span class="ic">${n[2]}</span><span class="lbl">${n[1]}</span></a>`).join('')}
+      ${navsForRole().map(n => `<a class="nav" data-v="${n[0]}" data-action="layout-nav" data-nav="${n[0]}"><span class="ic">${n[2]}</span><span class="lbl">${n[1]}</span></a>`).join('')}
 
       <div class="sep"></div>
       <a class="nav" data-action="layout-logout"><span class="ic">⎋</span><span class="lbl">Выйти</span></a>
@@ -69,7 +78,8 @@ function nav(v){
     settings:'Настройки'
   }[v];
 
-  document.getElementById('vtitle').textContent = t;
+  document.getElementById('vtitle').textContent =
+    (v === 'advertisers' && ME.role === 'advertiser') ? 'Мой кабинет' : t;
   document.getElementById('topright').innerHTML = '';
 
   ({

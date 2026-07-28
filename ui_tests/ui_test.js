@@ -327,6 +327,89 @@ async function clickNth(page, action, n) {
       }
     }
 
+    // ── 5б. Роль «рекламодатель»: кабинет свой, остальное закрыто ──────────
+    // Самая дорогая ошибка этого раздела — если рекламодатель увидит чужой
+    // эфир или деньги. Проверяем на живой учётке и убираем её за собой.
+    head('Изоляция роли «рекламодатель»');
+    step = 'создание тестовой учётки';
+    const advUser = `e2e_adv_${STAMP}`;
+    const created = await page.evaluate(async (u) => {
+      const r = await fetch('/api/users', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json',
+                  'Authorization': 'Bearer ' + localStorage.getItem('ds_token')},
+        body: JSON.stringify({username: u, password: 'e2e_secret_1', role: 'advertiser',
+                              advertiser_name: 'E2E Рекламодатель ' + u}),
+      });
+      return r.ok ? await r.json() : {error: r.status};
+    }, advUser);
+
+    if (created.error) {
+      bad(`не удалось создать учётку рекламодателя (HTTP ${created.error})`);
+    } else if (!created.advertiser_id) {
+      bad('кабинет не создался автоматически при заведении пользователя');
+    } else {
+      ok(`учётка создана, кабинет заведён автоматически (id ${created.advertiser_id})`);
+
+      const ctx = await browser.createBrowserContext();
+      const ap = await ctx.newPage();
+      try {
+        step = 'вход рекламодателем';
+        await ap.goto(BASE, {waitUntil: 'networkidle2'});
+        await ap.waitForSelector('#lg-pass');
+        await ap.$eval('#lg-user', (e, v) => { e.value = v; }, advUser);
+        await ap.$eval('#lg-pass', e => { e.value = 'e2e_secret_1'; });
+        await ap.click('[data-action="auth-login"]');
+        await ap.waitForSelector('.nav[data-nav="advertisers"]', {timeout: 15000});
+        await sleep(1500);
+
+        const navs = await ap.$$eval('.nav[data-nav]', els => els.map(e => e.dataset.nav));
+        if (navs.length === 1 && navs[0] === 'advertisers') ok('в меню только его кабинет');
+        else bad(`рекламодателю видно лишних разделов: ${navs.join(', ')}`);
+
+        step = 'запрет чужих данных';
+        const probe = await ap.evaluate(async (otherId) => {
+          const t = localStorage.getItem('ds_token');
+          const get = async (u) => (await fetch(u, {headers: {'Authorization': 'Bearer ' + t}})).status;
+          return {
+            list: await get('/api/advertisers'),
+            screens: await get('/api/minipc'),
+            invoices: await get('/api/billing/invoices'),
+            users: await get('/api/users'),
+            foreign: await get(`/api/advertisers/${otherId}/creatives`),
+            own: await get('/api/advertisers/me'),
+          };
+        }, created.advertiser_id === 1 ? 2 : 1);
+
+        const leaks = Object.entries(probe)
+          .filter(([k, v]) => k !== 'own' && v !== 403)
+          .map(([k, v]) => `${k}=${v}`);
+        if (leaks.length) bad(`УТЕЧКА: доступно то, что должно быть закрыто — ${leaks.join(', ')}`);
+        else ok('чужие данные и разделы закрыты (403)');
+        if (probe.own === 200) ok('свой кабинет открывается');
+        else bad(`свой кабинет недоступен (HTTP ${probe.own})`);
+      } catch (e) {
+        bad('проверка изоляции не завершилась: ' + e.message.split('\n')[0]);
+      } finally {
+        await ctx.close();
+      }
+
+      step = 'уборка тестовой учётки';
+      // Удаляем и учётку, и созданный ею кабинет: удаление пользователя
+      // намеренно НЕ трогает рекламодателя (в нём ролики, счета, документы),
+      // поэтому тестовый кабинет убираем отдельно, иначе он копится от
+      // прогона к прогону.
+      const del = await page.evaluate(async (userId, advId) => {
+        const h = {'Authorization': 'Bearer ' + localStorage.getItem('ds_token')};
+        const u = await fetch('/api/users/' + userId, {method: 'DELETE', headers: h});
+        const a = await fetch('/api/advertisers/' + advId, {method: 'DELETE', headers: h});
+        return {user: u.status, adv: a.status};
+      }, created.id, created.advertiser_id);
+      (del.user === 200 && del.adv === 200)
+        ? ok('тестовая учётка и её кабинет удалены')
+        : bad(`уборка не прошла (учётка ${del.user}, кабинет ${del.adv})`);
+    }
+
     // ── 6. Индикатор монитора (V2, миграция 028) ───────────────────────────
     head('Контроль монитора');
     step = 'бейдж монитора';

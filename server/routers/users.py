@@ -7,14 +7,45 @@ from deps import get_db, get_current_admin, require_superadmin, pwd_context
 
 router = APIRouter()
 
+ROLES = ("admin", "auditor", "moderator", "advertiser")
+
+
+def _ensure_advertiser(db: Session, name: str, actor: str) -> int:
+    """
+    Кабинет рекламодателя под учётную запись: одноимённый рекламодатель уже
+    есть — привязываемся к нему, нет — заводим.
+
+    Так «кабинет» не дублирует рекламодателя, который уже ведётся в медиатеке
+    (иначе ролики и счета остались бы у одной записи, а кабинет смотрел бы в
+    другую, пустую).
+    """
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(400, "Укажите наименование рекламодателя")
+    row = db.execute(text("SELECT id FROM advertisers WHERE lower(name) = lower(:n)"),
+                     {"n": name}).fetchone()
+    if row:
+        return row.id
+    new_id = db.execute(text(
+        "INSERT INTO advertisers (name) VALUES (:n) RETURNING id"), {"n": name}).fetchone()[0]
+    db.execute(text("""
+        INSERT INTO audit_log (event_type, title, detail, actor)
+        VALUES ('user', 'Создан кабинет рекламодателя', :d, :who)
+    """), {"d": name, "who": actor})
+    return new_id
+
 
 # ─── Пользователи панели (управление, только супер-админ) ───────────────────
 
 @router.get("/users")
 def get_users(admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
     rows = db.execute(text("""
-        SELECT id, username, role, is_blocked, last_login, first_name, last_name, full_name
-        FROM users ORDER BY username
+        SELECT u.id, u.username, u.role, u.is_blocked, u.last_login,
+               u.first_name, u.last_name, u.full_name,
+               u.advertiser_id, a.name AS advertiser_name
+        FROM users u
+        LEFT JOIN advertisers a ON a.id = u.advertiser_id
+        ORDER BY u.username
     """)).fetchall()
     return [dict(r._mapping) for r in rows]
 
@@ -30,19 +61,32 @@ def create_user(body: dict = Body(...), admin: dict = Depends(require_superadmin
 
     if not username or len(password) < 6:
         raise HTTPException(status_code=400, detail="Логин обязателен, пароль — минимум 6 символов")
-    if role not in ("admin", "auditor", "moderator"):
-        raise HTTPException(status_code=400, detail="Роль должна быть admin, auditor или moderator")
+    if role not in ROLES:
+        raise HTTPException(status_code=400,
+                            detail="Роль должна быть admin, auditor, moderator или advertiser")
 
     exists = db.execute(text("SELECT id FROM users WHERE username = :u"), {"u": username}).fetchone()
     if exists:
         raise HTTPException(status_code=400, detail="Пользователь с таким логином уже существует")
 
+    # Роль «рекламодатель» = кабинет. Наименование берём из формы, а если его
+    # не заполнили — из имени учётной записи, чтобы кабинет не остался
+    # безымянным (в документах это наименование пойдёт в акт и справку).
+    advertiser_id = None
+    if role == "advertiser":
+        name = (body.get("advertiser_name") or "").strip() \
+            or " ".join(x for x in (last_name, first_name) if x).strip() \
+            or username
+        advertiser_id = _ensure_advertiser(db, name, admin["username"])
+
     row = db.execute(text("""
-        INSERT INTO users (username, password_hash, role, first_name, last_name, created_by)
-        VALUES (:u, :ph, :r, :fn, :ln, :who)
-        RETURNING id, username, role
+        INSERT INTO users (username, password_hash, role, first_name, last_name, created_by,
+                           advertiser_id)
+        VALUES (:u, :ph, :r, :fn, :ln, :who, :aid)
+        RETURNING id, username, role, advertiser_id
     """), {"u": username, "ph": pwd_context.hash(password), "r": role,
-           "fn": first_name, "ln": last_name, "who": admin["username"]}).fetchone()
+           "fn": first_name, "ln": last_name, "who": admin["username"],
+           "aid": advertiser_id}).fetchone()
 
     db.execute(text("""
         INSERT INTO audit_log (event_type, title, detail, actor)
@@ -67,9 +111,17 @@ def change_user_role(user_id: int, body: dict = Body(...),
                       admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
     target = _get_target_user(db, user_id)
     role = body.get("role")
-    if role not in ("admin", "auditor", "moderator"):
-        raise HTTPException(status_code=400, detail="Роль должна быть admin, auditor или moderator")
-    db.execute(text("UPDATE users SET role = :r WHERE id = :id"), {"r": role, "id": user_id})
+    if role not in ROLES:
+        raise HTTPException(status_code=400,
+                            detail="Роль должна быть admin, auditor, moderator или advertiser")
+    # Стал рекламодателем — заводим/находим кабинет; перестал им быть — рвём
+    # привязку, иначе учётка сохранит доступ к чужому теперь кабинету.
+    aid = None
+    if role == "advertiser":
+        name = (body.get("advertiser_name") or "").strip() or target.username
+        aid = _ensure_advertiser(db, name, admin["username"])
+    db.execute(text("UPDATE users SET role = :r, advertiser_id = :aid WHERE id = :id"),
+               {"r": role, "aid": aid, "id": user_id})
     db.execute(text("""
         INSERT INTO audit_log (event_type, title, detail, actor)
         VALUES ('user', 'Роль изменена', :detail, :who)

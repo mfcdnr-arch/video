@@ -65,8 +65,21 @@ initAdvertisersViewActions();
 // и вернувшись, пользователь попадал бы внутрь карточки, открытой десять
 // минут назад, и не понимал, почему видит одного рекламодателя.
 async function viewAdvertisers(){
-  ADV_STATE.id = null;
   ADV_STATE.tab = 'overview';
+  // Рекламодателю списка чужих кабинетов не существует: сразу открываем его
+  // собственный. Какой именно — говорит сервер по токену, не панель.
+  if(ME.role === 'advertiser'){
+    try{
+      const mine = await api('/advertisers/me');
+      ADV_STATE.id = mine.advertiser_id;
+    }catch(e){
+      document.getElementById('view').innerHTML =
+        '<div class="empty">Учётная запись не привязана к рекламодателю. Обратитесь к администратору.</div>';
+      return;
+    }
+    return advRender();
+  }
+  ADV_STATE.id = null;
   return advRender();
 }
 
@@ -79,7 +92,9 @@ async function advRender(){
 
   if(!ADV_STATE.id) return advList(view);
 
-  topright.innerHTML = `<button class="btn" data-action="adv-back">← Все рекламодатели</button>`;
+  topright.innerHTML = ME.role === 'advertiser'
+    ? ''    // рекламодателю возвращаться некуда — у него один кабинет
+    : `<button class="btn" data-action="adv-back">← Все рекламодатели</button>`;
   view.innerHTML = '<div class="empty">Загрузка…</div>';
 
   const tabs = ADV_TABS.map(([k, label]) => `<button data-action="adv-tab" data-tab="${k}"

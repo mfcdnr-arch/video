@@ -96,6 +96,15 @@ async def dashboard_websocket(ws: WebSocket, db: Session = Depends(get_db)):
         await ws.close(code=4401, reason="Неверный токен")
         return
 
+    # Дашборд отдаёт статусы ВСЕХ экранов сети. Middleware в main.py websocket‑
+    # соединения не видит, поэтому роль «рекламодатель» отсекаем здесь же —
+    # иначе её JWT открыл бы поток по всей сети в обход белого списка путей.
+    role = db.execute(text("SELECT role FROM users WHERE username = :u"),
+                      {"u": username}).scalar()
+    if str(role or "").lower() == "advertiser":
+        await ws.close(code=4403, reason="Недоступно для этой роли")
+        return
+
     await dashboard_ws_manager.connect(ws)
     try:
         while True:

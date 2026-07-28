@@ -20,10 +20,25 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from deps import get_db, get_current_admin
+from deps import get_db, get_current_admin, advertiser_scope
 from routers.billing import _calc_amount, _parse_date
 
 router = APIRouter()
+
+
+@router.get("/advertisers/me")
+def my_advertiser(admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    """
+    Кабинет текущего пользователя. Панель вызывает это сразу после входа:
+    рекламодателя нужно открыть в его карточке, не показывая список чужих.
+    """
+    aid = admin.get("advertiser_id")
+    if not aid:
+        raise HTTPException(404, "Учётная запись не привязана к рекламодателю")
+    row = db.execute(text("SELECT id, name FROM advertisers WHERE id = :id"), {"id": aid}).fetchone()
+    if not row:
+        raise HTTPException(404, "Кабинет не найден")
+    return {"advertiser_id": row.id, "name": row.name}
 
 # Шаг «корзины» доступности экрана, минут. Heartbeat идёт раз в 30 секунд,
 # поэтому корзина в 5 минут переживает единичные пропуски пакета и при этом
@@ -63,7 +78,8 @@ def _get_advertiser(db: Session, aid: int):
 
 
 @router.get("/advertisers/{aid}/overview")
-def advertiser_overview(aid: int, date_from: str = Query(...), date_to: str = Query(...),
+def advertiser_overview(date_from: str = Query(...), date_to: str = Query(...),
+                        aid: int = Depends(advertiser_scope),
                         admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
     """
     Сводка за период: объёмы, доля в эфире, распределение по дням/часам,
@@ -182,9 +198,10 @@ def advertiser_overview(aid: int, date_from: str = Query(...), date_to: str = Qu
 
 
 @router.get("/advertisers/{aid}/airtime")
-def advertiser_airtime(aid: int, date_from: str = Query(...), date_to: str = Query(...),
+def advertiser_airtime(date_from: str = Query(...), date_to: str = Query(...),
                        screen_id: int = Query(None), media_id: int = Query(None),
                        limit: int = Query(500, le=5000), offset: int = Query(0),
+                       aid: int = Depends(advertiser_scope),
                        admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
     """
     Сырой журнал выходов — то, что в отрасли называют proof of play, а в
@@ -225,7 +242,8 @@ def advertiser_airtime(aid: int, date_from: str = Query(...), date_to: str = Que
 
 
 @router.get("/advertisers/{aid}/delivery")
-def advertiser_delivery(aid: int, date_from: str = Query(...), date_to: str = Query(...),
+def advertiser_delivery(date_from: str = Query(...), date_to: str = Query(...),
+                        aid: int = Depends(advertiser_scope),
                         admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
     """
     Качество доставки за период: сколько времени экраны, на которых крутился
@@ -341,7 +359,8 @@ def advertiser_delivery(aid: int, date_from: str = Query(...), date_to: str = Qu
 
 
 @router.get("/advertisers/{aid}/creatives")
-def advertiser_creatives(aid: int, admin: dict = Depends(get_current_admin),
+def advertiser_creatives(aid: int = Depends(advertiser_scope),
+                         admin: dict = Depends(get_current_admin),
                          db: Session = Depends(get_db)):
     """
     Ролики рекламодателя: статус модерации 38-ФЗ, сроки действия и до какой
