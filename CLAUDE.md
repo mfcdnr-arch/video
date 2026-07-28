@@ -28,7 +28,8 @@
   ticker, system, agent_ota, websockets
 - `server/migrations/` — SQL-миграции с номерами `001`…`024`, применяются
   автоматически при первом старте Postgres
-- `server/tests/` — pytest (billing, campaigns), запуск через `run_tests.sh`
+- `server/tests/` — pytest (billing, campaigns, контроль монитора), запуск через `run_tests.sh`
+- `ui_tests/ui_test.js` — браузерный E2E-прогон панели (puppeteer), запуск через `ui_test.sh`
 - `agent/` — код агента для мини-ПК: `ds_agent.py`, `ds_player.py` (mpv),
   `ds_sync.py`, `ds_downloader.py`, `ds_heartbeat.py`, `ds_ws_client.py`,
   `ds_ota_updater.py`, `ds_cleanup.py`
@@ -49,6 +50,7 @@
 - `bash install_server.sh` — собрать и поднять весь стек (идемпотентно)
 - `bash run_tests.sh` — прогнать pytest в контейнере `ds_api`
 - `bash smoke_test.sh` — smoke-проверка ключевых HTTP-эндпоинтов
+- `bash ui_test.sh` — браузерный прогон панели (разделы, кнопки, циклы CRUD)
 - `docker compose logs -f api` — следить за логами backend
 - `bash migrate.sh` — применить/проверить миграции БД
 - `bash collect_diag.sh` — собрать диагностику сервера
