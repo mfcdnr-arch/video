@@ -247,6 +247,15 @@ async function viewScreens(tab){
         ? `<span style="font-size:10px;background:var(--panel);border-radius:4px;padding:1px 5px;color:var(--muted);">${esc(s.group_name)}</span>`
         : '';
 
+      // Видеовыход: агент читает /sys/class/drm/*/status. null = агент старой
+      // версии или ядро не отдаёт статус — тогда бейдж серый, тревоги нет.
+      const outsTitle = s.display_outputs ? ' Выходы: ' + esc(s.display_outputs) + '.' : '';
+      const dispBadge = s.display_connected === true
+        ? `<span title="Монитор подключён к видеовыходу.${outsTitle}" style="font-size:10px;background:rgba(40,167,69,0.15);color:#28a745;border-radius:4px;padding:1px 6px;font-weight:600;">📺</span>`
+        : s.display_connected === false
+        ? `<span title="Монитор НЕ подключён к видеовыходу.${outsTitle}" style="font-size:10px;background:rgba(220,53,69,0.15);color:var(--danger);border-radius:4px;padding:1px 6px;font-weight:600;">📺</span>`
+        : `<span title="Состояние видеовыхода неизвестно: агент старой версии или драйвер не сообщает статус" style="font-size:10px;background:rgba(108,117,125,0.1);color:var(--muted);border-radius:4px;padding:1px 6px;">📺</span>`;
+
       const VENUES = {store_alcohol:'Магазин (алко)', store:'Магазин', mall:'ТЦ', office:'Офис', other:''};
       const venueLabel = VENUES[s.venue_type] ? `🏬 ${VENUES[s.venue_type]} · ` : '';
       const powerLabel = (s.power_on_time && s.power_off_time)
@@ -260,13 +269,16 @@ async function viewScreens(tab){
         <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;flex-wrap:wrap;">
           <span class="dot" style="background:${on?'var(--accent)':'var(--danger)'};flex-shrink:0;"></span>
           <span style="color:var(--muted);font-size:11px;flex-shrink:0;" title="ID экрана — для установки агента">ID ${s.id}</span>
-          <span style="font-weight:500;flex:1;">${esc(s.name)}</span>${wsBadge}${groupLabel}
+          <span style="font-weight:500;flex:1;">${esc(s.name)}</span>${wsBadge}${dispBadge}${groupLabel}
         </div>
         <div style="font-size:11px;color:var(--muted);margin-bottom:3px;">${esc(s.city||'')}${s.city&&s.location?' · ':''}${esc(s.location||'')} ${on?'· своб. '+(s.disk_free_gb!=null?Number(s.disk_free_gb).toFixed(0):'?')+' ГБ':'· офлайн'}</div>
         ${(s.os_version||s.vlc_version)?`<div style="font-size:11px;color:var(--muted);margin-bottom:3px;">ОС: ${esc(s.os_version||'—')} · VLC: ${esc(s.vlc_version||'—')}</div>`:''}
         <div style="font-size:11px;color:var(--muted);margin-bottom:3px;">${venueLabel}${powerLabel} · ${volLabel}</div>
         ${(s.clock_drift_seconds!=null && Math.abs(s.clock_drift_seconds)>60)
           ? `<div style="font-size:11px;color:var(--danger);margin-bottom:3px;" title="Разница между часами сервера и мини-ПК. Проверьте NTP/батарейку CMOS на устройстве — уплывшие часы ломают расписание, окна питания и синхронный показ.">⚠ Часы мини-ПК ${s.clock_drift_seconds>0?'отстают':'спешат'} на ${Math.round(Math.abs(s.clock_drift_seconds))} с</div>`
+          : ''}
+        ${(on && s.display_connected === false)
+          ? `<div style="font-size:11px;color:var(--danger);margin-bottom:3px;" title="Мини-ПК работает и играет контент, но ядро не видит монитора на видеовыходе. Проверьте кабель HDMI/DisplayPort и питание монитора.${outsTitle}">⚠ Монитор отключён от видеовыхода${s.display_changed_at?' (с '+esc(fmtServerTS(s.display_changed_at))+')':''}</div>`
           : ''}
         <div style="font-size:11px;color:${on?'var(--txt2)':'var(--dim)'};margin-bottom:9px;">▶ ${esc(s.playing_file||'—')}</div>
         <div style="display:flex;gap:5px;flex-wrap:wrap;">${on

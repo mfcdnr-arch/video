@@ -1,9 +1,65 @@
 """
 ds_heartbeat.py — отправка heartbeat на сервер
 """
-import shutil, logging, requests, time, subprocess, re
+import os, shutil, logging, requests, time, subprocess, re
 
 log = logging.getLogger(__name__)
+
+# Единственное место, где живёт версия агента: её шлёт heartbeat и отчёт
+# о перезапуске (ds_agent.py импортирует отсюда). Панель сравнивает её с
+# целевой версией и по ней же решают, доступна ли функция при приёмке.
+AGENT_VERSION = "1.2.0"
+
+# Каталог, где ядро публикует состояние видеовыходов (DRM-коннекторы).
+DRM_PATH = "/sys/class/drm"
+# Служебные коннекторы: не физические выходы, статус у них ни о чём не говорит.
+_SKIP_CONNECTORS = ("writeback", "virtual")
+
+
+def read_display_status():
+    """
+    Подключён ли монитор к видеовыходу — по /sys/class/drm/<cardN-ВЫХОД>/status.
+
+    Возвращает (connected, outputs):
+      connected — True, если хотя бы один физический выход в состоянии
+                  `connected`; False, если все известные выходы отключены;
+                  None, если статус узнать нельзя (нет /sys/class/drm, все
+                  выходы в `unknown` — так ведут себя VGA/DVI на части драйверов).
+      outputs   — человекочитаемая сводка «HDMI-A-1:connected, DP-1:disconnected».
+
+    Это детект КАБЕЛЯ/EDID, а не «картинка видна»: монитор, выключенный
+    кнопкой, обычно продолжает отвечать по DDC и остаётся `connected`.
+    """
+    try:
+        entries = sorted(os.listdir(DRM_PATH))
+    except Exception as e:
+        log.debug("Видеовыходы: {} недоступен ({})".format(DRM_PATH, e))
+        return None, ""
+
+    parts, any_connected, any_known = [], False, False
+    for entry in entries:
+        # Коннектор именуется card0-HDMI-A-1 / card0-DP-1; сама cardN и
+        # renderD128 не содержат дефиса и отсеиваются.
+        if "-" not in entry:
+            continue
+        name = entry.split("-", 1)[1]
+        if any(skip in name.lower() for skip in _SKIP_CONNECTORS):
+            continue
+        try:
+            with open(os.path.join(DRM_PATH, entry, "status"), "r", encoding="utf-8") as f:
+                status = f.read().strip().lower()
+        except Exception:
+            continue
+        parts.append("{}:{}".format(name, status))
+        if status in ("connected", "disconnected"):
+            any_known = True
+        if status == "connected":
+            any_connected = True
+
+    outputs = ", ".join(parts)[:200]
+    if not any_known:
+        return None, outputs
+    return any_connected, outputs
 
 
 def _read_os_version() -> str:
@@ -48,6 +104,9 @@ class Heartbeat:
         # Версии читаем один раз при старте (они не меняются в процессе работы).
         self.os_version = _read_os_version()
         self.vlc_version = _read_vlc_version()
+        # Последнее известное состояние видеовыхода — чтобы писать в лог
+        # только смену состояния, а не каждый heartbeat.
+        self._last_display = "не читали"
         log.info("Версия ОС: {} · VLC: {}".format(self.os_version, self.vlc_version))
 
     def _disk_free_gb(self) -> float:
@@ -59,12 +118,21 @@ class Heartbeat:
         return round(usage.total / (1024 ** 3), 2)
 
     def send(self, status: str = "online", playing_file: str = None) -> bool:
+        display_connected, display_outputs = read_display_status()
+        if display_connected != self._last_display:
+            log.info("Видеовыход: {} ({})".format(
+                {True: "монитор подключён", False: "МОНИТОР ОТКЛЮЧЁН",
+                 None: "статус неизвестен"}[display_connected], display_outputs or "нет данных"))
+            self._last_display = display_connected
         payload = {
             "status": status,
             "playing_file": playing_file,
             "disk_free_gb": self._disk_free_gb(),
             "disk_total_gb": self._disk_total_gb(),
-            "agent_version": "1.1.2",
+            # Подключён ли монитор к видеовыходу (None = определить нельзя).
+            "display_connected": display_connected,
+            "display_outputs": display_outputs,
+            "agent_version": AGENT_VERSION,
             "os_version": self.os_version,
             "vlc_version": self.vlc_version,
             # Время агента (UNIX, UTC) — сервер сравнивает со своим и хранит

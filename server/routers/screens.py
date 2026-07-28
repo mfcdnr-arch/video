@@ -70,6 +70,7 @@ def list_minipcs(admin: dict = Depends(get_current_admin), db: Session = Depends
                s.power_on_time, s.power_off_time,
                s.volume_day, s.volume_night, s.night_from, s.night_to,
                s.clock_drift_seconds, s.venue_type,
+               s.display_connected, s.display_outputs, s.display_changed_at,
                g.name as group_name
         FROM screens s
         LEFT JOIN sync_groups g ON g.id = s.group_id
@@ -180,6 +181,11 @@ async def heartbeat(screen_id: int, body: dict = Body(...), db: Session = Depend
     agent_time = body.get("agent_time")
     if isinstance(agent_time, (int, float)) and agent_time > 0:
         clock_drift = round(now.timestamp() - float(agent_time), 1)
+    # Видеовыход: True/False от агента, None = агент старой версии либо ядро
+    # не отдаёт статус. NULL не затирает последнее известное значение и не
+    # поднимает тревогу — см. миграцию 028.
+    display = body.get("display_connected")
+    display = bool(display) if isinstance(display, bool) else None
     # ИСПРАВЛЕНО: правильные имена полей из тела запроса
     db.execute(text("""
         UPDATE screens SET
@@ -192,10 +198,18 @@ async def heartbeat(screen_id: int, body: dict = Body(...), db: Session = Depend
             os_version   = :osv,
             vlc_version  = :vlcv,
             ip_address   = :ip,
-            clock_drift_seconds = COALESCE(:drift, clock_drift_seconds)
+            clock_drift_seconds = COALESCE(:drift, clock_drift_seconds),
+            display_connected = COALESCE(CAST(:disp AS BOOLEAN), display_connected),
+            display_outputs   = COALESCE(CAST(:disp_out AS VARCHAR), display_outputs),
+            display_changed_at = CASE
+                WHEN CAST(:disp AS BOOLEAN) IS NOT NULL
+                     AND display_connected IS DISTINCT FROM CAST(:disp AS BOOLEAN)
+                THEN :ts ELSE display_changed_at END
         WHERE id = :id
     """), {
         "drift": clock_drift,
+        "disp": display,
+        "disp_out": (body.get("display_outputs") or None),
         "ts": now,
         "pf": body.get("playing_file"),   # клиент шлёт "playing_file"
         "df": body.get("disk_free_gb"),
@@ -209,10 +223,10 @@ async def heartbeat(screen_id: int, body: dict = Body(...), db: Session = Depend
 
     db.execute(text("""
         INSERT INTO minipc_status
-            (screen_id, timestamp, status, playing_file, disk_free_gb, disk_total_gb, agent_version, os_version, vlc_version, ip_address)
-        VALUES (:sid, :ts, 'online', :pf, :df, :dt, :av, :osv, :vlcv, :ip)
+            (screen_id, timestamp, status, playing_file, disk_free_gb, disk_total_gb, agent_version, os_version, vlc_version, ip_address, display_connected)
+        VALUES (:sid, :ts, 'online', :pf, :df, :dt, :av, :osv, :vlcv, :ip, CAST(:disp AS BOOLEAN))
     """), {
-        "sid": screen_id, "ts": now,
+        "sid": screen_id, "ts": now, "disp": display,
         "pf": body.get("playing_file"),
         "df": body.get("disk_free_gb"),
         "dt": body.get("disk_total_gb"),

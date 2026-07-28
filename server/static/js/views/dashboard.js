@@ -9,7 +9,21 @@ async function viewDash(){
     h+=kpi('Рекламодателей', d.advertisers, d.media_count+' роликов');
     const expN = (d.expiring_media||[]).length;
     h+=kpi('Истекают ≤3 дней', expN, expN?'продлите или замените':'', expN?'#ffd34d':undefined);
+    const noDisp = d.no_display||[];
+    if(noDisp.length) h+=kpi('Без монитора', noDisp.length, 'играют «в стену»', 'var(--danger)');
     h+='</div>';
+    // мини-ПК работает и играет, но монитор не подключён к видеовыходу
+    if(noDisp.length){
+      h+='<div class="sec">Монитор не подключён</div>';
+      noDisp.forEach(s=>{
+        h+=`<div class="cell" style="display:flex;align-items:center;gap:10px;margin-bottom:6px;border-color:#7a3535;">
+          <span style="color:var(--danger);">📺</span>
+          <span style="flex:1;font-size:13px;">${esc(s.name)}</span>
+          <span class="muted" style="font-size:11px;">${esc(s.display_outputs||'')}</span>
+          <span style="font-size:12px;color:var(--danger);">${s.display_changed_at?'с '+esc(fmtServerTS(s.display_changed_at)):'кабель/питание монитора'}</span>
+        </div>`;
+      });
+    }
     // ролики с истекающим сроком действия
     if(expN){
       h+='<div class="sec">Срок действия истекает</div>';

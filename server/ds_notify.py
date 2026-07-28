@@ -79,6 +79,27 @@ def compute_alerts(conn, settings) -> dict:
                 f"💾 На экране «{r.name}» мало места: свободно {r.free_pct}% "
                 f"({float(r.disk_free_gb):.0f} из {float(r.disk_total_gb):.0f} ГБ).")
 
+    # Отключённый монитор имеет смысл ловить только у живых экранов: у офлайн
+    # уже есть своя тревога, а данные о видеовыходе у них устарели.
+    # Пауза в 3 минуты после смены состояния гасит ложные срабатывания при
+    # перезагрузке/переключении входа монитора.
+    if settings.get("notify_display"):
+        rows = conn.execute(text("""
+            SELECT id, name, display_outputs
+            FROM screens
+            WHERE display_connected IS FALSE
+              AND last_seen > NOW() - (:mins || ' minutes')::interval
+              AND (display_changed_at IS NULL
+                   OR display_changed_at < NOW() - INTERVAL '3 minutes')
+        """), {"mins": settings["offline_minutes"]}).fetchall()
+        for r in rows:
+            outs = f" Выходы: {r.display_outputs}." if r.display_outputs else ""
+            alerts[f"display:{r.id}"] = (
+                "display",
+                f"📺 Экран «{r.name}»: монитор не подключён к видеовыходу "
+                f"(HDMI/DisplayPort). Мини-ПК работает и играет контент, но на "
+                f"мониторе его не видно — проверьте кабель и питание монитора.{outs}")
+
     if settings["notify_broken"]:
         rows = conn.execute(text("""
             SELECT m.id, COALESCE(m.title, m.filename) AS title, a.name AS advertiser
@@ -127,11 +148,13 @@ def run_notifications() -> dict:
         for key, aid in active.items():
             if key in current:
                 continue
-            if key.startswith("offline:"):
+            if key.startswith(("offline:", "display:")):
                 name = conn.execute(text("SELECT name FROM screens WHERE id = :id"),
                                     {"id": int(key.split(":")[1])}).scalar()
                 if name:
-                    send_max_message(base, token, chat, f"✅ Экран «{name}» снова онлайн.")
+                    recovered = ("снова онлайн" if key.startswith("offline:")
+                                 else "монитор снова подключён")
+                    send_max_message(base, token, chat, f"✅ Экран «{name}»: {recovered}.")
             conn.execute(text(
                 "UPDATE notification_alerts SET is_active = FALSE, resolved_at = NOW() WHERE id = :id"),
                 {"id": aid})

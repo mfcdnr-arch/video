@@ -81,7 +81,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from ds_downloader import Downloader
 from ds_player    import VLCPlayer
 from ds_sync      import SyncHandler
-from ds_heartbeat import Heartbeat
+from ds_heartbeat import Heartbeat, AGENT_VERSION
 from ds_cleanup   import Cleanup
 from ds_ws_client import WSClient
 
@@ -270,7 +270,7 @@ def main():
                 json={
                     "restart_count": count,
                     "reason": "unknown",   # TODO: улучшить определение причины
-                    "agent_version": "1.1.2",
+                    "agent_version": AGENT_VERSION,
                 },
                 headers={"X-Token": TOKEN},
                 timeout=5

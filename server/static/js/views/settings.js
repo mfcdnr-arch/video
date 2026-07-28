@@ -161,6 +161,7 @@ async function loadNotifications(){
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer;"><input type="checkbox" id="nt-offline" ${chk(s.notify_offline)}> Экран офлайн</label>
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer;"><input type="checkbox" id="nt-disk" ${chk(s.notify_disk)}> Мало места</label>
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer;"><input type="checkbox" id="nt-broken" ${chk(s.notify_broken)}> Нерабочий ролик</label>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;" title="Мини-ПК работает и играет контент, но монитор отключён от видеовыхода"><input type="checkbox" id="nt-display" ${chk(s.notify_display)}> Монитор отключён</label>
         </div>
         <div style="display:flex;gap:8px;">
           <button class="btn primary" data-action="settings-save-notifications">Сохранить</button>
@@ -182,6 +183,7 @@ async function saveNotifications(){
     notify_offline: document.getElementById('nt-offline').checked,
     notify_disk: document.getElementById('nt-disk').checked,
     notify_broken: document.getElementById('nt-broken').checked,
+    notify_display: document.getElementById('nt-display').checked,
   };
   const tok = val('nt-token');
   if(tok) body.max_token = tok;   // пусто = не менять существующий

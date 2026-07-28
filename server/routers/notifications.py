@@ -11,6 +11,7 @@ _EDITABLE = {
     "enabled": bool, "max_token": str, "max_chat_id": str, "base_url": str,
     "offline_minutes": int, "disk_free_pct": int,
     "notify_offline": bool, "notify_disk": bool, "notify_broken": bool,
+    "notify_display": bool,
 }
 
 

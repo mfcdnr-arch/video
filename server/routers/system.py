@@ -287,6 +287,17 @@ def dashboard(db: Session = Depends(get_db), current_admin=Depends(get_current_a
         LIMIT 10
     """)).fetchall()
 
+    # Экраны, где мини-ПК жив и играет, но монитор не подключён к видеовыходу
+    # (миграция 028). Такой экран выглядит здоровым во всех остальных метриках,
+    # поэтому выносим его на дашборд отдельно.
+    no_display = db.execute(text("""
+        SELECT id, name, display_outputs, display_changed_at
+        FROM screens
+        WHERE display_connected IS FALSE
+          AND last_seen > NOW() - INTERVAL '5 minutes'
+        ORDER BY name
+    """)).fetchall()
+
     broken_media = db.execute(text("""
         SELECT m.title, m.filename, a.name AS advertiser, m.error_count
         FROM media m
@@ -307,5 +318,6 @@ def dashboard(db: Session = Depends(get_db), current_admin=Depends(get_current_a
         "disks": [dict(r._mapping) for r in disks],
         "feed": [dict(r._mapping) for r in feed],
         "broken_media": [dict(r._mapping) for r in broken_media],
+        "no_display": [dict(r._mapping) for r in no_display],
         "expiring_media": [dict(r._mapping) for r in expiring],
     }

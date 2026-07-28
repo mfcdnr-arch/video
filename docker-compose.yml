@@ -35,6 +35,7 @@ services:
       - ./server/migrations/025_playlist_unique_media.sql:/docker-entrypoint-initdb.d/25_playlist_unique_media.sql:ro
       - ./server/migrations/026_ticker_autoclear.sql:/docker-entrypoint-initdb.d/26_ticker_autoclear.sql:ro
       - ./server/migrations/027_screen_diagnostics.sql:/docker-entrypoint-initdb.d/27_screen_diagnostics.sql:ro
+      - ./server/migrations/028_display_signal.sql:/docker-entrypoint-initdb.d/28_display_signal.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
@@ -83,6 +84,9 @@ services:
       AGENT_UPDATE_PATH: /data/agent_updates
     volumes:
       - ./server:/app
+      # Код агента — только для регрессионных тестов (pytest гоняем внутри
+      # ds_api). Сервер этот каталог не читает; в проде монтировать не нужно.
+      - ./agent:/agent:ro
       - media_data:/data/media
       - backup_data:/data/backups
       - agent_updates_data:/data/agent_updates

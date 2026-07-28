@@ -106,7 +106,8 @@ async def dashboard_websocket(ws: WebSocket, db: Session = Depends(get_db)):
                         SELECT s.id, s.name, s.city, s.status, s.playing_file,
                                s.last_seen, s.disk_free_gb, s.disk_total_gb,
                                s.ip_address, s.agent_version, s.os_version,
-                               s.vlc_version, g.name as group_name
+                               s.vlc_version, s.display_connected, s.display_outputs,
+                               g.name as group_name
                         FROM screens s
                         LEFT JOIN sync_groups g ON g.id = s.group_id
                         ORDER BY s.name
