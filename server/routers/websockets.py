@@ -19,6 +19,7 @@ router = APIRouter()
 
 # ─── WebSocket: push-команды для агентов ────────────────────────────────────
 
+@router.websocket("/ws/agent/{screen_id}")
 @router.websocket("/api/ws/agent/{screen_id}")
 async def agent_websocket(screen_id: int, ws: WebSocket, db: Session = Depends(get_db)):
     """
@@ -26,6 +27,14 @@ async def agent_websocket(screen_id: int, ws: WebSocket, db: Session = Depends(g
     Аутентификация: X-Token передаётся как query-параметр ?token=...
     После подключения сервер пушит {"type":"new_command"} при появлении команд.
     Агент должен ответить {"type":"ping"} на {"type":"ping"} (keepalive).
+
+    Роут объявлен по ДВУМ путям намеренно:
+      • /ws/agent/{id}     — так запрос приходит через nginx: агент стучится на
+        /api/ws/agent/{id}, а nginx (proxy_pass с завершающим «/») срезает
+        префикс /api. Без этого пути handshake отдавал 404 и агент молча
+        откатывался на polling (задержка команд до 5 с).
+      • /api/ws/agent/{id} — прямое обращение к uvicorn на :8000 (dev, тесты,
+        обращения изнутри docker-сети мимо nginx).
     """
     # Аутентификация через query-параметр token
     token = ws.query_params.get("token", "")
