@@ -714,3 +714,179 @@ def update_requisites(aid: int, body: dict = Body(...), admin: dict = Depends(re
     db.execute(text(f"UPDATE advertisers SET {', '.join(sets)} WHERE id = :id"), params)
     db.commit()
     return {"status": "ok"}
+
+
+# ─── Компенсации за недоставленные выходы ───────────────────────────────────
+# Принцип (решение заказчика 28.07.2026): система СЧИТАЕТ недобор и
+# ПРЕДЛАГАЕТ вариант, а решение принимает человек кнопкой. Сумма счёта сама
+# не меняется никогда — иначе счёт «уезжал» бы без ведома того, кто его
+# выставил, и расхождение всплывало бы уже у заказчика.
+
+# Порог, ниже которого недобор не считаем поводом для разговора: расписание
+# и округления дают небольшой разброс всегда.
+SHORTFALL_MIN_PCT = 3.0
+
+
+@router.get("/advertisers/{aid}/compensation")
+def compensation_preview(aid: int, date_from: str = Query(...), date_to: str = Query(...),
+                         admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    """
+    Расчёт недобора за период с разбивкой по причинам и предложение.
+
+    Причины ранжируются по «нашей вине»: простой экрана и отключённый монитор —
+    наша ответственность; снятый модерацией ролик — ответственность заказчика;
+    остаток («не хватило слотов») — планирование.
+    """
+    adv = _get_advertiser(db, aid)
+    d_from, d_to = _period(date_from, date_to)
+
+    # 1. План и факт по кампаниям, пересекающимся с периодом
+    from routers.campaigns import _campaign_facts
+    today = (datetime.utcnow() + timedelta(hours=3)).date()
+    camps = db.execute(text("""
+        SELECT * FROM campaigns
+        WHERE advertiser_id = :aid AND date_from <= :dt AND date_to >= :df
+        ORDER BY date_from
+    """), {"aid": aid, "df": d_from, "dt": d_to}).fetchall()
+    plan = fact = 0
+    campaigns = []
+    for c in camps:
+        f = _campaign_facts(db, c, today)
+        plan += f["plan_to_date"]
+        fact += f["fact_to_date"]
+        campaigns.append({"id": c.id, "name": c.name, "plan": f["plan_to_date"],
+                          "fact": f["fact_to_date"], "shortfall": f["shortfall"]})
+    shortfall = max(0, plan - fact)
+    shortfall_pct = round(100.0 * shortfall / plan, 1) if plan else 0.0
+
+    # 2. Причины. Часы простоя и «без монитора» берём из того же расчёта, что
+    # и вкладка «Качество доставки» — цифры в карточке и в компенсации обязаны
+    # совпадать, иначе спор превращается в спор о наших же цифрах.
+    from routers.advertiser_office import advertiser_delivery
+    delivery = advertiser_delivery(date_from=d_from.isoformat(), date_to=d_to.isoformat(),
+                                   aid=aid, admin=admin, db=db)
+    offline_h = delivery["totals"]["offline_hours"] or 0
+    dark_h = delivery["totals"]["display_off_hours"] or 0
+    screens_n = max(1, delivery["totals"]["screens"])
+    period_h = ((d_to - d_from).days + 1) * 24 * screens_n
+    our_fault_share = min(1.0, (offline_h + dark_h) / period_h) if period_h else 0.0
+
+    rejected = db.execute(text("""
+        SELECT COUNT(*) FROM media
+        WHERE advertiser_id = :aid AND review_status = 'rejected'
+    """), {"aid": aid}).scalar() or 0
+
+    by_reason = []
+    our_plays = int(round(shortfall * our_fault_share))
+    if offline_h:
+        by_reason.append({"reason": "offline", "label": "Экран не выходил на связь",
+                          "hours": offline_h, "our_fault": True})
+    if dark_h:
+        by_reason.append({"reason": "display_off", "label": "Монитор отключён от видеовыхода",
+                          "hours": dark_h, "our_fault": True})
+    if rejected:
+        by_reason.append({"reason": "rejected", "label": "Ролики сняты модерацией (38-ФЗ)",
+                          "count": rejected, "our_fault": False})
+    rest = shortfall - our_plays
+    if rest > 0:
+        by_reason.append({"reason": "no_slots", "label": "Не хватило слотов в расписании",
+                          "plays": rest, "our_fault": False})
+
+    # 3. Предложение — только на «нашу» часть недобора
+    price = float(adv.price_per_play if adv.billing_mode == "per_play" else adv.price_per_minute)
+    if adv.billing_mode == "per_play":
+        proposed_amount = round(our_plays * price, 2)
+    else:
+        # По минутам: пересчитываем недоданные показы в минуты по средней
+        # длительности ролика этого рекламодателя за период.
+        avg_sec = db.execute(text("""
+            SELECT AVG(EXTRACT(EPOCH FROM (pl.ended_at - pl.started_at)))
+            FROM play_log pl JOIN media m ON m.id = pl.media_id
+            WHERE m.advertiser_id = :aid
+        """), {"aid": aid}).scalar() or 0
+        proposed_amount = round(our_plays * float(avg_sec) / 60.0 * price, 2)
+
+    # Скидка не может превышать то, что рекламодатель заплатит за этот период:
+    # при завышенном плане кампании расчёт «по недобору» легко даёт сумму
+    # больше счёта, и такое предложение выглядит абсурдно.
+    facts = _period_facts(db, aid, d_from, d_to)
+    _, period_amount = _amount_for(db, adv, facts["plays"], facts["minutes"])
+    capped = proposed_amount > period_amount
+    proposed_amount = min(proposed_amount, period_amount)
+
+    existing = db.execute(text("""
+        SELECT id, kind, status, proposed_amount, proposed_plays, applied_amount,
+               applied_plays, decided_by, decided_at, note, created_at
+        FROM compensations
+        WHERE advertiser_id = :aid AND period_start = :df AND period_end = :dt
+        ORDER BY created_at DESC
+    """), {"aid": aid, "df": d_from, "dt": d_to}).fetchall()
+
+    significant = shortfall_pct >= SHORTFALL_MIN_PCT and our_plays > 0
+    return {
+        "period": {"date_from": d_from.isoformat(), "date_to": d_to.isoformat()},
+        "campaigns": campaigns,
+        "plan": plan, "fact": fact,
+        "shortfall": shortfall, "shortfall_pct": shortfall_pct,
+        "our_fault_plays": our_plays,
+        "our_fault_share_pct": round(100.0 * our_fault_share, 1),
+        "by_reason": by_reason,
+        "period_amount": period_amount,
+        "proposal": {
+            "significant": significant,
+            "discount_amount": proposed_amount,
+            "extra_plays": our_plays,
+            "capped_by_period_amount": capped,
+            "hint": ("Недобор в пределах обычного разброса расписания — "
+                     "компенсация не требуется" if not significant else
+                     ("Скидка ограничена суммой за период" if capped else
+                      "Предлагается скидка в счёте либо допоказы в следующем периоде")),
+        },
+        "decisions": [dict(r._mapping) for r in existing],
+    }
+
+
+@router.post("/advertisers/{aid}/compensation")
+def compensation_decide(aid: int, body: dict = Body(...), admin: dict = Depends(require_write),
+                        db: Session = Depends(get_db)):
+    """
+    Решение по компенсации: скидка, допоказы или отказ. Запись попадает в
+    журнал и в акт; сумма счёта при этом НЕ меняется — если решено дать
+    скидку, её проводят корректировкой счёта осознанно.
+    """
+    adv = _get_advertiser(db, aid)
+    d_from, d_to = _period(body.get("date_from"), body.get("date_to"))
+    kind = body.get("kind") or "discount"
+    if kind not in ("discount", "extra_plays"):
+        raise HTTPException(400, "kind: discount или extra_plays")
+    decision = body.get("decision") or "applied"
+    if decision not in ("applied", "declined"):
+        raise HTTPException(400, "decision: applied или declined")
+
+    amount = float(body.get("amount") or 0)
+    plays = int(body.get("plays") or 0)
+    row = db.execute(text("""
+        INSERT INTO compensations
+            (advertiser_id, period_start, period_end, reason, missed_plays, kind,
+             proposed_amount, proposed_plays, status, applied_amount, applied_plays,
+             decided_by, decided_at, note)
+        VALUES (:aid, :df, :dt, :reason, :missed, :kind, :pa, :pp, :st, :aa, :ap,
+                :who, NOW(), :note)
+        RETURNING id, kind, status, applied_amount, applied_plays, decided_by, decided_at
+    """), {"aid": aid, "df": d_from, "dt": d_to,
+           "reason": body.get("reason") or "other",
+           "missed": int(body.get("missed_plays") or 0), "kind": kind,
+           "pa": amount, "pp": plays,
+           "st": decision,
+           "aa": amount if decision == "applied" and kind == "discount" else None,
+           "ap": plays if decision == "applied" and kind == "extra_plays" else None,
+           "who": admin["username"], "note": (body.get("note") or "").strip() or None}).fetchone()
+    db.execute(text("""
+        INSERT INTO audit_log (event_type, title, detail, actor)
+        VALUES ('billing', :title, :d, :who)
+    """), {"title": "Компенсация: " + ("применена" if decision == "applied" else "отклонена"),
+           "d": f"{adv.name}, {_fmt_period(d_from, d_to)}: "
+                + (f"скидка {amount:.2f} ₽" if kind == "discount" else f"допоказы {plays}"),
+           "who": admin["username"]})
+    db.commit()
+    return dict(row._mapping)

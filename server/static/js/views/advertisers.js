@@ -75,6 +75,11 @@ function initAdvertisersViewActions(){
         return advAddContract();
       case 'adv-del-contract':
         return advDeleteContract(Number(el.dataset.contractId), el.dataset.number || '');
+      case 'adv-comp-apply':
+        return advCompensate(el.dataset.kind, Number(el.dataset.amount || 0),
+                             Number(el.dataset.plays || 0), Number(el.dataset.missed || 0));
+      case 'adv-comp-decline':
+        return advCompensate('discount', 0, 0, Number(el.dataset.missed || 0), 'declined');
     }
   });
 }
@@ -156,6 +161,28 @@ async function advAddContract(){
       method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
     });
     toast('Договор добавлен');
+    advRender();
+  }catch(e){ toast('Ошибка: ' + e.message); }
+}
+
+async function advCompensate(kind, amount, plays, missed, decision){
+  decision = decision || 'applied';
+  const what = decision === 'declined'
+    ? 'Зафиксировать, что компенсация НЕ предоставляется?'
+    : (kind === 'discount'
+        ? `Зафиксировать скидку ${amount.toFixed(2)} ₽ за недоставленные выходы?\n\n`
+          + 'Сумма счёта при этом НЕ изменится — скидку проводят корректировкой счёта отдельно.'
+        : `Зафиксировать ${plays} допоказов в следующем периоде?`);
+  const note = prompt(what + '\n\nКомментарий (необязательно):');
+  if(note === null) return;
+  try{
+    await api(`/advertisers/${ADV_STATE.id}/compensation`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({date_from: ADV_STATE.from, date_to: ADV_STATE.to,
+                            kind, amount, plays, missed_plays: missed,
+                            decision, note})
+    });
+    toast('Решение зафиксировано');
     advRender();
   }catch(e){ toast('Ошибка: ' + e.message); }
 }
@@ -485,10 +512,74 @@ async function advDelivery(){
         <td style="text-align:right;">${c.shortfall}</td></tr>`;
     });
     h += '</table></div>';
-    h += '<div class="muted" style="font-size:11px;margin-top:6px;">Недобор — основание для компенсации.'
-       + ' Расчёт и решение появятся на следующем этапе; сумма счёта сама не меняется.</div>';
   }
+  if(canWrite()) h += await advCompensationBlock();
   return h;
+}
+
+// ─── Компенсация за недоставленные выходы ─────────────────────────────────
+// Система считает и предлагает, решение принимает человек. Сумма счёта сама
+// не меняется никогда — иначе счёт «уезжал» бы без ведома того, кто его выставил.
+async function advCompensationBlock(){
+  let c;
+  try{ c = await api(`/advertisers/${ADV_STATE.id}/compensation?${advPeriodQuery()}`); }
+  catch(e){ return ''; }
+
+  let h = '<div class="sec">Компенсация за недобор</div><div class="cell">';
+  if(!c.plan){
+    h += '<div class="muted" style="font-size:12px;">За период нет кампаний с планом — считать недобор не от чего.</div></div>';
+    return h;
+  }
+
+  h += `<div style="display:flex;gap:20px;flex-wrap:wrap;font-size:12px;margin-bottom:8px;">
+    <span>План <b>${c.plan}</b> · факт <b>${c.fact}</b> · недобор
+      <b style="color:${c.shortfall ? 'var(--danger)' : 'var(--accent)'};">${c.shortfall}</b>
+      (${c.shortfall_pct}%)</span>
+    <span class="muted">из них по нашей вине: <b>${c.our_fault_plays}</b> (${c.our_fault_share_pct}% времени)</span>
+  </div>`;
+
+  if(c.by_reason.length){
+    h += '<div style="font-size:12px;margin-bottom:8px;">';
+    c.by_reason.forEach(r => {
+      const v = r.hours != null ? r.hours + ' ч' : (r.plays != null ? r.plays + ' показов' : r.count + ' шт.');
+      h += `<div style="padding:2px 0;color:${r.our_fault ? 'var(--danger)' : 'var(--muted)'};">
+        ${r.our_fault ? '●' : '○'} ${esc(r.label)} — ${v}</div>`;
+    });
+    h += '</div>';
+  }
+
+  if(!c.proposal.significant){
+    h += `<div class="muted" style="font-size:12px;">${esc(c.proposal.hint)}</div>`;
+  }else{
+    h += `<div style="font-size:12px;margin-bottom:8px;">Предложение: скидка
+      <b>${Number(c.proposal.discount_amount).toFixed(2)} ₽</b> либо
+      <b>${c.proposal.extra_plays}</b> допоказов.
+      ${c.proposal.capped_by_period_amount
+        ? '<span class="muted">Скидка ограничена суммой за период (' + Number(c.period_amount).toFixed(2) + ' ₽).</span>'
+        : ''}</div>`;
+    h += `<div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="btn primary" data-action="adv-comp-apply" data-kind="discount"
+        data-amount="${c.proposal.discount_amount}" data-missed="${c.shortfall}">Дать скидку</button>
+      <button class="btn" data-action="adv-comp-apply" data-kind="extra_plays"
+        data-plays="${c.proposal.extra_plays}" data-missed="${c.shortfall}">Дать допоказы</button>
+      <button class="btn" data-action="adv-comp-decline" data-missed="${c.shortfall}">Не компенсировать</button>
+    </div>
+    <div class="muted" style="font-size:11px;margin-top:6px;">Решение попадёт в журнал и в акт.
+      Сумма счёта автоматически не меняется — скидку проводят корректировкой счёта.</div>`;
+  }
+
+  if(c.decisions.length){
+    h += '<div style="margin-top:10px;font-size:12px;"><span class="muted">Решения по периоду:</span>';
+    c.decisions.forEach(d => {
+      const what = d.status === 'declined' ? 'без компенсации'
+        : (d.kind === 'discount' ? `скидка ${Number(d.applied_amount || 0).toFixed(2)} ₽`
+                                 : `допоказы ${d.applied_plays || 0}`);
+      h += `<div class="muted" style="font-size:11px;padding:2px 0;">
+        ${esc(fmtServerTS(d.decided_at))} · ${esc(d.decided_by || '')} · ${what}${d.note ? ' · ' + esc(d.note) : ''}</div>`;
+    });
+    h += '</div>';
+  }
+  return h + '</div>';
 }
 
 // ─── Вкладка «Ролики и 38-ФЗ» ─────────────────────────────────────────────
