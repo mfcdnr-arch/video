@@ -10,15 +10,19 @@
 
 Структуры (dict):
   показ          id, playlist_id, playlist_name, date_from, date_to,
-                 hour_from, hour_to, stopped_at (datetime | None), screens (set[int])
+                 hour_from, hour_to, stopped_at (datetime | None), screens (set[int]),
+                 saved_at (datetime, наивное МСК — когда показ создан или правился
+                 последний раз; нужен для приоритета, см. choose_playlists)
   переопределение id, screen_id, on_date, playlist_id, playlist_name, is_off
                  (групповые переопределения уже развёрнуты по экранам)
   решения        {(placement_id, screen_id, other_kind, other_id): "replace" | "alternate"},
                  other_kind — "placement" или "override"
 
 Пересечение показов админ разрешает отдельно для каждого экрана:
-«replace» — новый показ вытесняет старый, «alternate» — оба играют по
-очереди в общем часу. Недельный шаблон пересечением не считается.
+«replace» — последний сохранённый показ вытесняет остальные, «alternate» —
+играют по очереди в общем часу. Недельный шаблон пересечением не считается.
+Решения хранятся под id показа, который админ сохранял (создавал или правил),
+— поэтому приоритет у показа с самым поздним saved_at, а не с наибольшим id.
 """
 from datetime import date, datetime, time, timedelta
 
@@ -138,21 +142,31 @@ def find_conflicts(new: dict, others: list[dict], overrides: list[dict]) -> tupl
 
 # --- выбор плейлистов --------------------------------------------------------
 
+def _recency(p: dict) -> tuple[datetime, int]:
+    """Ключ «новизны» показа: когда сохранён, при равенстве/отсутствии — id."""
+    return (p.get("saved_at") or datetime.min, p["id"])
+
+
 def choose_playlists(applicable: list[dict], decisions: dict, override: dict | None, screen_id: int) -> list[int]:
     """Какие плейлисты играют на экране `screen_id` в конкретный час.
 
     applicable — показы, действующие в этот час на этом экране;
     override   — переопределение экрана на этот день (или None).
 
-    Новейший показ (max id) идёт первым. Старшие показы и переопределение
-    с плейлистом (не is_off) добавляются только если у новейшего на них
-    стоит решение "alternate" — по очереди после него. Без решения или
-    при "replace" они вытеснены. Без повторов playlist_id.
-    Пусто, если applicable пуст.
+    «Новейший» — последний сохранённый показ: максимум по (saved_at, id).
+    Правка старого показа делает его новейшим, а решения при сохранении
+    записываются под его id — значит, они лежат именно у новейшего.
+    Без saved_at (или при равных) порядок по id: больший id новее.
+
+    Новейший показ идёт первым. Старшие показы (в том же порядке, от новых
+    к старым) и переопределение с плейлистом (не is_off) добавляются только
+    если у новейшего на них стоит решение "alternate" — по очереди после
+    него. Без решения или при "replace" они вытеснены. Без повторов
+    playlist_id. Пусто, если applicable пуст.
     """
     if not applicable:
         return []
-    ordered = sorted(applicable, key=lambda p: p["id"], reverse=True)   # новейший первым
+    ordered = sorted(applicable, key=_recency, reverse=True)   # новейший первым
     newest = ordered[0]
 
     def alternates(kind: str, other_id: int) -> bool:

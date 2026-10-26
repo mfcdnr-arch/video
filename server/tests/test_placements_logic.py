@@ -10,9 +10,12 @@ from placements_logic import (dates_overlap, hours_overlap, applies_at, placemen
                               find_conflicts, choose_playlists, template_playlist)
 
 
-def P(id, d1, d2, h1, h2, screens, pl=10, stopped=None):
-    return {"id": id, "playlist_id": pl, "playlist_name": f"PL{pl}", "date_from": d1, "date_to": d2,
-            "hour_from": h1, "hour_to": h2, "stopped_at": stopped, "screens": set(screens)}
+def P(id, d1, d2, h1, h2, screens, pl=10, stopped=None, saved=None):
+    p = {"id": id, "playlist_id": pl, "playlist_name": f"PL{pl}", "date_from": d1, "date_to": d2,
+         "hour_from": h1, "hour_to": h2, "stopped_at": stopped, "screens": set(screens)}
+    if saved is not None:
+        p["saved_at"] = saved       # когда показ создан/правился последним; без него — порядок по id
+    return p
 
 
 def OV(id, screen_id, on_date, pl=30, off=False):
@@ -214,6 +217,36 @@ def test_choose_decisions_of_older_placements_are_ignored():
     pls = [P(1, N1, N30, 9, 13, [1], pl=10), P(2, N1, N30, 9, 13, [1], pl=20), P(3, N1, N30, 9, 13, [1], pl=30)]
     d = {(2, 1, "placement", 1): "alternate"}                       # решение не у новейшего (3)
     assert choose_playlists(pls, d, None, 1) == [30]
+
+
+def test_choose_edited_older_placement_wins_by_saved_at():
+    # A (id=1) правили позже, чем B (id=2) создали: приоритет у последнего сохранённого,
+    # а решения лежат под id правленого показа — (1, экран, "placement", 2).
+    a = P(1, N1, N30, 9, 13, [1], pl=10, saved=datetime(2026, 11, 3, 12))
+    b = P(2, N1, N30, 9, 13, [1], pl=20, saved=datetime(2026, 11, 2, 12))
+    assert choose_playlists([a, b], {(1, 1, "placement", 2): "alternate"}, None, 1) == [10, 20]
+    assert choose_playlists([a, b], {(1, 1, "placement", 2): "replace"}, None, 1) == [10]
+    assert choose_playlists([a, b], {}, None, 1) == [10]
+    # решения «со стороны» вытесненного (id=2) для него не работают
+    assert choose_playlists([a, b], {(2, 1, "placement", 1): "alternate"}, None, 1) == [10]
+
+
+def test_choose_edited_older_placement_with_override_and_three_placements():
+    a = P(1, N1, N30, 9, 13, [1], pl=10, saved=datetime(2026, 11, 9))
+    b = P(2, N1, N30, 9, 13, [1], pl=20, saved=datetime(2026, 11, 2))
+    c = P(3, N1, N30, 9, 13, [1], pl=30, saved=datetime(2026, 11, 5))
+    ov = {"id": 7, "playlist_id": 70, "is_off": False}
+    d = {(1, 1, "placement", 3): "alternate", (1, 1, "placement", 2): "alternate", (1, 1, "override", 7): "alternate"}
+    # порядок: сначала самый свежий по saved_at (A), дальше по убыванию saved_at (C, B), в конце переопределение
+    assert choose_playlists([b, c, a], d, ov, 1) == [10, 30, 20, 70]
+
+
+def test_choose_saved_at_ties_and_missing_fall_back_to_id():
+    t = datetime(2026, 11, 2, 12)
+    same = [P(1, N1, N30, 9, 13, [1], pl=10, saved=t), P(2, N1, N30, 9, 13, [1], pl=20, saved=t)]
+    assert choose_playlists(same, {}, None, 1) == [20]                       # saved_at равны — новейший по id
+    mixed = [P(5, N1, N30, 9, 13, [1], pl=50), P(2, N1, N30, 9, 13, [1], pl=20, saved=t)]
+    assert choose_playlists(mixed, {}, None, 1) == [20]                      # без saved_at — самый давний
 
 
 def test_choose_off_override_never_added():
