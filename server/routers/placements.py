@@ -1,31 +1,41 @@
-"""Показы по датам: предпросмотр пересечений и создание.
+"""Показы по датам: предпросмотр, создание, список, правка, остановка, отмена, неделя.
 
 Показ ставит плейлист на экраны (или на все экраны сети) на диапазон дат и
 ежедневно на целые часы МСК. Пересечения с другими показами и с датовыми
 переопределениями находит placements_logic.find_conflicts; решает их админ —
 отдельно для каждого экрана («replace» / «alternate»). Сохранить показ, пока
-хоть одно пересечение не решено, нельзя (409).
+хоть одно пересечение не решено, нельзя (409). Правка (PUT) идёт тем же
+путём, что создание, но сам показ пересечением не считается.
+
+Остановить можно только идущий показ (status "active"), отменить (удалить) —
+только запланированный; статус считает placements_logic.placement_status.
+GET /placements/week отдаёт сетку 7 дней × 24 часа для одного экрана
+(placements_logic.week_cells).
 
 Чистые функции (parse_body, parse_decisions, unresolved, summary_text,
-overflow_notes) проверяются в tests/test_placements_api.py. SQL живёт в
+overflow_notes, week_start, sort_listing, listing_row, check_stoppable,
+check_deletable) проверяются в tests/test_placements_api.py. SQL живёт в
 placements_store: разбор строк (развёртывание групп и «всех экранов»,
-приоритет экрана над группой, наивные МСК-даты, запись saved_at) — в
-tests/test_placements_store.py на фейковой БД. smoke_test.sh на живом
-стенде проходит только путь без пересечений: предпросмотр и создание
-показа на новом экране; ветки с пересечениями, 409 и решениями им не
-покрыты.
+приоритет экрана над группой, наивные МСК-даты, запись saved_at и
+stopped_at) — в tests/test_placements_store.py на фейковой БД. smoke_test.sh
+на живом стенде проходит путь без пересечений: предпросмотр, создание,
+список, правка, неделя, остановка и отмена на новом экране; ветки с
+пересечениями, 409 на создание и решениями им не покрыты.
 """
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Callable
 
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from admin_panel import ad_sequence
-from deps import get_db, require_write
-from placements_logic import ALTERNATE, KIND_OVERRIDE, KIND_PLACEMENT, REPLACE, find_conflicts
-from placements_store import all_screen_ids, load_overrides, load_placements, now_msk, save_placement
+from deps import get_current_admin, get_db, require_write
+from placements_logic import (ALTERNATE, KIND_OVERRIDE, KIND_PLACEMENT, REPLACE, alternate_overlaps,
+                              find_conflicts, placement_status, week_cells)
+from placements_store import (all_screen_ids, delete_placement, get_placement, load_decisions,
+                              load_overrides, load_placements, load_playlist_names, load_screen_slots,
+                              now_msk, save_placement, stop_placement)
 from playlist_rules import overflow_minutes
 
 router = APIRouter()
@@ -168,6 +178,63 @@ def overflow_notes(conflicts: list[dict], playlist_id: int,
     return list(dict.fromkeys(notes))
 
 
+# --- список, неделя, остановка и отмена (чистые функции) -----------------------
+
+STOP_ONLY_ACTIVE = "Остановить можно только идущий показ"
+CANCEL_ONLY_PLANNED = "Показ уже идёт или закончился — используйте «Остановить»"
+EDIT_STOPPED = "Остановленный показ изменить нельзя — создайте новый"
+
+# В списке сначала идущие, потом запланированные, потом завершённые.
+_LISTING_ORDER = {"active": 0, "planned": 1, "done": 2, "stopped": 2}
+
+
+def week_start(s: str) -> date:
+    """Начало недели из query-параметра: дата ГГГГ-ММ-ДД, обязательно понедельник (иначе 400)."""
+    d = _date(s, "Начало недели")
+    if d.weekday() != 0:
+        raise HTTPException(400, f"Начало недели {d:%d.%m.%Y} — не понедельник")
+    return d
+
+
+def sort_listing(rows: list[dict]) -> list[dict]:
+    """Порядок списка показов: active, planned, затем done/stopped; внутри — дата начала по убыванию."""
+    return sorted(rows, key=lambda r: (_LISTING_ORDER[r["status"]], -r["date_from"].toordinal(), -r["id"]))
+
+
+def listing_row(p: dict, now: datetime, screen_names: dict[int, str], alternates: list[dict]) -> dict:
+    """Строка GET /placements: показ из load_placements + статус на момент now.
+
+    screen_names — {screen_id: название}; alternates — alternate_overlaps(...) для этого показа.
+    """
+    def name(screen_id: int) -> str:
+        return screen_names.get(screen_id) or f"Экран #{screen_id}"
+
+    screens = sorted(p["screens"], key=lambda s: (name(s).lower(), s))
+    return {
+        "id": p["id"], "playlist_id": p["playlist_id"], "all_screens": p["all_screens"],
+        "screen_count": len(screens), "screens": [{"id": s, "name": name(s)} for s in screens],
+        "date_from": p["date_from"], "date_to": p["date_to"],
+        "hour_from": p["hour_from"], "hour_to": p["hour_to"],
+        "status": placement_status(p, now),
+        "alternates": [{"screen_name": name(a["screen_id"]), "other_playlist_name": a["other_playlist_name"],
+                        "date_from": a["date_from"], "date_to": a["date_to"],
+                        "hour_from": a["hour_from"], "hour_to": a["hour_to"]} for a in alternates],
+        "created_by": p["created_by"], "created_at": p["created_at"],
+    }
+
+
+def check_stoppable(status: str) -> None:
+    """Остановить можно только идущий показ; иначе 409."""
+    if status != "active":
+        raise HTTPException(409, STOP_ONLY_ACTIVE)
+
+
+def check_deletable(status: str) -> None:
+    """Отменить (удалить) можно только запланированный показ; иначе 409."""
+    if status != "planned":
+        raise HTTPException(409, CANCEL_ONLY_PLANNED)
+
+
 # --- общая часть предпросмотра и создания -------------------------------------
 
 def _prepare(db: Session, body: dict, exclude_id: int | None = None) -> tuple[dict, list, list]:
@@ -256,16 +323,14 @@ def preview_placement(body: dict = Body(...), admin: dict = Depends(require_writ
             "screen_count": len(data["screens"])}
 
 
-@router.post("/placements")
-def create_placement(body: dict = Body(...), admin: dict = Depends(require_write),
-                     db: Session = Depends(get_db)):
-    """
-    Создать показ. Тело — как у предпросмотра плюс "decisions":
-    [{"screen_id", "other_kind", "other_id", "mode"}] — по решению на каждое
-    пересечение из предпросмотра. Не решено хоть одно — 409, ничего не пишем.
+def _save(db: Session, body: dict, actor: str, placement_id: int | None = None) -> int:
+    """Создать (placement_id=None) или изменить показ по телу запроса; вернуть его id.
+
+    Общая часть POST и PUT: разобрать решения, найти пересечения (при правке
+    сам показ не в счёт), убедиться, что решены все, сохранить и закоммитить.
     """
     decisions = parse_decisions(body.get("decisions") if isinstance(body, dict) else None)
-    data, conflicts, _ = _prepare(db, body)
+    data, conflicts, _ = _prepare(db, body, placement_id)
     left = unresolved(conflicts, decisions)
     if left:
         raise HTTPException(409, f"Не решено пересечений: {left}")
@@ -278,6 +343,118 @@ def create_placement(body: dict = Body(...), admin: dict = Depends(require_write
         keep.append({"screen_id": k[0], "other_kind": k[1], "other_id": k[2], "mode": decisions[k]})
     keep = list({_key(d): d for d in keep}.values())
 
-    placement_id = save_placement(db, data, keep, admin.get("username", "admin"))
+    placement_id = save_placement(db, data, keep, actor, placement_id)
     db.commit()
-    return {"id": placement_id}
+    return placement_id
+
+
+@router.post("/placements")
+def create_placement(body: dict = Body(...), admin: dict = Depends(require_write),
+                     db: Session = Depends(get_db)):
+    """
+    Создать показ. Тело — как у предпросмотра плюс "decisions":
+    [{"screen_id", "other_kind", "other_id", "mode"}] — по решению на каждое
+    пересечение из предпросмотра. Не решено хоть одно — 409, ничего не пишем.
+    """
+    return {"id": _save(db, body, admin.get("username", "admin"))}
+
+
+@router.get("/placements")
+def list_placements(playlist_id: int = Query(..., description="Показы этого плейлиста"),
+                    admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    """
+    Показы плейлиста: идущие, затем запланированные, затем закончившиеся и
+    остановленные (внутри — дата начала по убыванию). У каждого — экраны,
+    статус (planned / active / done / stopped) и строки «по очереди»: с каким
+    плейлистом, на каком экране, в какие даты и часы (решения админа по
+    пересечениям, см. placements_logic.alternate_overlaps).
+    """
+    now = now_msk()
+    mine = load_placements(db, date.min, date.max, playlist_id)
+    if not mine:
+        return []
+
+    # Чем показы пересекаются — по всей сети в границах дат этих показов.
+    lo, hi = min(p["date_from"] for p in mine), max(p["date_to"] for p in mine)
+    around = load_placements(db, lo, hi)
+    overrides = load_overrides(db, lo, hi)
+    decisions = load_decisions(db, [p["id"] for p in around])
+    info = _screens_info(db, {sid for p in mine for sid in p["screens"]})
+    screen_names = {sid: name for sid, (name, _) in info.items()}
+
+    rows = [listing_row(p, now, screen_names, alternate_overlaps(p, around, overrides, decisions)) for p in mine]
+    return sort_listing(rows)
+
+
+@router.get("/placements/week")
+def placements_week(screen_id: int = Query(...), start: str = Query(..., description="Понедельник, ГГГГ-ММ-ДД"),
+                    admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    """
+    Неделя экрана для сетки «По датам»: 7 дней × 24 часа = 168 клеток
+    {"date", "hour", "kind", "playlists", "playlist_ids", "placement_id"}.
+    kind: off | placement | alternate | override | template | empty
+    (порядок источников — placements_logic.week_cells).
+    """
+    first = week_start(start)
+    if not db.execute(text("SELECT 1 FROM screens WHERE id = :id"), {"id": screen_id}).first():
+        raise HTTPException(404, "Экран не найден")
+
+    days = [first + timedelta(days=i) for i in range(7)]
+    placements = [p for p in load_placements(db, days[0], days[-1]) if screen_id in p["screens"]]
+    overrides = [o for o in load_overrides(db, days[0], days[-1]) if o["screen_id"] == screen_id]
+    decisions = load_decisions(db, [p["id"] for p in placements])
+    slots = load_screen_slots(db, screen_id)
+    names = load_playlist_names(db, {p["playlist_id"] for p in placements}
+                                | {s["playlist_id"] for s in slots}
+                                | {o["playlist_id"] for o in overrides if o["playlist_id"] is not None})
+    return {"days": [d.isoformat() for d in days],
+            "cells": week_cells(days, screen_id, placements, decisions, overrides, slots, names)}
+
+
+@router.put("/placements/{placement_id}")
+def update_placement(placement_id: int, body: dict = Body(...), admin: dict = Depends(require_write),
+                     db: Session = Depends(get_db)):
+    """
+    Изменить показ: тело и ответ — как у создания. Прошедшая дата начала
+    допустима, если её не меняли; сам показ пересечением не считается.
+    Сохранённый показ становится новейшим (saved_at), его решения по
+    пересечениям записываются заново. Остановленный показ не правится — 409.
+    """
+    current = get_placement(db, placement_id)
+    if current is None:
+        raise HTTPException(404, "Показ не найден")
+    if current["stopped_at"] is not None:
+        raise HTTPException(409, EDIT_STOPPED)
+    return {"id": _save(db, body, admin.get("username", "admin"), placement_id)}
+
+
+@router.post("/placements/{placement_id}/stop")
+def stop_placement_now(placement_id: int, admin: dict = Depends(require_write),
+                       db: Session = Depends(get_db)):
+    """
+    Остановить идущий показ с текущего момента: прошедшие часы остаются в
+    истории, остальные не идут. Не идущий (запланирован, закончился, уже
+    остановлен) — 409.
+    """
+    p = get_placement(db, placement_id)
+    if p is None:
+        raise HTTPException(404, "Показ не найден")
+    now = now_msk()
+    check_stoppable(placement_status(p, now))
+    if not stop_placement(db, p, admin.get("username", "admin"), now):
+        raise HTTPException(409, STOP_ONLY_ACTIVE)     # кто-то остановил между проверкой и записью
+    db.commit()
+    return {"status": "stopped", "stopped_at": now}
+
+
+@router.delete("/placements/{placement_id}")
+def cancel_placement(placement_id: int, admin: dict = Depends(require_write),
+                     db: Session = Depends(get_db)):
+    """Отменить запланированный показ — он удаляется. Идущий или закончившийся — 409."""
+    p = get_placement(db, placement_id)
+    if p is None:
+        raise HTTPException(404, "Показ не найден")
+    check_deletable(placement_status(p, now_msk()))
+    delete_placement(db, p, admin.get("username", "admin"))
+    db.commit()
+    return {"status": "deleted"}

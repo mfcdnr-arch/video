@@ -4,10 +4,11 @@
 в test_placements_store.py; smoke_test.sh на стенде проходит только путь без
 пересечений (предпросмотр и создание).
 """
-from datetime import date
+from datetime import date, datetime
 import pytest
 from fastapi import HTTPException
-from routers.placements import parse_body, parse_decisions, unresolved, summary_text, overflow_notes
+from routers.placements import (parse_body, parse_decisions, unresolved, summary_text, overflow_notes,
+                                week_start, sort_listing, listing_row, check_stoppable, check_deletable)
 
 T = date(2026, 10, 26)
 B = {"playlist_id": 1, "all_screens": False, "screen_ids": [3], "date_from": "2026-11-01",
@@ -81,3 +82,64 @@ def test_overflow_notes():
     same = {**C, "other_playlist_id": 1}                     # тот же плейлист — не «два плейлиста»
     assert overflow_notes([C, other_screen, fits, same], 1, total) == [
         "в 10:00 ролики двух плейлистов занимают 65 мин — в час не помещаются, часть выйдет реже"]
+
+
+# --- неделя, порядок списка, 409 на остановку и отмену -------------------------
+
+def test_week_start_must_be_monday():
+    assert week_start("2026-11-02") == date(2026, 11, 2)
+    with pytest.raises(HTTPException):
+        week_start("2026-11-03")
+
+
+@pytest.mark.parametrize("raw", ["2026-11-03", "2026-11-01", "", "завтра", "2026-13-01", None])
+def test_week_start_rejects_non_monday_and_junk_with_400(raw):
+    with pytest.raises(HTTPException) as e:
+        week_start(raw)
+    assert e.value.status_code == 400
+
+
+def test_sort_listing_active_then_planned_then_finished_each_newest_start_first():
+    def row(id, status, d):
+        return {"id": id, "status": status, "date_from": date(2026, 11, d)}
+    rows = [row(1, "done", 20), row(2, "planned", 3), row(3, "active", 1), row(4, "stopped", 25),
+            row(5, "planned", 9), row(6, "active", 5), row(7, "done", 2)]
+    assert [r["id"] for r in sort_listing(rows)] == [6, 3, 5, 2, 4, 1, 7]
+    assert sort_listing([]) == []
+
+
+def test_listing_row_shape_status_screens_and_alternates():
+    p = {"id": 7, "playlist_id": 10, "playlist_name": "Утро", "all_screens": False, "screens": {3, 1, 9},
+         "date_from": date(2026, 11, 1), "date_to": date(2026, 11, 30), "hour_from": 9, "hour_to": 13,
+         "stopped_at": None, "created_by": "admin", "created_at": datetime(2026, 10, 26, 12, 0)}
+    alt = {"screen_id": 3, "other_kind": "placement", "other_id": 8, "other_playlist_id": 20,
+           "other_playlist_name": "Акция", "date_from": date(2026, 11, 5), "date_to": date(2026, 11, 7),
+           "hour_from": 10, "hour_to": 12}
+    row = listing_row(p, datetime(2026, 11, 3, 10), {1: "Бета", 3: "Альфа"}, [alt])
+    assert row == {
+        "id": 7, "playlist_id": 10, "all_screens": False, "screen_count": 3,
+        "screens": [{"id": 3, "name": "Альфа"}, {"id": 1, "name": "Бета"}, {"id": 9, "name": "Экран #9"}],
+        "date_from": date(2026, 11, 1), "date_to": date(2026, 11, 30), "hour_from": 9, "hour_to": 13,
+        "status": "active",
+        "alternates": [{"screen_name": "Альфа", "other_playlist_name": "Акция", "date_from": date(2026, 11, 5),
+                        "date_to": date(2026, 11, 7), "hour_from": 10, "hour_to": 12}],
+        "created_by": "admin", "created_at": datetime(2026, 10, 26, 12, 0)}
+    assert listing_row(p, datetime(2026, 10, 30, 10), {}, [])["status"] == "planned"
+    assert listing_row({**p, "stopped_at": datetime(2026, 11, 2)}, datetime(2026, 11, 3), {}, [])["status"] == "stopped"
+
+
+def test_check_stoppable_only_active():
+    check_stoppable("active")
+    for status in ("planned", "done", "stopped"):
+        with pytest.raises(HTTPException) as e:
+            check_stoppable(status)
+        assert e.value.status_code == 409 and e.value.detail == "Остановить можно только идущий показ"
+
+
+def test_check_deletable_only_planned():
+    check_deletable("planned")
+    for status in ("active", "done", "stopped"):
+        with pytest.raises(HTTPException) as e:
+            check_deletable(status)
+        assert e.value.status_code == 409
+        assert e.value.detail == "Показ уже идёт или закончился — используйте «Остановить»"

@@ -197,3 +197,93 @@ def template_playlist(slots: list[dict], dow: int, hour: int) -> int | None:
         if group:
             return max(group, key=lambda s: s.get("prio") or 0)["playlist_id"]
     return None
+
+
+# --- недельная сетка и «по очереди» -------------------------------------------
+
+KIND_OFF = "off"
+KIND_ALTERNATE = "alternate"
+KIND_TEMPLATE = "template"
+KIND_EMPTY = "empty"
+
+
+def week_cells(days: list[date], screen_id: int, placements: list[dict], decisions: dict,
+               overrides: list[dict], slots: list[dict], names: dict[int, str]) -> list[dict]:
+    """Что играет на экране `screen_id` в каждый час каждого из `days` (МСК).
+
+    Источники по убыванию приоритета (спека §4.7, без «Эфира сети» — он живёт
+    «сейчас», а не по датам): переопределение «выключен» → показы по датам →
+    переопределение с плейлистом → недельный шаблон → пусто.
+
+    placements — показы (любых экранов; берутся только этого экрана),
+    overrides — переопределения (берутся только этого экрана),
+    slots — слоты шаблона, уже выбранные для этого экрана (см. template_playlist),
+    names — {playlist_id: название}; недостающее берётся из самих показов и
+    переопределений.
+
+    Клетка: {"date", "hour", "kind", "playlists": [названия], "playlist_ids": [id],
+    "placement_id"}. kind: "off" | "placement" | "alternate" (в клетке ≥2
+    плейлиста, они чередуются) | "override" | "template" | "empty".
+    placement_id — новейший из показов, действующих в этот час (иначе None).
+    Порядок клеток: по дням, внутри дня — по часам.
+    """
+    mine = [p for p in placements if screen_id in p["screens"]]
+    override_on = {o["on_date"]: o for o in overrides if o["screen_id"] == screen_id}
+
+    known: dict[int, str | None] = {p["playlist_id"]: p.get("playlist_name") for p in mine}
+    known.update({o["playlist_id"]: o.get("playlist_name") for o in override_on.values()
+                  if o.get("playlist_id") is not None})
+
+    def name_of(playlist_id: int) -> str:
+        return names.get(playlist_id) or known.get(playlist_id) or f"Плейлист #{playlist_id}"
+
+    cells = []
+    for day in days:
+        ov = override_on.get(day)
+        is_off = bool(ov and ov.get("is_off"))
+        for hour in range(24):
+            kind, ids, placement_id = KIND_EMPTY, [], None
+            applicable = [] if is_off else [p for p in mine if applies_at(p, day, hour)]
+            if is_off:
+                kind = KIND_OFF
+            elif applicable:
+                ids = choose_playlists(applicable, decisions, ov, screen_id)
+                placement_id = max(applicable, key=_recency)["id"]
+                kind = KIND_ALTERNATE if len(ids) >= 2 else KIND_PLACEMENT
+            elif ov and ov.get("playlist_id") is not None:
+                kind, ids = KIND_OVERRIDE, [ov["playlist_id"]]
+            else:
+                template_id = template_playlist(slots, day.weekday(), hour)
+                if template_id is not None:
+                    kind, ids = KIND_TEMPLATE, [template_id]
+            cells.append({"date": day, "hour": hour, "kind": kind,
+                          "playlists": [name_of(i) for i in ids], "playlist_ids": ids,
+                          "placement_id": placement_id})
+    return cells
+
+
+def alternate_overlaps(p: dict, others: list[dict], overrides: list[dict], decisions: dict) -> list[dict]:
+    """Пересечения показа `p`, которые админ решил «крутить по очереди».
+
+    Возвращает элементы find_conflicts (экран, другой плейлист, даты и часы
+    пересечения). Решение берётся у того из пары, кто сохранён позже, — как в
+    choose_playlists, где решает новейший показ; поэтому «по очереди» видно в
+    карточках обоих показов. Переопределение «новее» быть не может — его
+    решение лежит у самого p. Пересечение с тем же плейлистом пропускается:
+    сам с собой он не чередуется. `others` может содержать и сам p.
+    """
+    conflicts, _ = find_conflicts(p, others, overrides)
+    by_id = {o["id"]: o for o in others}
+    out = []
+    for c in conflicts:
+        if c["other_playlist_id"] == p["playlist_id"]:
+            continue
+        if c["other_kind"] == KIND_PLACEMENT:
+            other = by_id[c["other_id"]]
+            owner, rest = (p, other) if _recency(p) >= _recency(other) else (other, p)
+            key = (owner["id"], c["screen_id"], KIND_PLACEMENT, rest["id"])
+        else:
+            key = (p["id"], c["screen_id"], KIND_OVERRIDE, c["other_id"])
+        if decisions.get(key) == ALTERNATE:
+            out.append(c)
+    return out

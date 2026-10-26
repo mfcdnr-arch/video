@@ -129,8 +129,99 @@ def load_decisions(db, placement_ids: list[int]) -> dict:
     return {(r.placement_id, r.screen_id, r.other_kind, r.other_id): r.mode for r in rows}
 
 
+def get_placement(db, placement_id: int) -> dict | None:
+    """Один показ без экранов (id, плейлист, даты, часы, stopped_at) или None.
+
+    Хватает для проверки статуса (placements_logic.placement_status) и для
+    записи в журнал при остановке и отмене.
+    """
+    rows = db.execute(text("""
+        SELECT pl.id, pl.playlist_id, p.name AS playlist_name, pl.date_from, pl.date_to,
+               pl.hour_from, pl.hour_to, pl.stopped_at
+        FROM placements pl JOIN playlists p ON p.id = pl.playlist_id
+        WHERE pl.id = :id
+    """), {"id": placement_id}).fetchall()
+    if not rows:
+        return None
+    r = rows[0]
+    return {"id": r.id, "playlist_id": r.playlist_id, "playlist_name": r.playlist_name,
+            "date_from": r.date_from, "date_to": r.date_to,
+            "hour_from": r.hour_from, "hour_to": r.hour_to, "stopped_at": r.stopped_at}
+
+
+def load_screen_slots(db, screen_id: int) -> list[dict]:
+    """Слоты недельного шаблона, которые действуют на экране: его собственные,
+    слоты его группы и общесетевые, с уровнем prio (экран 3 > группа 2 > сеть 1).
+
+    Тот же отбор, что у ленты экрана (routers/screens.py) и симулятора
+    (routers/schedule.py); какой из слотов выбрать на (день, час) решает
+    placements_logic.template_playlist.
+    """
+    rows = db.execute(text("""
+        SELECT ss.day_of_week, ss.hour, ss.playlist_id,
+               CASE WHEN ss.screen_id IS NOT NULL THEN 3
+                    WHEN ss.group_id IS NOT NULL THEN 2 ELSE 1 END AS prio
+        FROM schedule_slots ss
+        WHERE ss.screen_id = :sid
+           OR (ss.screen_id IS NULL AND ss.group_id IS NOT NULL
+               AND ss.group_id = (SELECT group_id FROM screens WHERE id = :sid))
+           OR (ss.screen_id IS NULL AND ss.group_id IS NULL)
+    """), {"sid": screen_id}).fetchall()
+    return [{"day_of_week": r.day_of_week, "hour": r.hour, "playlist_id": r.playlist_id, "prio": r.prio}
+            for r in rows]
+
+
+def load_playlist_names(db, ids) -> dict[int, str]:
+    """{playlist_id: название} для указанных плейлистов."""
+    ids = sorted(set(ids))
+    if not ids:
+        return {}
+    rows = db.execute(text("SELECT id, name FROM playlists WHERE id = ANY(:ids)"), {"ids": ids}).fetchall()
+    return {r.id: r.name for r in rows}
+
+
 def _hh(hour: int) -> str:
     return f"{hour:02d}:00"
+
+
+def _period(date_from: date, date_to: date, hour_from: int, hour_to: int) -> str:
+    return f"{date_from:%d.%m.%Y}–{date_to:%d.%m.%Y}, {_hh(hour_from)}–{_hh(hour_to)}"
+
+
+def _audit(db, title: str, detail: str, actor: str) -> None:
+    db.execute(text("""
+        INSERT INTO audit_log (event_type, title, detail, actor)
+        VALUES ('schedule', :t, :d, :a)
+    """), {"t": title, "d": detail, "a": actor})
+
+
+def _describe(p: dict) -> str:
+    return (f"#{p['id']} «{p['playlist_name']}», "
+            f"{_period(p['date_from'], p['date_to'], p['hour_from'], p['hour_to'])}")
+
+
+def stop_placement(db, p: dict, actor: str, now: datetime | None = None) -> bool:
+    """Остановить показ `p` (из get_placement) с момента `now` (наивное МСК).
+
+    Пишем момент из Python, не NOW() Postgres (см. шапку модуля). Условие
+    «stopped_at IS NULL» не даёт второй остановке (двойной клик, второй
+    админ) сдвинуть уже записанный момент: тогда False и ничего не пишем.
+    Без commit.
+    """
+    now = now or now_msk()
+    updated = db.execute(text("""
+        UPDATE placements SET stopped_at = :now WHERE id = :id AND stopped_at IS NULL
+    """), {"now": now, "id": p["id"]})
+    if not updated.rowcount:
+        return False
+    _audit(db, "Показ: остановлен", f"{_describe(p)}, остановлен {now:%d.%m.%Y %H:%M}", actor)
+    return True
+
+
+def delete_placement(db, p: dict, actor: str) -> None:
+    """Удалить (отменить) показ `p` из get_placement; экраны и решения уходят каскадом. Без commit."""
+    db.execute(text("DELETE FROM placements WHERE id = :id"), {"id": p["id"]})
+    _audit(db, "Показ: отменён", _describe(p), actor)
 
 
 def save_placement(db, data: dict, decisions: list[dict], actor: str,
@@ -183,12 +274,8 @@ def save_placement(db, data: dict, decisions: list[dict], actor: str,
     where = ("на всех экранах сети" if data["all_screens"]
              else f"на {len(data['screens'])} экран(ах)")
     detail = (f"#{placement_id} «{name}» {where}, "
-              f"{data['date_from']:%d.%m.%Y}–{data['date_to']:%d.%m.%Y}, "
-              f"{_hh(data['hour_from'])}–{_hh(data['hour_to'])}")
+              f"{_period(data['date_from'], data['date_to'], data['hour_from'], data['hour_to'])}")
     if decisions:
         detail += f", решений по пересечениям: {len(decisions)}"
-    db.execute(text("""
-        INSERT INTO audit_log (event_type, title, detail, actor)
-        VALUES ('schedule', :t, :d, :a)
-    """), {"t": title, "d": detail, "a": actor})
+    _audit(db, title, detail, actor)
     return placement_id

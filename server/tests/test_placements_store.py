@@ -16,6 +16,7 @@ import placements_store as store
 class _Result:
     def __init__(self, rows):
         self._rows = list(rows)
+        self.rowcount = len(self._rows)        # для UPDATE/DELETE: «затронуто строк» = строк в маршруте
 
     def fetchall(self):
         return self._rows
@@ -191,3 +192,78 @@ def test_edit_placement_bumps_saved_at_keeps_stopped_at_all_screens_has_no_rows(
     assert db.params("INSERT INTO placement_screens") == []
     assert db.params("INSERT INTO placements") == []
     assert db.params("INSERT INTO audit_log")[0]["t"] == "Показ: изменён"
+
+
+# --- чтение одного показа, слоты шаблона, названия -----------------------------
+
+def test_get_placement_and_missing():
+    row = Row(id=4, playlist_id=9, playlist_name="Утро", date_from=D1, date_to=D2, hour_from=9, hour_to=13,
+              stopped_at=None)
+    db = RoutedDB([("FROM placements pl", [row])])
+    assert store.get_placement(db, 4) == {"id": 4, "playlist_id": 9, "playlist_name": "Утро", "date_from": D1,
+                                          "date_to": D2, "hour_from": 9, "hour_to": 13, "stopped_at": None}
+    assert db.params("FROM placements pl") == [{"id": 4}]
+    assert store.get_placement(RoutedDB([]), 4) is None
+
+
+def test_load_screen_slots_keeps_level_priority_for_the_screen():
+    rows = [Row(day_of_week=0, hour=None, playlist_id=1, prio=1), Row(day_of_week=0, hour=9, playlist_id=2, prio=3)]
+    db = RoutedDB([("FROM schedule_slots", rows)])
+    assert store.load_screen_slots(db, 5) == [
+        {"day_of_week": 0, "hour": None, "playlist_id": 1, "prio": 1},
+        {"day_of_week": 0, "hour": 9, "playlist_id": 2, "prio": 3}]
+    (params,) = db.params("FROM schedule_slots")
+    assert params == {"sid": 5}
+    sql = db.calls[0][0]
+    assert "ss.screen_id = :sid" in sql and "ss.group_id IS NOT NULL" in sql and "prio" in sql      # экран / группа экрана / сеть
+
+
+def test_load_playlist_names():
+    db = RoutedDB([("FROM playlists", [Row(id=1, name="Общий"), Row(id=2, name="Утро")])])
+    assert store.load_playlist_names(db, {2, 1, 2}) == {1: "Общий", 2: "Утро"}
+    assert db.params("FROM playlists") == [{"ids": [1, 2]}]
+    empty = RoutedDB([])
+    assert store.load_playlist_names(empty, set()) == {} and empty.calls == []        # без id в БД не ходим
+
+
+# --- остановка и отмена --------------------------------------------------------
+
+PLC = {"id": 8, "playlist_id": 5, "playlist_name": "Утро", "date_from": D1, "date_to": D2,
+       "hour_from": 9, "hour_to": 13, "stopped_at": None}
+NOW = datetime(2026, 11, 1, 10, 37)
+
+
+def test_stop_writes_python_msk_now_only_if_not_stopped_yet_and_audits():
+    db = RoutedDB([("UPDATE placements", [1])])
+    assert store.stop_placement(db, PLC, "admin", NOW) is True
+    (upd,) = db.params("UPDATE placements")
+    assert upd == {"now": NOW, "id": 8}
+    sql = db.calls[0][0]
+    assert "stopped_at = :now" in sql and "stopped_at IS NULL" in sql and "NOW()" not in sql.upper()
+    (audit,) = db.params("INSERT INTO audit_log")
+    assert audit["t"] == "Показ: остановлен" and audit["a"] == "admin"
+    assert "#8" in audit["d"] and "«Утро»" in audit["d"] and "01.11.2026–02.11.2026" in audit["d"] \
+        and "09:00–13:00" in audit["d"] and "01.11.2026 10:37" in audit["d"]
+
+
+def test_stop_already_stopped_by_someone_else_writes_nothing_more():
+    db = RoutedDB([])                                   # UPDATE ничего не затронул
+    assert store.stop_placement(db, PLC, "admin", NOW) is False
+    assert db.params("INSERT INTO audit_log") == []
+
+
+def test_stop_without_now_uses_msk_now():
+    db = RoutedDB([("UPDATE placements", [1])])
+    before = _msk_now_naive()
+    store.stop_placement(db, PLC, "admin")
+    (upd,) = db.params("UPDATE placements")
+    assert upd["now"].tzinfo is None and before <= upd["now"] <= _msk_now_naive()
+
+
+def test_delete_removes_placement_and_audits_cancellation():
+    db = RoutedDB([])
+    store.delete_placement(db, PLC, "admin")
+    assert db.params("DELETE FROM placements") == [{"id": 8}]
+    (audit,) = db.params("INSERT INTO audit_log")
+    assert audit["t"] == "Показ: отменён" and audit["a"] == "admin"
+    assert "#8" in audit["d"] and "«Утро»" in audit["d"] and "09:00–13:00" in audit["d"]

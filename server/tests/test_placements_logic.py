@@ -4,10 +4,11 @@
 Все даты и часы — наивное МСК. Показ: [date_from..date_to] включительно,
 часы [hour_from, hour_to) — полуинтервал.
 """
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from placements_logic import (dates_overlap, hours_overlap, applies_at, placement_status,
-                              find_conflicts, choose_playlists, template_playlist)
+                              find_conflicts, choose_playlists, template_playlist,
+                              week_cells, alternate_overlaps)
 
 
 def P(id, d1, d2, h1, h2, screens, pl=10, stopped=None, saved=None):
@@ -285,3 +286,135 @@ def test_template_prio_within_group_and_other_days_ignored():
     assert template_playlist(slots, 0, 0) == 4          # час 0 — это час, а не «весь день»
     assert template_playlist(slots, 1, 5) is None
     assert template_playlist([], 0, 0) is None
+
+
+# --- недельная сетка ---------------------------------------------------------
+
+DAYS = [date(2026, 11, 2) + timedelta(days=i) for i in range(7)]      # пн 02.11 … вс 08.11
+ALL_DAY_1 = [{"day_of_week": d, "hour": None, "playlist_id": 1, "prio": 1} for d in range(7)]
+
+
+def cells_of(placements, decisions=None, overrides=(), slots=(), names=None, screen_id=5):
+    out = week_cells(DAYS, screen_id, list(placements), decisions or {}, list(overrides), list(slots),
+                     names if names is not None else {})
+    return {(c["date"], c["hour"]): c for c in out}
+
+
+def test_week_cells_priorities():
+    days = [date(2026, 11, 2) + timedelta(days=i) for i in range(7)]
+    pl = [P(1, N1, N30, 9, 13, [5], pl=10)]
+    ovs = [{"id": 9, "screen_id": 5, "on_date": date(2026, 11, 3), "playlist_id": None, "playlist_name": None, "is_off": True}]
+    slots = [{"day_of_week": d, "hour": None, "playlist_id": 1, "prio": 1} for d in range(7)]
+    cells = {(c["date"], c["hour"]): c for c in week_cells(days, 5, pl, {}, ovs, slots, {10: "Утро", 1: "Общий"})}
+    assert cells[(date(2026, 11, 2), 9)]["kind"] == "placement" and cells[(date(2026, 11, 2), 9)]["playlists"] == ["Утро"]
+    assert cells[(date(2026, 11, 2), 13)]["kind"] == "template"
+    assert cells[(date(2026, 11, 3), 9)]["kind"] == "off"
+    assert len(cells) == 168
+    # R1: рядом с названиями — id плейлистов (в том же порядке), по ним UI открывает плейлист
+    assert cells[(date(2026, 11, 2), 9)]["playlist_ids"] == [10]
+    assert cells[(date(2026, 11, 2), 13)]["playlists"] == ["Общий"] and cells[(date(2026, 11, 2), 13)]["playlist_ids"] == [1]
+
+
+def test_week_cells_shape_order_and_placement_id():
+    out = week_cells(DAYS, 5, [P(7, N1, N30, 9, 13, [5], pl=10)], {}, [], [], {10: "Утро"})
+    assert [(c["date"], c["hour"]) for c in out] == [(d, h) for d in DAYS for h in range(24)]   # по дням, внутри — по часам
+    assert all(set(c) == {"date", "hour", "kind", "playlists", "playlist_ids", "placement_id"} for c in out)
+    c = {(c["date"], c["hour"]): c for c in out}
+    assert c[(DAYS[0], 9)]["placement_id"] == 7
+    assert c[(DAYS[0], 8)] == {"date": DAYS[0], "hour": 8, "kind": "empty", "playlists": [],
+                               "playlist_ids": [], "placement_id": None}
+
+
+def test_week_cells_placement_hours_are_half_open_and_dates_inclusive():
+    p = P(1, date(2026, 11, 3), date(2026, 11, 4), 9, 13, [5], pl=10)       # вт 03.11 … ср 04.11, часы 9–12
+    c = cells_of([p], names={10: "Утро"})
+    assert [c[(DAYS[1], h)]["kind"] for h in (8, 9, 12, 13)] == ["empty", "placement", "placement", "empty"]
+    assert [c[(DAYS[2], h)]["kind"] for h in (9, 12, 13)] == ["placement", "placement", "empty"]   # последний день — включительно
+    assert c[(DAYS[0], 10)]["kind"] == "empty" and c[(DAYS[3], 10)]["kind"] == "empty"             # 02.11 и 05.11 вне дат
+
+
+def test_week_cells_other_screen_and_stopped_placements_do_not_show():
+    other_screen = P(1, N1, N30, 9, 13, [6], pl=10)
+    stopped = P(2, N1, N30, 9, 13, [5], pl=20, stopped=datetime(2026, 11, 2, 0, 0))
+    c = cells_of([other_screen, stopped], slots=ALL_DAY_1, names={10: "A", 20: "B", 1: "Общий"})
+    assert c[(DAYS[0], 10)]["kind"] == "template"                                           # шаблон, а не чужой/остановленный показ
+
+
+def test_week_cells_stopped_placement_keeps_finished_hours():
+    p = P(2, N1, N30, 9, 13, [5], pl=20, stopped=datetime(2026, 11, 2, 10, 37))             # остановлен в 10:37
+    c = cells_of([p], slots=ALL_DAY_1, names={20: "B", 1: "Общий"})
+    assert c[(DAYS[0], 9)]["kind"] == "placement" and c[(DAYS[0], 10)]["kind"] == "template"
+    assert c[(DAYS[1], 9)]["kind"] == "template"
+
+
+def test_week_cells_alternate_two_placements_newest_first():
+    older = P(1, N1, N30, 9, 13, [5], pl=10, saved=datetime(2026, 10, 27))
+    newer = P(2, N1, N30, 9, 13, [5], pl=20, saved=datetime(2026, 10, 28))
+    dec = {(2, 5, "placement", 1): "alternate"}
+    cell = cells_of([older, newer], dec, names={10: "Утро", 20: "Акция"})[(DAYS[0], 10)]
+    assert (cell["kind"], cell["playlists"], cell["playlist_ids"], cell["placement_id"]) == \
+        ("alternate", ["Акция", "Утро"], [20, 10], 2)
+    replaced = cells_of([older, newer], {(2, 5, "placement", 1): "replace"}, names={10: "Утро", 20: "Акция"})[(DAYS[0], 10)]
+    assert (replaced["kind"], replaced["playlists"], replaced["placement_id"]) == ("placement", ["Акция"], 2)
+
+
+def test_week_cells_override_with_playlist_and_its_alternate_with_placement():
+    ov = OV(9, 5, DAYS[2], pl=30)
+    c = cells_of([P(1, N1, N30, 9, 13, [5], pl=10)], {(1, 5, "override", 9): "alternate"}, [ov],
+                 ALL_DAY_1, {10: "Утро", 30: "Акция дня", 1: "Общий"})
+    assert (c[(DAYS[2], 15)]["kind"], c[(DAYS[2], 15)]["playlists"], c[(DAYS[2], 15)]["placement_id"]) == \
+        ("override", ["Акция дня"], None)                                                  # переопределение бьёт шаблон
+    both = c[(DAYS[2], 10)]
+    assert (both["kind"], both["playlists"], both["playlist_ids"], both["placement_id"]) == \
+        ("alternate", ["Утро", "Акция дня"], [10, 30], 1)
+    no_decision = cells_of([P(1, N1, N30, 9, 13, [5], pl=10)], {}, [ov], ALL_DAY_1, {10: "Утро", 30: "Акция дня"})
+    assert no_decision[(DAYS[2], 10)]["kind"] == "placement" and no_decision[(DAYS[2], 10)]["playlists"] == ["Утро"]
+
+
+def test_week_cells_override_of_other_screen_or_day_ignored_and_off_beats_placement():
+    ovs = [OV(1, 6, DAYS[0], pl=30), OV(2, 5, DAYS[3], off=True)]
+    c = cells_of([P(1, N1, N30, 9, 13, [5], pl=10)], {}, ovs, [], {10: "Утро", 30: "Чужой"})
+    assert c[(DAYS[0], 10)]["kind"] == "placement"
+    off = c[(DAYS[3], 10)]
+    assert (off["kind"], off["playlists"], off["playlist_ids"], off["placement_id"]) == ("off", [], [], None)
+
+
+def test_week_cells_template_hour_beats_all_day_and_missing_name_has_fallback():
+    slots = [{"day_of_week": 0, "hour": None, "playlist_id": 1, "prio": 3},
+             {"day_of_week": 0, "hour": 9, "playlist_id": 2, "prio": 1}]
+    c = cells_of([], slots=slots, names={1: "Весь день"})
+    assert (c[(DAYS[0], 9)]["kind"], c[(DAYS[0], 9)]["playlist_ids"]) == ("template", [2])
+    assert c[(DAYS[0], 9)]["playlists"] == ["Плейлист #2"]                                  # имени нет в names — не падаем
+    assert c[(DAYS[0], 10)]["playlists"] == ["Весь день"]
+    assert c[(DAYS[1], 9)]["kind"] == "empty"                                              # во вторник слотов нет
+
+
+def test_week_cells_names_fall_back_to_names_inside_placements_and_overrides():
+    c = cells_of([P(1, N1, N30, 9, 13, [5], pl=10)], {(1, 5, "override", 9): "alternate"}, [OV(9, 5, DAYS[0], pl=30)])
+    assert c[(DAYS[0], 10)]["playlists"] == ["PL10", "PL30"]                              # имена из самих показа и переопределения
+
+
+# --- «по очереди» в карточке показа -------------------------------------------
+
+def test_alternate_overlaps_follow_decision_of_the_newer_side():
+    older = P(1, N1, N30, 9, 13, [1, 2], pl=10, saved=datetime(2026, 10, 27))
+    newer = P(2, date(2026, 11, 5), date(2026, 11, 7), 11, 15, [1], pl=20, saved=datetime(2026, 10, 28))
+    dec = {(2, 1, "placement", 1): "alternate"}                    # решение лежит у новейшего (2)
+    from_newer = alternate_overlaps(newer, [older, newer], [], dec)
+    assert [(a["screen_id"], a["other_id"], a["other_playlist_name"], a["date_from"], a["date_to"],
+             a["hour_from"], a["hour_to"]) for a in from_newer] == [(1, 1, "PL10", date(2026, 11, 5), date(2026, 11, 7), 11, 13)]
+    from_older = alternate_overlaps(older, [older, newer], [], dec)    # со стороны старого — то же пересечение
+    assert [(a["screen_id"], a["other_id"], a["other_playlist_name"]) for a in from_older] == [(1, 2, "PL20")]
+    assert alternate_overlaps(older, [older, newer], [], {(2, 1, "placement", 1): "replace"}) == []
+    assert alternate_overlaps(older, [older, newer], [], {}) == []
+
+
+def test_alternate_overlaps_override_stopped_other_and_same_playlist():
+    p = P(1, N1, N30, 9, 13, [1], pl=10, saved=datetime(2026, 10, 28))
+    ov = OV(4, 1, date(2026, 11, 9), pl=30)
+    stopped = P(3, N1, N30, 9, 13, [1], pl=40, stopped=datetime(2026, 11, 1), saved=datetime(2026, 10, 20))
+    twin = P(5, N1, N30, 9, 13, [1], pl=10, saved=datetime(2026, 10, 21))      # тот же плейлист — сам с собой не чередуется
+    dec = {(1, 1, "override", 4): "alternate", (1, 1, "placement", 3): "alternate", (1, 1, "placement", 5): "alternate"}
+    out = alternate_overlaps(p, [p, stopped, twin], [ov], dec)
+    assert [(a["other_kind"], a["other_id"], a["date_from"], a["hour_from"], a["hour_to"]) for a in out] == \
+        [("override", 4, date(2026, 11, 9), 9, 13)]

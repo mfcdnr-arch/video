@@ -98,6 +98,58 @@ if [ -n "${SID:-}" ] && [ -n "${PID:-}" ]; then
   PLC=$(echo "$BODY" | python3 -c "import sys,json;print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
   if [ "$HTTP" = "200" ] && [ -n "$PLC" ]; then ok "показ создан (id=$PLC)"; else bad "создание показа: HTTP $HTTP"; fi
 fi
+if [ -n "${PLC:-}" ]; then
+  # python-проверки над JSON-телом: код возврата 0 — условие выполнено
+  body_has(){ echo "$BODY" | python3 -c "import sys,json; r=json.load(sys.stdin); sys.exit(0 if ($1) else 1)" 2>/dev/null; }
+  msk_monday(){ $DC python3 -c "import datetime as d; t=d.datetime.now(d.timezone(d.timedelta(hours=3))).date()+d.timedelta(days=$1); print(t-d.timedelta(days=t.weekday()-$2))" 2>/dev/null; }
+
+  # список показов плейлиста: новый показ есть, он запланирован на завтра
+  req GET "/placements?playlist_id=$PID"
+  if [ "$HTTP" = "200" ] && body_has "any(x['id']==$PLC and x['status']=='planned' and x['screen_count']==1 for x in r)"; then
+    ok "список показов плейлиста: #$PLC запланирован"; else bad "список показов: HTTP $HTTP"; fi
+
+  # правка: часы 11–13 (дата начала не менялась)
+  req PUT "/placements/$PLC" -H 'Content-Type: application/json' \
+      -d "{\"playlist_id\": $PID, \"all_screens\": false, \"screen_ids\": [$SID], \"date_from\": \"$D1\", \"date_to\": \"$D2\", \"hour_from\": 11, \"hour_to\": 13, \"decisions\": []}"
+  if [ "$HTTP" = "200" ]; then ok "показ изменён (11–13)"; else bad "правка показа: HTTP $HTTP"; fi
+  req GET "/placements?playlist_id=$PID"
+  if [ "$HTTP" = "200" ] && body_has "any(x['id']==$PLC and x['hour_from']==11 and x['hour_to']==13 for x in r)"; then
+    ok "в списке новые часы показа"; else bad "правка не видна в списке"; fi
+
+  # неделя экрана: текущая (168 клеток) и та, где завтрашний показ (виден в клетках 11–12)
+  req GET "/placements/week?screen_id=$SID&start=$(msk_monday 0 0)"
+  if [ "$HTTP" = "200" ] && body_has "len(r['days'])==7 and len(r['cells'])==168"; then
+    ok "неделя экрана: 7 дней, 168 клеток"; else bad "неделя экрана: HTTP $HTTP"; fi
+  req GET "/placements/week?screen_id=$SID&start=$(msk_monday 1 0)"
+  if [ "$HTTP" = "200" ] && body_has "any(c['placement_id']==$PLC and c['kind']=='placement' and c['hour']==11 for c in r['cells'])"; then
+    ok "недельная сетка показывает показ #$PLC"; else bad "в сетке нет показа #$PLC: HTTP $HTTP"; fi
+  req GET "/placements/week?screen_id=$SID&start=$(msk_monday 0 1)"
+  [ "$HTTP" = "400" ] && ok "неделя не с понедельника → 400" || bad "неделя не с понедельника: HTTP $HTTP (ждали 400)"
+
+  # остановить запланированный нельзя
+  req POST "/placements/$PLC/stop"
+  [ "$HTTP" = "409" ] && ok "остановка запланированного показа → 409" || bad "остановка запланированного: HTTP $HTTP (ждали 409)"
+
+  # идущий показ (сегодня, весь день): остановка → статус «stopped», повторная и отмена → 409
+  D0=$(msk_day 0)
+  req POST "/placements" -H 'Content-Type: application/json' \
+      -d "{\"playlist_id\": $PID, \"all_screens\": false, \"screen_ids\": [$SID], \"date_from\": \"$D0\", \"date_to\": \"$D0\", \"hour_from\": 0, \"hour_to\": 24, \"decisions\": []}"
+  PLC2=$(echo "$BODY" | python3 -c "import sys,json;print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+  if [ "$HTTP" = "200" ] && [ -n "$PLC2" ]; then
+    ok "идущий показ создан (id=$PLC2)"
+    req POST "/placements/$PLC2/stop"
+    [ "$HTTP" = "200" ] && ok "идущий показ остановлен" || bad "остановка идущего показа: HTTP $HTTP"
+    req GET "/placements?playlist_id=$PID"
+    if [ "$HTTP" = "200" ] && body_has "any(x['id']==$PLC2 and x['status']=='stopped' for x in r)"; then
+      ok "в списке статус «остановлен»"; else bad "после остановки статус не stopped"; fi
+    req POST "/placements/$PLC2/stop"
+    [ "$HTTP" = "409" ] && ok "повторная остановка → 409" || bad "повторная остановка: HTTP $HTTP (ждали 409)"
+    req DELETE "/placements/$PLC2"
+    [ "$HTTP" = "409" ] && ok "отмена остановленного показа → 409" || bad "отмена остановленного: HTTP $HTTP (ждали 409)"
+  else
+    bad "создание идущего показа: HTTP $HTTP"
+  fi
+fi
 
 # ── 5. Отчёты / биллинг / уведомления доступны ───────────────────────────────
 step "Модули доступны"
@@ -116,7 +168,15 @@ req GET "/reports/fillers";        [ "$HTTP" = "200" ] && ok "отчёт по з
 
 # ── 6. Уборка тестовых данных ────────────────────────────────────────────────
 step "Уборка"
-# Тестовый показ ($PLC) уходит вместе с плейлистом (ON DELETE CASCADE).
+# Запланированный показ ($PLC) отменяем сам; остановленный ($PLC2) уходит
+# вместе с плейлистом (ON DELETE CASCADE).
+if [ -n "${PLC:-}" ]; then
+  req DELETE "/placements/$PLC"
+  if [ "$HTTP" = "200" ]; then ok "запланированный показ отменён"; else bad "отмена показа: HTTP $HTTP"; fi
+  req GET "/placements?playlist_id=$PID"
+  if [ "$HTTP" = "200" ] && ! echo "$BODY" | python3 -c "import sys,json; sys.exit(0 if any(x['id']==$PLC for x in json.load(sys.stdin)) else 1)" 2>/dev/null; then
+    ok "отменённого показа в списке нет"; else bad "отменённый показ остался в списке"; fi
+fi
 [ -n "${PID:-}" ] && req DELETE "/playlists/$PID" && ok "плейлист удалён"
 [ -n "${MID:-}" ] && req DELETE "/media/$MID"      && ok "медиа удалено"
 [ -n "${SID:-}" ] && req DELETE "/minipc/$SID"     && ok "экран удалён"
