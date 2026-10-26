@@ -8,6 +8,10 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+# Celery кладёт /app в sys.path только на время загрузки tasks.py и потом
+# убирает, поэтому импорты внутри задач (ds_notify, routers.*) падали с
+# ModuleNotFoundError. С PYTHONPATH каталог приложения виден всегда.
+ENV PYTHONPATH=/app
 COPY requirements.txt .
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
