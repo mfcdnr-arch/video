@@ -1,11 +1,21 @@
 """
 ds_player.py — управление mpv через IPC Unix-сокет (JSON команды)
 """
+from __future__ import annotations
 import socket, json, time, threading, subprocess, logging, os
 from pathlib import Path
+from typing import Callable
 
 log = logging.getLogger(__name__)
 MPV_SOCKET = '/tmp/ds-mpv.sock'
+
+
+def build_playable(files: list[str], broken: set[str],
+                   exists: Callable[[str], bool]) -> list[str]:
+    """Список для mpv из расписания. Порядок и повторы сохраняются (плейлист ×N,
+    круги заглушек), выкидываются только нерабочие и отсутствующие локально файлы.
+    Логирование отсутствующих делает вызывающий код."""
+    return [f for f in files if f not in broken and exists(f)]
 
 
 class VLCPlayer:

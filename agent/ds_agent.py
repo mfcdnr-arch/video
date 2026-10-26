@@ -82,7 +82,7 @@ log = logging.getLogger("ds_agent")
 # ── Импортируем модули ────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
 from ds_downloader import Downloader
-from ds_player    import VLCPlayer
+from ds_player    import VLCPlayer, build_playable
 from ds_sync      import SyncHandler
 from ds_heartbeat import Heartbeat, AGENT_VERSION
 from ds_cleanup   import Cleanup
@@ -411,16 +411,13 @@ def main():
                 current_playing = None
         elif schedule and display_on:
             files = current_playlist_files(schedule)
-            # Только существующие локально и не помеченные нерабочими
-            playable = []
+            # Предупреждаем о файлах, которых нет локально (build_playable не логирует)
             for fname in files:
-                if fname in broken_files:
-                    continue
-                if not (Path(MEDIA_DIR) / fname).exists():
+                if fname not in broken_files and not (Path(MEDIA_DIR) / fname).exists():
                     log.warning("Файл отсутствует локально: " + fname)
-                    continue
-                if fname not in playable:
-                    playable.append(fname)
+            # Только существующие локально и не помеченные нерабочими; повторы сохраняются
+            playable = build_playable(files, broken_files,
+                                      lambda f: (Path(MEDIA_DIR) / f).exists())
 
             status = player.get_status()
             if playable:
@@ -432,8 +429,8 @@ def main():
                         current_list = playable
                     else:
                         current_list = []
-                        if len(playable) == 1:
-                            # Единственный файл не пошёл — значит, он и нерабочий
+                        if len(set(playable)) == 1:
+                            # Единственный файл (возможно, повторённый ×N) не пошёл — значит, он и нерабочий
                             fname = playable[0]
                             log.warning("Пропускаем нерабочий ролик: " + fname)
                             broken_files.add(fname)
