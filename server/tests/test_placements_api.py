@@ -30,6 +30,13 @@ def test_parse_body_allows_past_date_from_when_unchanged():
 def test_all_screens_needs_no_list():
     assert parse_body({**B, "all_screens": True, "screen_ids": []}, T)["all_screens"] is True
 
+@pytest.mark.parametrize("patch", [{"hour_from": "²"}, {"playlist_id": True}, {"hour_to": 12.5},
+                                   {"screen_ids": ["x"]}, {"date_from": None}])
+def test_parse_body_rejects_junk_values_with_400(patch):
+    with pytest.raises(HTTPException) as e:
+        parse_body({**B, **patch}, T)
+    assert e.value.status_code == 400
+
 
 # --- решения по пересечениям, итоговая фраза, переполнение часа ---------------
 

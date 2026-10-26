@@ -36,8 +36,11 @@ def _int(value) -> int | None:
         return None
     if isinstance(value, int):
         return value
-    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
-        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:          # «²», «9.5», пусто — не целое
+            return None
     return None
 
 
