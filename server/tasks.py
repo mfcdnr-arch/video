@@ -46,6 +46,10 @@ celery_app.conf.update(
             "task": "check_notifications",
             "schedule": 60.0,   # каждую минуту
         },
+        "close-billing-periods": {
+            "task": "close_billing_periods",
+            "schedule": crontab(hour=6, minute=10),   # 06:10 МСК ежедневно
+        },
     },
 )
 
@@ -245,3 +249,51 @@ def archive_play_log():
 
     log.info(f"[playlog-archive] В архив перенесено строк: {moved}")
     return {"archived": moved}
+
+
+@celery_app.task(name="close_billing_periods")
+def close_billing_periods():
+    """
+    Раз в сутки: закрыть расчётные периоды договоров, закончившиеся вчера.
+
+    Что делает: собирает пакет документов за период (эфирная справка, акт,
+    сводный отчёт) и шлёт админу уведомление в MAX с суммой.
+    Чего НЕ делает: не выставляет счёт. Выставление счёта — денежное решение,
+    оно остаётся за человеком; задача снимает ручную работу и напоминание,
+    но не подписывается за администратора.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session as OrmSession
+
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        log.error("[close-periods] DATABASE_URL не задан")
+        return "error: DATABASE_URL is not set"
+
+    engine = create_engine(database_url, pool_pre_ping=True)
+    with OrmSession(engine) as db:
+        from routers.advertiser_docs import close_due_periods
+        closed = close_due_periods(db)
+
+    if not closed:
+        return {"closed": 0}
+
+    lines = ["📄 Закрылись расчётные периоды:"]
+    for c in closed:
+        lines.append(f"• {c['advertiser']} (договор {c['contract']}): "
+                     f"{c['period_start']}—{c['period_end']}, {c['plays']} выходов, "
+                     f"{c['amount']:.2f} ₽"
+                     + ("" if c["documents"] else f" — документы НЕ собраны: {c['problem']}"))
+    lines.append("Счёт не выставлен: закройте период в разделе «Биллинг».")
+    try:
+        from ds_notify import send_max_message
+        from sqlalchemy import text as sql_text
+        with OrmSession(engine) as db:
+            s = db.execute(sql_text("SELECT * FROM notification_settings WHERE id = 1")).mappings().first()
+        if s and s["enabled"] and s["max_token"] and s["max_chat_id"]:
+            send_max_message(s["base_url"], s["max_token"], s["max_chat_id"], "\n".join(lines))
+    except Exception as e:
+        log.warning(f"[close-periods] уведомление не отправлено: {e}")
+
+    log.info(f"[close-periods] закрыто периодов: {len(closed)}")
+    return {"closed": len(closed), "items": closed}

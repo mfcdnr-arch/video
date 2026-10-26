@@ -571,6 +571,18 @@ def generate_documents(aid: int, body: dict = Body(...), admin: dict = Depends(r
                 "hint": "Документы за этот период уже сформированы. "
                         "Чтобы собрать новую версию, включите пересборку."}
 
+    return {"status": "ok", "reused": False,
+            "documents": build_period_documents(db, adv, d_from, d_to, admin["username"])}
+
+
+def build_period_documents(db: Session, adv, d_from: date, d_to: date, actor: str) -> list:
+    """
+    Собрать пакет документов за период. Вынесено отдельно, потому что этим
+    занимаются двое: администратор кнопкой и ночная задача автозакрытия
+    периода по договору — расхождение в их логике сразу дало бы разные
+    документы за один и тот же период.
+    """
+    aid = adv.id
     company = db.execute(text("SELECT * FROM company_settings WHERE id = 1")).mappings().first()
     company = dict(company) if company else {}
     if not company.get("legal_name") and not company.get("short_name"):
@@ -593,11 +605,11 @@ def generate_documents(aid: int, body: dict = Body(...), admin: dict = Depends(r
     from routers.advertiser_office import advertiser_delivery
     try:
         delivery = advertiser_delivery(date_from=d_from.isoformat(), date_to=d_to.isoformat(),
-                                       aid=aid, admin=admin, db=db)
+                                       aid=aid, admin={"username": actor}, db=db)
     except HTTPException:
         delivery = None
 
-    who = admin["username"]
+    who = actor
     docs = []
     num_air = _next_number(db, aid, "airtime", d_to)
     docs.append(_store(db, aid, "airtime", "pdf", d_from, d_to, num_air,
@@ -618,7 +630,7 @@ def generate_documents(aid: int, body: dict = Body(...), admin: dict = Depends(r
         VALUES ('billing', 'Сформированы документы', :d, :who)
     """), {"d": f"{adv.name}: {_fmt_period(d_from, d_to)}", "who": who})
     db.commit()
-    return {"status": "ok", "reused": False, "documents": docs}
+    return docs
 
 
 @router.get("/advertisers/{aid}/documents/{doc_id}/download")
@@ -890,3 +902,217 @@ def compensation_decide(aid: int, body: dict = Body(...), admin: dict = Depends(
            "who": admin["username"]})
     db.commit()
     return dict(row._mapping)
+
+
+# ─── Заявки на размещение ───────────────────────────────────────────────────
+# Рекламодатель оставляет заявку («хочу N выходов в такой-то период на таких-то
+# экранах»), администратор подтверждает и одним действием превращает её в
+# кампанию. Смысл — убрать переписку в почте: условия и решение видны в системе.
+
+@router.get("/placement-requests")
+def list_requests(status: str = Query(None), admin: dict = Depends(get_current_admin),
+                  db: Session = Depends(get_db)):
+    """Все заявки (для администратора). Рекламодатель свои видит через кабинет."""
+    where, params = "", {}
+    if status:
+        where = "WHERE r.status = :st"
+        params["st"] = status
+    rows = db.execute(text(f"""
+        SELECT r.*, a.name AS advertiser
+        FROM placement_requests r JOIN advertisers a ON a.id = r.advertiser_id
+        {where}
+        ORDER BY CASE WHEN r.status = 'new' THEN 0 ELSE 1 END, r.created_at DESC
+    """), params).fetchall()
+    return [dict(x._mapping) for x in rows]
+
+
+@router.get("/advertisers/{aid}/requests")
+def list_own_requests(aid: int = Depends(advertiser_scope),
+                      admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    rows = db.execute(text("""
+        SELECT * FROM placement_requests WHERE advertiser_id = :aid
+        ORDER BY created_at DESC
+    """), {"aid": aid}).fetchall()
+    return [dict(x._mapping) for x in rows]
+
+
+@router.post("/advertisers/{aid}/requests")
+def create_request(body: dict = Body(...), aid: int = Depends(advertiser_scope),
+                   admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    """
+    Создать заявку. Доступно и рекламодателю (в своём кабинете), и
+    администратору — заявка от лица клиента по звонку.
+    """
+    _get_advertiser(db, aid)
+    d_from, d_to = _period(body.get("date_from"), body.get("date_to"))
+    screens = (body.get("screens") or "").strip() or None
+    if screens:
+        # только числа через запятую — строку потом разбирает кампания
+        parts = [p.strip() for p in screens.split(",") if p.strip()]
+        if not all(p.isdigit() for p in parts):
+            raise HTTPException(400, "screens: список id экранов через запятую")
+        screens = ",".join(parts)
+    row = db.execute(text("""
+        INSERT INTO placement_requests
+            (advertiser_id, period_start, period_end, screens, plays_wanted, comment, created_by)
+        VALUES (:aid, :df, :dt, :scr, :pw, :cm, :who)
+        RETURNING *
+    """), {"aid": aid, "df": d_from, "dt": d_to, "scr": screens,
+           "pw": int(body.get("plays_wanted") or 0) or None,
+           "cm": (body.get("comment") or "").strip() or None,
+           "who": admin["username"]}).fetchone()
+    db.execute(text("""
+        INSERT INTO audit_log (event_type, title, detail, actor)
+        VALUES ('billing', 'Заявка на размещение', :d, :who)
+    """), {"d": f"{_fmt_period(d_from, d_to)}", "who": admin["username"]})
+    db.commit()
+    return dict(row._mapping)
+
+
+@router.post("/placement-requests/{req_id}/decide")
+def decide_request(req_id: int, body: dict = Body(...), admin: dict = Depends(require_write),
+                   db: Session = Depends(get_db)):
+    """
+    Решение по заявке. approve=true и указан target_plays_per_day — заявка
+    сразу превращается в кампанию, чтобы не заводить её вторым действием
+    руками и не разойтись в цифрах с тем, что попросил клиент.
+    """
+    req = db.execute(text("SELECT * FROM placement_requests WHERE id = :id"),
+                     {"id": req_id}).mappings().first()
+    if not req:
+        raise HTTPException(404, "Заявка не найдена")
+    if req["status"] != "new":
+        raise HTTPException(409, "По заявке уже принято решение")
+
+    approve = bool(body.get("approve"))
+    note = (body.get("note") or "").strip() or None
+    campaign_id = None
+    status = "approved" if approve else "declined"
+
+    if approve:
+        days = (req["period_end"] - req["period_start"]).days + 1
+        per_day = body.get("target_plays_per_day")
+        if per_day in (None, "", 0):
+            # Не указали — раскладываем пожелание клиента равномерно по дням
+            per_day = max(1, round((req["plays_wanted"] or 0) / days)) if req["plays_wanted"] else None
+        if per_day:
+            adv_name = db.execute(text("SELECT name FROM advertisers WHERE id = :id"),
+                                  {"id": req["advertiser_id"]}).scalar()
+            row = db.execute(text("""
+                INSERT INTO campaigns (advertiser_id, name, date_from, date_to,
+                                       target_plays_per_day, note)
+                VALUES (:aid, :n, :df, :dt, :tp, :note)
+                RETURNING id
+            """), {"aid": req["advertiser_id"],
+                   "n": f"{adv_name}: {req['period_start']:%d.%m}—{req['period_end']:%d.%m}",
+                   "df": req["period_start"], "dt": req["period_end"],
+                   "tp": int(per_day),
+                   "note": f"Создана по заявке №{req_id}"}).fetchone()
+            campaign_id = row[0]
+            status = "campaign"
+
+    db.execute(text("""
+        UPDATE placement_requests
+        SET status = :st, campaign_id = :cid, decided_by = :who, decided_at = NOW(),
+            decision_note = :note
+        WHERE id = :id
+    """), {"st": status, "cid": campaign_id, "who": admin["username"], "note": note, "id": req_id})
+    db.execute(text("""
+        INSERT INTO audit_log (event_type, title, detail, actor)
+        VALUES ('billing', :t, :d, :who)
+    """), {"t": "Заявка одобрена" if approve else "Заявка отклонена",
+           "d": f"№{req_id}" + (f" → кампания №{campaign_id}" if campaign_id else ""),
+           "who": admin["username"]})
+    db.commit()
+    return {"status": status, "campaign_id": campaign_id}
+
+
+# ─── Расчётные периоды договора ─────────────────────────────────────────────
+
+def period_ended_on(contract: dict, day: date):
+    """
+    Если на дату `day` заканчивается расчётный период договора — вернуть его
+    границы, иначе None.
+
+    Календарный месяц: период кончается в последний день месяца. Произвольный:
+    сетка period_days от period_anchor — так закрывается «каждые 30 дней от
+    15 марта», как записано в договоре, а не как удобно календарю.
+    """
+    start = contract.get("valid_from") or contract.get("period_anchor")
+    kind = contract.get("period_kind") or "month"
+    if kind == "month":
+        nxt = (day.replace(day=1) + timedelta(days=32)).replace(day=1)
+        if day == nxt - timedelta(days=1):
+            return day.replace(day=1), day
+        return None
+    days = int(contract.get("period_days") or 0)
+    anchor = contract.get("period_anchor") or start
+    if not days or not anchor or day < anchor:
+        return None
+    delta = (day - anchor).days + 1
+    if delta % days:
+        return None
+    p_start = day - timedelta(days=days - 1)
+    return p_start, day
+
+
+def close_due_periods(db: Session, on_day: date = None) -> list:
+    """
+    Закрыть расчётные периоды, завершившиеся `on_day` (по умолчанию вчера):
+    собрать документы и вернуть список для уведомления.
+
+    Счёт НЕ выставляется автоматически: это денежное решение, оно остаётся за
+    человеком (та же логика, что у компенсаций). Задача экономит ручную
+    сборку документов и напоминает, что период пора закрывать.
+    """
+    on_day = on_day or (datetime.utcnow() + timedelta(hours=3)).date() - timedelta(days=1)
+    rows = db.execute(text("""
+        SELECT c.*, a.name AS advertiser_name, COALESCE(a.kind, 'advertiser') AS adv_kind
+        FROM contracts c JOIN advertisers a ON a.id = c.advertiser_id
+        WHERE c.is_active
+          AND (c.valid_from IS NULL OR c.valid_from <= :d)
+          AND (c.valid_to IS NULL OR c.valid_to >= :d)
+    """), {"d": on_day}).mappings().all()
+
+    closed = []
+    for c in rows:
+        if c["adv_kind"] == "gov":
+            continue                      # госорганам счета не выставляются
+        period = period_ended_on(dict(c), on_day)
+        if not period:
+            continue
+        d_from, d_to = period
+        already = db.execute(text("""
+            SELECT COUNT(*) FROM advertiser_documents
+            WHERE advertiser_id = :aid AND period_start = :df AND period_end = :dt
+        """), {"aid": c["advertiser_id"], "df": d_from, "dt": d_to}).scalar()
+        if already:
+            continue
+        adv = _get_advertiser(db, c["advertiser_id"])
+        facts = _period_facts(db, adv.id, d_from, d_to)
+        _, amount = _amount_for(db, adv, facts["plays"], facts["minutes"])
+        try:
+            build_period_documents(db, adv, d_from, d_to, "celery")
+            docs_ok = True
+        except HTTPException as e:
+            # Чаще всего — не заполнены реквизиты организации. Период всё равно
+            # закрылся, поэтому уведомить надо, просто без документов.
+            docs_ok = False
+            log_detail = e.detail
+        closed.append({
+            "advertiser_id": adv.id, "advertiser": c["advertiser_name"],
+            "contract": c["number"],
+            "period_start": d_from.isoformat(), "period_end": d_to.isoformat(),
+            "plays": facts["plays"], "minutes": facts["minutes"], "amount": amount,
+            "documents": docs_ok,
+            "problem": None if docs_ok else log_detail,
+        })
+    return closed
+
+
+@router.post("/billing/close-periods")
+def close_periods_now(body: dict = Body({}), admin: dict = Depends(require_write),
+                      db: Session = Depends(get_db)):
+    """Ручной запуск автозакрытия (та же логика, что у ночной задачи)."""
+    day = _parse_date(body["day"], "day") if body.get("day") else None
+    return {"closed": close_due_periods(db, day)}
