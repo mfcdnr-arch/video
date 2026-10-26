@@ -1,7 +1,8 @@
 """API показов (server/routers/placements.py): разбор и проверка тела запроса.
 
-Чистые функции роутера, БД не нужна. SQL-часть (placements_store) проверяется
-smoke_test.sh на живом стенде.
+Чистые функции роутера, БД не нужна. Разбор строк БД (placements_store) —
+в test_placements_store.py; smoke_test.sh на стенде проходит только путь без
+пересечений (предпросмотр и создание).
 """
 from datetime import date
 import pytest

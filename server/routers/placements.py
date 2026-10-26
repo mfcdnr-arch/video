@@ -7,8 +7,13 @@
 хоть одно пересечение не решено, нельзя (409).
 
 Чистые функции (parse_body, parse_decisions, unresolved, summary_text,
-overflow_notes) проверяются в tests/test_placements_api.py; SQL — в
-placements_store, его проверяет smoke_test.sh на живом стенде.
+overflow_notes) проверяются в tests/test_placements_api.py. SQL живёт в
+placements_store: разбор строк (развёртывание групп и «всех экранов»,
+приоритет экрана над группой, наивные МСК-даты, запись saved_at) — в
+tests/test_placements_store.py на фейковой БД. smoke_test.sh на живом
+стенде проходит только путь без пересечений: предпросмотр и создание
+показа на новом экране; ветки с пересечениями, 409 и решениями им не
+покрыты.
 """
 from datetime import date
 from typing import Callable
