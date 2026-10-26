@@ -2,7 +2,8 @@
 # smoke_test.sh — быстрый прогон ключевых сценариев ПЕРЕД каждым релизом.
 # Запускать на сервере после `install_server.sh` / обновления.
 # Проверяет: все контейнеры живы, вход, здоровье API, полный цикл
-# «экран → медиа → плейлист → расписание», отчёты, биллинг, уведомления.
+# «экран → медиа → плейлист → расписание», показ по датам, отчёты, биллинг,
+# уведомления.
 # Все тестовые данные создаются с префиксом SMOKE_ и удаляются в конце.
 #
 # Использование:   bash smoke_test.sh
@@ -82,6 +83,22 @@ if [ -n "$SID" ] && [ -n "$PID" ]; then
   [ "$HTTP" = "200" ] && ok "слот расписания назначен" || bad "назначение слота: HTTP $HTTP"
 fi
 
+# ── 4а. Показ по датам: предпросмотр и создание ─────────────────────────────
+step "Показ по датам"
+if [ -n "${SID:-}" ] && [ -n "${PID:-}" ]; then
+  # Даты — завтра и послезавтра по МСК, считаем внутри ds_api (python там есть
+  # всегда, а `date -d` на macOS-стенде не работает).
+  msk_day(){ $DC python3 -c "import datetime as d; print(d.datetime.now(d.timezone(d.timedelta(hours=3))).date() + d.timedelta(days=$1))" 2>/dev/null; }
+  D1=$(msk_day 1); D2=$(msk_day 2)
+  PLC_JSON="\"playlist_id\": $PID, \"all_screens\": false, \"screen_ids\": [$SID], \"date_from\": \"$D1\", \"date_to\": \"$D2\", \"hour_from\": 10, \"hour_to\": 12"
+  req POST "/placements/preview" -H 'Content-Type: application/json' -d "{$PLC_JSON}"
+  SUMMARY=$(echo "$BODY" | python3 -c "import sys,json;print(json.load(sys.stdin).get('summary',''))" 2>/dev/null)
+  if [ "$HTTP" = "200" ] && [ -n "$SUMMARY" ]; then ok "предпросмотр показа: $SUMMARY"; else bad "предпросмотр показа: HTTP $HTTP"; fi
+  req POST "/placements" -H 'Content-Type: application/json' -d "{$PLC_JSON, \"decisions\": []}"
+  PLC=$(echo "$BODY" | python3 -c "import sys,json;print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+  if [ "$HTTP" = "200" ] && [ -n "$PLC" ]; then ok "показ создан (id=$PLC)"; else bad "создание показа: HTTP $HTTP"; fi
+fi
+
 # ── 5. Отчёты / биллинг / уведомления доступны ───────────────────────────────
 step "Модули доступны"
 req GET "/dashboard";              [ "$HTTP" = "200" ] && ok "дашборд" || bad "дашборд: HTTP $HTTP"
@@ -99,6 +116,7 @@ req GET "/reports/fillers";        [ "$HTTP" = "200" ] && ok "отчёт по з
 
 # ── 6. Уборка тестовых данных ────────────────────────────────────────────────
 step "Уборка"
+# Тестовый показ ($PLC) уходит вместе с плейлистом (ON DELETE CASCADE).
 [ -n "${PID:-}" ] && req DELETE "/playlists/$PID" && ok "плейлист удалён"
 [ -n "${MID:-}" ] && req DELETE "/media/$MID"      && ok "медиа удалено"
 [ -n "${SID:-}" ] && req DELETE "/minipc/$SID"     && ok "экран удалён"
