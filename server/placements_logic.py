@@ -1,0 +1,185 @@
+"""Логика показов: даты, часы, статусы, пересечения, выбор плейлистов.
+
+Чистая логика на stdlib, без БД и без fastapi: на вход — простые dict,
+на выход — списки и кортежи. Её используют API показов (создание/правка,
+проверка пересечений) и лента экрана (какой плейлист играть в этот час).
+
+Все даты и часы — наивное московское время (МСК). Показ действует на днях
+[date_from .. date_to] ВКЛЮЧИТЕЛЬНО и в часах [hour_from, hour_to) —
+полуинтервал, hour_to может быть 24.
+
+Структуры (dict):
+  показ          id, playlist_id, playlist_name, date_from, date_to,
+                 hour_from, hour_to, stopped_at (datetime | None), screens (set[int])
+  переопределение id, screen_id, on_date, playlist_id, playlist_name, is_off
+                 (групповые переопределения уже развёрнуты по экранам)
+  решения        {(placement_id, screen_id, other_kind, other_id): "replace" | "alternate"},
+                 other_kind — "placement" или "override"
+
+Пересечение показов админ разрешает отдельно для каждого экрана:
+«replace» — новый показ вытесняет старый, «alternate» — оба играют по
+очереди в общем часу. Недельный шаблон пересечением не считается.
+"""
+from datetime import date, datetime, time, timedelta
+
+REPLACE = "replace"
+ALTERNATE = "alternate"
+
+KIND_PLACEMENT = "placement"
+KIND_OVERRIDE = "override"
+
+_HOUR = timedelta(hours=1)
+
+
+# --- даты, часы, действие показа ---------------------------------------------
+
+def dates_overlap(a_from: date, a_to: date, b_from: date, b_to: date) -> tuple[date, date] | None:
+    """Общие дни двух диапазонов (границы включительно) или None."""
+    lo, hi = max(a_from, b_from), min(a_to, b_to)
+    return (lo, hi) if lo <= hi else None
+
+
+def hours_overlap(a_from: int, a_to: int, b_from: int, b_to: int) -> tuple[int, int] | None:
+    """Общие часы двух полуинтервалов [from, to) или None; (9,13) и (13,15) не пересекаются."""
+    lo, hi = max(a_from, b_from), min(a_to, b_to)
+    return (lo, hi) if lo < hi else None
+
+
+def applies_at(p: dict, day: date, hour: int) -> bool:
+    """Играет ли показ p в час `hour` дня `day` (МСК).
+
+    У остановленного показа остаются только часы, которые закончились не
+    позже stopped_at: остановка в 10:37 гасит час 10–11, а 9–10 остаётся.
+    """
+    if not (p["date_from"] <= day <= p["date_to"]):
+        return False
+    if not (p["hour_from"] <= hour < p["hour_to"]):
+        return False
+    stopped_at = p.get("stopped_at")
+    if stopped_at is not None:
+        return datetime.combine(day, time(hour)) + _HOUR <= stopped_at
+    return True
+
+
+def placement_status(p: dict, now: datetime) -> str:
+    """"stopped" | "done" | "planned" | "active" на момент now (МСК)."""
+    if p.get("stopped_at") is not None:
+        return "stopped"
+    today = now.date()
+    if today > p["date_to"] or (today == p["date_to"] and now.hour >= p["hour_to"]):
+        return "done"
+    if today < p["date_from"]:
+        return "planned"
+    return "active"
+
+
+# --- пересечения -------------------------------------------------------------
+
+def find_conflicts(new: dict, others: list[dict], overrides: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Что пересекается с новым показом `new`.
+
+    Возвращает (пересечения, выключенные дни):
+      пересечения — по одному на экран и на пересекающийся показ/переопределение:
+        {"screen_id", "other_kind", "other_id", "other_playlist_id",
+         "other_playlist_name", "date_from", "date_to", "hour_from", "hour_to"}
+        даты и часы — само пересечение; переопределение с плейлистом занимает
+        весь день, поэтому его часы равны часам нового показа;
+      выключенные дни — переопределения is_off в днях нового показа:
+        {"screen_id", "on_date"} (это не выбор replace/alternate, а предупреждение).
+
+    Пропускаются остановленные показы и сам редактируемый показ (тот же id).
+    Экраны в `screens` уже развёрнуты вызывающим (в т.ч. для «всех экранов»).
+    Порядок: по screen_id, затем по дате.
+    """
+    new_id = new.get("id")
+    new_screens = new["screens"]
+    conflicts: list[dict] = []
+
+    for other in others:
+        if other.get("stopped_at") is not None:
+            continue
+        if new_id is not None and other.get("id") == new_id:
+            continue
+        common = new_screens & other["screens"]
+        if not common:
+            continue
+        dates = dates_overlap(new["date_from"], new["date_to"], other["date_from"], other["date_to"])
+        hours = hours_overlap(new["hour_from"], new["hour_to"], other["hour_from"], other["hour_to"])
+        if dates is None or hours is None:
+            continue
+        for screen_id in common:
+            conflicts.append({
+                "screen_id": screen_id, "other_kind": KIND_PLACEMENT, "other_id": other["id"],
+                "other_playlist_id": other["playlist_id"], "other_playlist_name": other["playlist_name"],
+                "date_from": dates[0], "date_to": dates[1],
+                "hour_from": hours[0], "hour_to": hours[1],
+            })
+
+    off_days: list[dict] = []
+    for ov in overrides:
+        if ov["screen_id"] not in new_screens:
+            continue
+        if not (new["date_from"] <= ov["on_date"] <= new["date_to"]):
+            continue
+        if ov.get("is_off"):
+            off_days.append({"screen_id": ov["screen_id"], "on_date": ov["on_date"]})
+        elif ov.get("playlist_id") is not None:
+            conflicts.append({
+                "screen_id": ov["screen_id"], "other_kind": KIND_OVERRIDE, "other_id": ov["id"],
+                "other_playlist_id": ov["playlist_id"], "other_playlist_name": ov.get("playlist_name"),
+                "date_from": ov["on_date"], "date_to": ov["on_date"],
+                "hour_from": new["hour_from"], "hour_to": new["hour_to"],
+            })
+
+    conflicts.sort(key=lambda c: (c["screen_id"], c["date_from"]))
+    off_days.sort(key=lambda d: (d["screen_id"], d["on_date"]))
+    return conflicts, off_days
+
+
+# --- выбор плейлистов --------------------------------------------------------
+
+def choose_playlists(applicable: list[dict], decisions: dict, override: dict | None, screen_id: int) -> list[int]:
+    """Какие плейлисты играют на экране `screen_id` в конкретный час.
+
+    applicable — показы, действующие в этот час на этом экране;
+    override   — переопределение экрана на этот день (или None).
+
+    Новейший показ (max id) идёт первым. Старшие показы и переопределение
+    с плейлистом (не is_off) добавляются только если у новейшего на них
+    стоит решение "alternate" — по очереди после него. Без решения или
+    при "replace" они вытеснены. Без повторов playlist_id.
+    Пусто, если applicable пуст.
+    """
+    if not applicable:
+        return []
+    ordered = sorted(applicable, key=lambda p: p["id"], reverse=True)   # новейший первым
+    newest = ordered[0]
+
+    def alternates(kind: str, other_id: int) -> bool:
+        return decisions.get((newest["id"], screen_id, kind, other_id)) == ALTERNATE
+
+    chosen = [newest["playlist_id"]]
+    for older in ordered[1:]:
+        if alternates(KIND_PLACEMENT, older["id"]):
+            chosen.append(older["playlist_id"])
+    if override and not override.get("is_off") and override.get("playlist_id") is not None \
+            and alternates(KIND_OVERRIDE, override["id"]):
+        chosen.append(override["playlist_id"])
+
+    return list(dict.fromkeys(chosen))   # без повторов, порядок сохраняется
+
+
+# --- недельный шаблон --------------------------------------------------------
+
+def template_playlist(slots: list[dict], dow: int, hour: int) -> int | None:
+    """Плейлист недельного шаблона для дня недели `dow` и часа `hour`.
+
+    slots: {"day_of_week", "hour" (None — весь день), "playlist_id", "prio"}.
+    Почасовой слот приоритетнее «весь день»; внутри группы — больший prio.
+    """
+    day_slots = [s for s in slots if s["day_of_week"] == dow]
+    for group in ([s for s in day_slots if s.get("hour") == hour],
+                  [s for s in day_slots if s.get("hour") is None]):
+        if group:
+            return max(group, key=lambda s: s.get("prio") or 0)["playlist_id"]
+    return None
