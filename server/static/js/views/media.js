@@ -199,7 +199,7 @@ async function runMediaSearch(q){
     rows.forEach(m => {
       h += `<div class="cell" style="display:flex;align-items:center;gap:10px;margin-bottom:6px;${m.advertiser_id?'cursor:pointer;':''}"
         ${m.advertiser_id?`data-action="media-open-adv" data-adv-id="${m.advertiser_id}" data-adv-name="${esc(m.advertiser||'')}"`:''}>
-        <div style="width:64px;height:36px;flex-shrink:0;background:var(--bg2);border-radius:5px;overflow:hidden;position:relative;">
+        <div ${mprevAttrs(m.id, m.title||m.filename)} style="width:64px;height:36px;flex-shrink:0;background:var(--bg2);border-radius:5px;overflow:hidden;position:relative;">
           <img src="${API}/media/${m.id}/thumbnail" alt="" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;" onerror="this.remove()">
         </div>
         <div style="flex:1;min-width:0;">
@@ -362,7 +362,7 @@ async function openAdv(id, name){
     h += '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr));">';
     files.forEach(f => {
       h += `<div class="cell" style="padding:0;overflow:hidden;">
-        <div style="height:88px;background:var(--bg2);display:flex;align-items:center;justify-content:center;color:#454b57;font-size:26px;position:relative;">
+        <div ${f.status==='document' ? '' : mprevAttrs(f.id, f.title||f.filename)} style="height:88px;background:var(--bg2);display:flex;align-items:center;justify-content:center;color:#454b57;font-size:26px;position:relative;">
           ${f.status==='document'
             // У документа миниатюры нет и быть не может — запрос за ней давал
             // 404 в консоли на каждую карточку. Рисуем расширение файла.
@@ -616,7 +616,7 @@ async function openCommonMedia(folderId){
     h += '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr));">';
     files.forEach(f => {
       h += `<div class="cell" style="padding:0;overflow:hidden;">
-        <div style="height:88px;background:var(--bg2);display:flex;align-items:center;justify-content:center;color:#454b57;font-size:26px;position:relative;">
+        <div ${mprevAttrs(f.id, f.title||f.filename)} style="height:88px;background:var(--bg2);display:flex;align-items:center;justify-content:center;color:#454b57;font-size:26px;position:relative;">
           <img src="${API}/media/${f.id}/thumbnail" alt=""
                style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;"
                onerror="this.remove()">▶
@@ -699,7 +699,7 @@ async function openFillers(){
     h += '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr));">';
     d.items.forEach(f => {
       h += `<div class="cell" style="padding:0;overflow:hidden;">
-        <div style="height:88px;background:var(--bg2);display:flex;align-items:center;justify-content:center;color:#454b57;font-size:26px;position:relative;">
+        <div ${mprevAttrs(f.id, f.title||f.filename)} style="height:88px;background:var(--bg2);display:flex;align-items:center;justify-content:center;color:#454b57;font-size:26px;position:relative;">
           <img src="${API}/media/${f.id}/thumbnail" alt=""
                style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;"
                onerror="this.remove()">▶
@@ -794,6 +794,12 @@ async function bulkDeleteMedia(){
   }
   toast('Удалено: ' + ok + (fail ? (', ошибок: ' + fail) : ''));
   MEDIA_ADV ? openAdv(MEDIA_ADV.id, MEDIA_ADV.name) : viewMedia();
+}
+
+// Атрибуты миниатюры, по клику на которую открывается просмотр ролика
+// (обработчик — js/views/media-preview.js).
+function mprevAttrs(id, title){
+  return `class="mprev-open" data-action="mprev-open" data-media-id="${id}" role="button" tabindex="0" title="Просмотр" aria-label="Просмотр: ${esc(title||'')}"`;
 }
 
 function fmtSize(b){ if(!b) return '—'; const mb = b/1048576; return mb>1024?(mb/1024).toFixed(1)+' ГБ':mb.toFixed(0)+' МБ'; }

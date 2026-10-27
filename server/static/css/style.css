@@ -87,7 +87,7 @@
   .banner.on{background:#15241f;border:1px solid var(--accent2);}
   .banner.off{background:var(--panel);border:0.5px solid var(--border2);}
   .empty{color:var(--muted);font-size:13px;padding:30px 0;text-align:center;}
-  .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#fff;color:#111418;padding:10px 18px;border-radius:8px;font-size:13px;font-weight:500;box-shadow:0 6px 24px rgba(0,0,0,.4);opacity:0;transition:opacity .2s;z-index:99;}
+  .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#fff;color:#111418;padding:10px 18px;border-radius:8px;font-size:13px;font-weight:500;box-shadow:0 6px 24px rgba(0,0,0,.4);opacity:0;transition:opacity .2s;z-index:5000;pointer-events:none;}
   .toast.show{opacity:1;}
   .login{max-width:340px;margin:14vh auto;background:var(--panel);border:0.5px solid var(--border2);border-radius:12px;padding:26px;}
   .tickprev{position:relative;height:120px;background:linear-gradient(135deg,#1b1e25,#0e1014);border:0.5px solid var(--border2);border-radius:10px;overflow:hidden;display:flex;align-items:center;justify-content:center;}
@@ -95,3 +95,39 @@
   .tickrun{display:inline-block;padding-left:100%;animation:run 12s linear infinite;font-size:15px;font-weight:600;}
   @keyframes run{from{transform:translateX(0)}to{transform:translateX(-100%)}}
   @media(max-width:640px){nav{width:56px}.brand,.nav span.lbl{display:none}.nav{text-align:center}}
+
+  /* модальные окна (js/core/modal.js): стопкой, нижнее — от z-index 1000, тост (5000) поверх всех */
+  body.modal-open{overflow:hidden;}
+  .modal-backdrop{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(5,6,8,.72);overscroll-behavior:contain;animation:modalFade .12s ease-out;}
+  .modal{display:flex;flex-direction:column;max-height:100%;background:var(--panel);color:var(--txt);border:1px solid var(--border2);border-radius:10px;box-shadow:0 8px 32px rgba(0,0,0,.55);overflow:hidden;animation:modalPop .14s ease-out;}
+  .modal:focus{outline:none;}
+  .modal-head{display:flex;align-items:center;gap:10px;padding:10px 12px 10px 14px;border-bottom:1px solid var(--border);flex:none;}
+  .modal-title{flex:1;min-width:0;margin:0;font-size:14px;font-weight:600;overflow-wrap:anywhere;}
+  .modal-x{flex:none;width:30px;height:30px;border:0;border-radius:6px;background:transparent;color:var(--dim);font-size:16px;line-height:1;cursor:pointer;}
+  .modal-x:hover{background:var(--bg2);color:var(--txt);}
+  .modal-x:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
+  .modal-body{flex:1 1 auto;min-height:0;padding:14px;overflow:auto;}
+  .modal-foot{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:10px;padding:10px 14px;border-top:1px solid var(--border);background:var(--bg2);flex:none;}
+  @keyframes modalFade{from{opacity:0}to{opacity:1}}
+  @keyframes modalPop{from{opacity:0;transform:translateY(6px) scale(.985)}to{opacity:1;transform:none}}
+  @media (prefers-reduced-motion:reduce){.modal-backdrop,.modal{animation:none;}}
+
+  /* просмотр ролика (js/views/media-preview.js): кадр слева, сведения справа; на узком экране — сведения под кадром */
+  .modal.modal-mprev .modal-body{padding:0;}
+  .mprev{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(190px,1fr);align-items:start;}
+  .mprev-media{position:relative;aspect-ratio:16/9;background:#000;display:flex;align-items:center;justify-content:center;}
+  .mprev-media video,.mprev-media img{display:block;width:100%;height:100%;object-fit:contain;background:#000;}
+  .mprev-media video:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;}
+  .mprev-err{padding:14px;text-align:center;font-size:12px;color:var(--txt2);}
+  .mprev-info{min-width:0;padding:12px 14px;font-size:12px;color:var(--txt2);}
+  .mprev-info div{margin-bottom:7px;overflow-wrap:anywhere;}
+  .mprev-info div:last-child{margin-bottom:0;}
+  .mprev-info b{color:var(--txt);font-weight:500;}
+  @media (max-width:640px){
+    .mprev{grid-template-columns:minmax(0,1fr);}
+    .mprev-info{border-top:1px solid var(--border);}
+  }
+  /* превью-кнопка в списках медиатеки: клик открывает просмотр */
+  .mprev-open{cursor:pointer;}
+  .mprev-open:hover{filter:brightness(1.15);}
+  .mprev-open:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;}
