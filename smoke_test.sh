@@ -29,6 +29,11 @@ req(){ # req METHOD PATH [extra curl args...]
   HTTP="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
 }
 
+# python-проверки над JSON-телом ответа ($BODY, объект/список = r): код возврата 0 — условие выполнено
+body_has(){ echo "$BODY" | python3 -c "import sys,json; r=json.load(sys.stdin); sys.exit(0 if ($1) else 1)" 2>/dev/null; }
+# поле верхнего уровня JSON-тела (пусто, если нет)
+body_get(){ echo "$BODY" | python3 -c "import sys,json;print(json.load(sys.stdin).get('$1',''))" 2>/dev/null; }
+
 echo "════════════════════════════════════════════"
 echo " SMOKE TEST — Digital Signage $(date '+%Y-%m-%d %H:%M')"
 echo "════════════════════════════════════════════"
@@ -83,6 +88,102 @@ if [ -n "$SID" ] && [ -n "$PID" ]; then
   [ "$HTTP" = "200" ] && ok "слот расписания назначен" || bad "назначение слота: HTTP $HTTP"
 fi
 
+# Плейлист одним запросом: проверка, создание, замена (окно сборки плейлиста).
+# MID — одобренный ролик (service), MID3 — второй одобренный, MID2 — «на модерации».
+if [ -n "${MID:-}" ] && [ -n "${PID:-}" ]; then
+  JSON_H='Content-Type: application/json'
+  req POST "/media/upload?title=SMOKE_media2_$STAMP&category=service" -F "file=@/tmp/smoke.mp4"
+  MID3=$(body_get id)
+  [ -n "$MID3" ] && ok "второй одобренный ролик загружен (id=$MID3)" || bad "второй ролик: HTTP $HTTP"
+  req POST "/media/upload?title=SMOKE_pend_$STAMP&category=other&age_rating=0%2B" -F "file=@/tmp/smoke.mp4"
+  MID2=$(body_get id)
+  if [ -n "$MID2" ] && body_has "r['review_status']=='pending'"; then ok "ролик на модерации загружен (id=$MID2)"; else bad "ролик на модерации: HTTP $HTTP"; fi
+
+  # длительность тестового ролика — как её видит сервер (из плейлиста PID)
+  req GET "/playlists/$PID/items"
+  DUR=$(echo "$BODY" | python3 -c "import sys,json;print(json.load(sys.stdin)[0]['duration_seconds'])" 2>/dev/null)
+  DUR="${DUR:-0}"
+
+  # проверка: ролик ×4 — 4 показа, итог 4×длительность и одна подсказка про повторы подряд
+  req POST "/playlists/check" -H "$JSON_H" -d "{\"items\": [{\"media_id\": $MID, \"repeat_count\": 4}]}"
+  if [ "$HTTP" = "200" ] && body_has "r['plays']==4 and abs(r['total_seconds']-4*$DUR)<0.1 and len(r['warnings'])==1 and 'SMOKE_media_$STAMP' in r['warnings'][0] and '4' in r['warnings'][0]"; then
+    ok "проверка плейлиста: ролик ×4 — 4 показа и подсказка про повторы"; else bad "проверка плейлиста ×4: HTTP $HTTP"; fi
+  req POST "/playlists/check" -H "$JSON_H" -d "{\"items\": [{\"media_id\": $MID, \"repeat_count\": 1}]}"
+  if [ "$HTTP" = "200" ] && body_has "r['warnings']==[] and r['plays']==1 and abs(r['total_seconds']-$DUR)<0.1"; then
+    ok "проверка плейлиста: один ролик ×1 — подсказок нет"; else bad "проверка плейлиста ×1: HTTP $HTTP"; fi
+  req POST "/playlists/check" -H "$JSON_H" -d '{"items": []}'
+  if [ "$HTTP" = "200" ] && body_has "r=={'warnings': [], 'total_seconds': 0, 'plays': 0}"; then
+    ok "проверка пустого списка: нули и без подсказок"; else bad "проверка пустого списка: HTTP $HTTP"; fi
+  req POST "/playlists/check" -H "$JSON_H" -d "{\"items\": [{\"media_id\": $MID, \"repeat_count\": 100}]}"
+  [ "$HTTP" = "400" ] && ok "проверка: повторов 100 → 400" || bad "проверка: повторов 100: HTTP $HTTP (ждали 400)"
+
+  # создание одним запросом: название + ролик ×2
+  req POST "/playlists/full" -H "$JSON_H" -d "{\"name\": \"SMOKE_full_$STAMP\", \"items\": [{\"media_id\": $MID, \"repeat_count\": 2}]}"
+  PID2=$(body_get id)
+  if [ "$HTTP" = "200" ] && [ -n "$PID2" ] && body_has "r['name']=='SMOKE_full_$STAMP' and r['warnings']==[]"; then
+    ok "плейлист создан одним запросом (id=$PID2)"; else bad "создание плейлиста одним запросом: HTTP $HTTP"; PID2=""; fi
+  if [ -n "$PID2" ]; then
+    req GET "/playlists/$PID2/items"
+    if [ "$HTTP" = "200" ] && body_has "len(r)==1 and r[0]['media_id']==$MID and r[0]['position']==1 and r[0]['repeat_count']==2"; then
+      ok "в новом плейлисте ролик ×2 на позиции 1"; else bad "состав нового плейлиста: HTTP $HTTP"; fi
+    req GET "/playlists"
+    if [ "$HTTP" = "200" ] && body_has "any(x['id']==$PID2 and x['name']=='SMOKE_full_$STAMP' for x in r)"; then
+      ok "новый плейлист виден в списке"; else bad "нового плейлиста нет в списке: HTTP $HTTP"; fi
+  fi
+
+  # ошибки при создании: плейлист не появляется вовсе
+  if [ -n "${MID2:-}" ]; then
+    req POST "/playlists/full" -H "$JSON_H" -d "{\"name\": \"SMOKE_fullbad_$STAMP\", \"items\": [{\"media_id\": $MID}, {\"media_id\": $MID2}]}"
+    if [ "$HTTP" = "409" ] && body_has "'SMOKE_pend_$STAMP' in r['detail']"; then
+      ok "создание с роликом на модерации → 409 с его названием"; else bad "создание с неодобренным: HTTP $HTTP (ждали 409)"; fi
+  fi
+  req POST "/playlists/full" -H "$JSON_H" -d "{\"name\": \"SMOKE_fullbad_$STAMP\", \"items\": [{\"media_id\": $MID}, {\"media_id\": 2147483000}]}"
+  [ "$HTTP" = "404" ] && ok "создание с несуществующим роликом → 404" || bad "создание с несуществующим роликом: HTTP $HTTP (ждали 404)"
+  req POST "/playlists/full" -H "$JSON_H" -d "{\"name\": \"  \", \"items\": [{\"media_id\": $MID}]}"
+  [ "$HTTP" = "400" ] && ok "создание с пустым названием → 400" || bad "создание с пустым названием: HTTP $HTTP (ждали 400)"
+  req GET "/playlists"
+  if [ "$HTTP" = "200" ] && ! body_has "any(x['name']=='SMOKE_fullbad_$STAMP' or x['name'].strip()=='' for x in r)"; then
+    ok "после ошибок создания плейлист не появился"; else bad "после ошибок создания остался плейлист"; fi
+
+  # замена роликов: другой порядок, два ролика, новое название
+  if [ -n "$PID2" ] && [ -n "${MID3:-}" ]; then
+    req PUT "/playlists/$PID2/items" -H "$JSON_H" -d "{\"name\": \"SMOKE_put_$STAMP\", \"items\": [{\"media_id\": $MID3}, {\"media_id\": $MID, \"repeat_count\": 3}]}"
+    # оба ролика — один и тот же файл: подсказки про долю («×3» — три четверти плейлиста) и про дубль файла
+    if [ "$HTTP" = "200" ] && body_has "r['status']=='ok' and len(r['warnings'])==2 and 'SMOKE_media_$STAMP' in r['warnings'][0] and 'SMOKE_media2_$STAMP' in r['warnings'][1] and 'SMOKE_media_$STAMP' in r['warnings'][1]"; then
+      ok "ролики плейлиста заменены, в ответе подсказки про долю и дубль файла"; else bad "замена роликов: HTTP $HTTP"; fi
+    req GET "/playlists/$PID2/items"
+    if [ "$HTTP" = "200" ] && body_has "[(x['media_id'], x['position'], x['repeat_count']) for x in r]==[($MID3,1,1),($MID,2,3)]"; then
+      ok "после замены: новый порядок, позиции 1–2, повторы ×1 и ×3"; else bad "состав после замены: HTTP $HTTP"; fi
+    req GET "/playlists"
+    if [ "$HTTP" = "200" ] && body_has "any(x['id']==$PID2 and x['name']=='SMOKE_put_$STAMP' for x in r)"; then
+      ok "плейлист переименован при замене"; else bad "переименования при замене нет: HTTP $HTTP"; fi
+
+    # замена без name название не трогает; повторы ×5 → подсказка в ответе
+    req PUT "/playlists/$PID2/items" -H "$JSON_H" -d "{\"items\": [{\"media_id\": $MID, \"repeat_count\": 5}]}"
+    if [ "$HTTP" = "200" ] && body_has "r['status']=='ok' and len(r['warnings'])==1"; then
+      ok "замена без названия: подсказка про ×5 в ответе"; else bad "замена без названия: HTTP $HTTP"; fi
+    req GET "/playlists"
+    if [ "$HTTP" = "200" ] && body_has "any(x['id']==$PID2 and x['name']=='SMOKE_put_$STAMP' for x in r)"; then
+      ok "название без name не изменилось"; else bad "название изменилось без name"; fi
+
+    # неудачная замена оставляет прежний состав и название
+    if [ -n "${MID2:-}" ]; then
+      req PUT "/playlists/$PID2/items" -H "$JSON_H" -d "{\"name\": \"SMOKE_nope_$STAMP\", \"items\": [{\"media_id\": $MID3}, {\"media_id\": $MID2}]}"
+      [ "$HTTP" = "409" ] && ok "замена с роликом на модерации → 409" || bad "замена с неодобренным: HTTP $HTTP (ждали 409)"
+    fi
+    req PUT "/playlists/$PID2/items" -H "$JSON_H" -d '{"items": []}'
+    [ "$HTTP" = "400" ] && ok "замена пустым списком → 400" || bad "замена пустым списком: HTTP $HTTP (ждали 400)"
+    req GET "/playlists/$PID2/items"
+    if [ "$HTTP" = "200" ] && body_has "[(x['media_id'], x['position'], x['repeat_count']) for x in r]==[($MID,1,5)]"; then
+      ok "после ошибок замены состав прежний"; else bad "состав изменился после неудачной замены"; fi
+    req GET "/playlists"
+    if [ "$HTTP" = "200" ] && body_has "any(x['id']==$PID2 and x['name']=='SMOKE_put_$STAMP' for x in r)"; then
+      ok "после ошибок замены название прежнее"; else bad "название изменилось после неудачной замены"; fi
+  fi
+  req PUT "/playlists/2147483000/items" -H "$JSON_H" -d "{\"items\": [{\"media_id\": $MID}]}"
+  [ "$HTTP" = "404" ] && ok "замена в несуществующем плейлисте → 404" || bad "замена в несуществующем плейлисте: HTTP $HTTP (ждали 404)"
+fi
+
 # ── 4а. Показ по датам: предпросмотр и создание ─────────────────────────────
 step "Показ по датам"
 if [ -n "${SID:-}" ] && [ -n "${PID:-}" ]; then
@@ -99,8 +200,6 @@ if [ -n "${SID:-}" ] && [ -n "${PID:-}" ]; then
   if [ "$HTTP" = "200" ] && [ -n "$PLC" ]; then ok "показ создан (id=$PLC)"; else bad "создание показа: HTTP $HTTP"; fi
 fi
 if [ -n "${PLC:-}" ]; then
-  # python-проверки над JSON-телом: код возврата 0 — условие выполнено
-  body_has(){ echo "$BODY" | python3 -c "import sys,json; r=json.load(sys.stdin); sys.exit(0 if ($1) else 1)" 2>/dev/null; }
   msk_monday(){ $DC python3 -c "import datetime as d; t=d.datetime.now(d.timezone(d.timedelta(hours=3))).date()+d.timedelta(days=$1); print(t-d.timedelta(days=t.weekday()-$2))" 2>/dev/null; }
 
   # список показов плейлиста: новый показ есть, он запланирован на завтра
@@ -178,7 +277,10 @@ if [ -n "${PLC:-}" ]; then
     ok "отменённого показа в списке нет"; else bad "отменённый показ остался в списке"; fi
 fi
 [ -n "${PID:-}" ] && req DELETE "/playlists/$PID" && ok "плейлист удалён"
+[ -n "${PID2:-}" ] && req DELETE "/playlists/$PID2" && ok "плейлист «одним запросом» удалён"
 [ -n "${MID:-}" ] && req DELETE "/media/$MID"      && ok "медиа удалено"
+[ -n "${MID2:-}" ] && req DELETE "/media/$MID2"    && ok "ролик на модерации удалён"
+[ -n "${MID3:-}" ] && req DELETE "/media/$MID3"    && ok "второй ролик удалён"
 [ -n "${SID:-}" ] && req DELETE "/minipc/$SID"     && ok "экран удалён"
 $DC rm -f /tmp/smoke.mp4 2>/dev/null
 
