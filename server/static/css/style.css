@@ -3,6 +3,7 @@
     --txt:#f1f3f6; --txt2:#c7ccd4; --muted:#aeb4be; --dim:#8b919c;
     --accent:#7fe3c4; --accent2:#12a886; --danger:#ff8a7a; --danger2:#d83a2d;
     --c-coca:#ff6b5e; --c-nike:#f5b73d; --c-pepsi:#5ba3ec; --c-local:#7fe3c4;
+    --dup-bg:#5a3b00; --dup-fg:#ffd98a;   /* метка «дубль» (окно плейлиста и медиатека) */
     --font:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
   }
   *{box-sizing:border-box;}
@@ -132,6 +133,24 @@
   .mprev-open:hover{filter:brightness(1.15);}
   .mprev-open:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;}
 
+  /* медиатека (js/views/media.js): метка «дубль» на карточках и окно «Такой ролик уже есть в медиатеке» */
+  .mdup-badge{position:absolute;left:6px;bottom:6px;z-index:1;padding:1px 7px;border-radius:5px;font-size:10px;background:var(--dup-bg);color:var(--dup-fg);}
+  .mdup-badge.inl{position:static;display:inline-block;margin-left:5px;vertical-align:1px;}
+  .mdup-line{margin:-3px 0 7px;font-size:11px;color:var(--dup-fg);overflow-wrap:anywhere;}
+  .mdup-line.inl{margin:2px 0 0;}
+  .modal.modal-mdup .modal-title::before{content:"\26A0";content:"\26A0" / "";margin-right:8px;font-size:18px;line-height:1;color:var(--c-nike);vertical-align:-2px;}
+  .mdup{display:flex;gap:12px;align-items:flex-start;}
+  .mdup-th{position:relative;flex:none;width:120px;aspect-ratio:16/9;border-radius:6px;overflow:hidden;background:#0b0d11;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.3);font-size:20px;}
+  .mdup-th img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
+  .mdup-txt{min-width:0;}
+  .mdup-txt p{margin:0 0 6px;font-size:13px;color:var(--txt2);overflow-wrap:anywhere;}
+  .mdup-txt p:last-child{margin-bottom:0;}
+  .mdup-txt b,.mdup-txt .mdup-ttl{color:var(--txt);font-weight:600;}
+  .mdup-txt .mdup-meta{font-size:12px;color:var(--dim);}
+  @media (max-width:480px){
+    .mdup{flex-direction:column;}
+  }
+
   /* окно «Плейлист» (js/views/playlist-editor.js): название, папки, поиск, плитки, предупреждения */
   .modal.modal-pled .modal-body{padding:0;display:flex;flex-direction:column;}
   .pled-name{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--border);flex:none;}
@@ -169,13 +188,13 @@
   .pled-watch{position:absolute;top:6px;right:6px;padding:2px 7px;border:0;border-radius:10px;background:rgba(0,0,0,.75);color:#fff;font-size:11px;cursor:pointer;}
   .pled-watch:hover{background:rgba(0,0,0,.92);}
   .pled-badge{position:absolute;left:6px;bottom:6px;padding:2px 6px;border-radius:10px;font-size:11px;background:rgba(0,0,0,.75);color:#fff;}
-  .pled-dup{background:#5a3b00;color:#ffd98a;}
+  .pled-dup{background:var(--dup-bg);color:var(--dup-fg);}
   .pled-status{left:auto;right:6px;background:rgba(0,0,0,.8);color:#ffd34d;}
   .pled-status.rej{color:var(--danger);}
   .pled-tt{padding:5px 7px 6px;font-size:12px;overflow-wrap:anywhere;}
   .pled-tt i{display:block;color:var(--dim);font-style:normal;font-size:11px;}
   .pled-tt mark{background:rgba(127,227,196,.3);color:inherit;border-radius:2px;padding:0;}
-  .pled-tt i.pled-dupline{color:#ffd98a;}
+  .pled-tt i.pled-dupline{color:var(--dup-fg);}
   .pled-rep{display:flex;align-items:center;gap:6px;padding:0 7px 7px;font-size:12px;color:var(--txt2);}
   .pled-rep[hidden]{display:none;}
   .pled-rep b{min-width:34px;text-align:center;background:var(--panel);border:1px solid var(--border2);border-radius:4px;padding:1px 0;font-weight:600;color:var(--txt);}

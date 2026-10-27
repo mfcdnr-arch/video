@@ -3,6 +3,7 @@
 //=============================================================================
 
 let MEDIA_ADV = null;
+let MEDIA_DUPS = null;   // дубли, загруженные при отрисовке «Медиатеки»: поиск берёт их отсюда, а не запрашивает заново
 
 // Инициализация действий для медиа-вида
 function initMediaViewActions(){
@@ -190,7 +191,10 @@ async function runMediaSearch(q){
   }
   if(advList) advList.style.display = 'none';
   try{
-    const rows = await api('/media/search?q=' + encodeURIComponent(q));
+    const [rows, dups] = await Promise.all([
+      api('/media/search?q=' + encodeURIComponent(q)),
+      MEDIA_DUPS ? MEDIA_DUPS : mdupLoad().then(d => (MEDIA_DUPS = d)),
+    ]);
     if(!rows.length){ box.innerHTML = '<div class="empty">Ничего не найдено</div>'; return; }
     const ST = {pending:'<span style="color:#ffd34d;">на модерации</span>',
                 rejected:'<span style="color:var(--danger);">отклонён</span>',
@@ -203,8 +207,9 @@ async function runMediaSearch(q){
           <img src="${API}/media/${m.id}/thumbnail" alt="" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;" onerror="this.remove()">
         </div>
         <div style="flex:1;min-width:0;">
-          <div style="font-size:12px;font-weight:500;">${esc(m.title||m.filename)} ${m.is_filler?'<span class="muted" style="font-size:10px;">(заглушка)</span>':''}</div>
+          <div style="font-size:12px;font-weight:500;">${esc(m.title||m.filename)} ${m.is_filler?'<span class="muted" style="font-size:10px;">(заглушка)</span>':''}${mdupBadge(dups, m.id, true)}</div>
           <div class="muted" style="font-size:11px;">${esc(m.advertiser||'без рекламодателя')}${m.duration_seconds?' · '+Math.round(m.duration_seconds)+' c':''}${m.age_rating?' · '+esc(m.age_rating):''}</div>
+          ${mdupLine(dups, m.id, true)}
         </div>
         <div style="font-size:11px;">${ST[m.review_status]||''}</div>
         <span class="dim">${m.advertiser_id?'›':''}</span>
@@ -228,8 +233,9 @@ async function viewMedia(){
   const view = document.getElementById('view');
 
   try{
-    const [advs, fillers, common] = await Promise.all([
-      api('/advertisers'), api('/media/fillers'), api('/media/common')]);
+    const [advs, fillers, common, dups] = await Promise.all([
+      api('/advertisers'), api('/media/fillers'), api('/media/common'), mdupLoad()]);
+    MEDIA_DUPS = dups;
     advs.forEach(a => ADV_COLORS[a.id] = a.color);
 
     const commonCard = `<div class="cell" data-action="media-open-common"
@@ -324,7 +330,7 @@ async function openAdv(id, name){
   document.getElementById('topright').innerHTML = '';
   const view = document.getElementById('view');
   try{
-    const [folders, files] = await Promise.all([api('/advertisers/' + id + '/folders'), api('/advertisers/' + id + '/media')]);
+    const [folders, files, dups] = await Promise.all([api('/advertisers/' + id + '/folders'), api('/advertisers/' + id + '/media'), mdupLoad()]);
 
     let h = `<div style="display:flex;align-items:center;gap:9px;margin-bottom:13px;">
       <button class="btn" data-action="media-back">← Назад</button>
@@ -374,10 +380,12 @@ async function openAdv(id, name){
           ${f.in_playlist?'<span style="position:absolute;top:6px;left:6px;background:#0f6e56;color:#dffaf0;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;">в эфире</span>':''}
           ${f.status!=='document'&&f.review_status==='pending'?'<span style="position:absolute;top:6px;right:6px;background:#8a6d00;color:#ffe9a8;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;">на модерации</span>':''}
           ${f.review_status==='rejected'?`<span title="${esc(f.reject_reason||'')}" style="position:absolute;top:6px;right:6px;background:#7a1f1f;color:#ffd7d7;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;">отклонён</span>`:''}
-          ${f.age_rating?`<span style="position:absolute;bottom:6px;right:6px;background:rgba(0,0,0,.65);color:#fff;font-size:10px;padding:1px 6px;border-radius:5px;z-index:1;">${esc(f.age_rating)}</span>`:''}</div>
+          ${f.age_rating?`<span style="position:absolute;bottom:6px;right:6px;background:rgba(0,0,0,.65);color:#fff;font-size:10px;padding:1px 6px;border-radius:5px;z-index:1;">${esc(f.age_rating)}</span>`:''}
+          ${mdupBadge(dups, f.id)}</div>
         <div style="padding:9px 10px;">
           <div style="font-size:12px;font-weight:500;word-break:break-all;">${esc(f.title||f.filename)}</div>
           <div style="font-size:11px;color:var(--muted);margin:2px 0 7px;">${fmtSize(f.filesize)}${f.duration_seconds?' · '+Math.round(f.duration_seconds)+' c':''}</div>
+          ${mdupLine(dups, f.id)}
           <div style="display:flex;gap:5px;align-items:center;border-top:0.5px solid var(--border2);padding-top:7px;">
             ${canWrite()?`<label class="iconbtn" title="Выбрать" style="cursor:pointer;padding:0 3px;display:inline-flex;align-items:center;"><input type="checkbox" class="media-sel-chk" data-action="media-toggle-sel" data-file-id="${f.id}" style="width:15px;height:15px;cursor:pointer;"></label>`:''}
             <button class="iconbtn" title="Скачать" data-action="media-download" data-file-id="${f.id}">⤓</button>
@@ -529,7 +537,6 @@ async function doUpload(){
   if(vf && vu && vf > vu){ toast('«Показывать по» раньше «Показывать с»'); return; }
   const advId = document.getElementById('up-adv')?.value || '';
   const folderId = document.getElementById('up-folder')?.value || '';
-  const fd = new FormData(); fd.append('file', fileEl.files[0]);
   const q = new URLSearchParams({title});
   if(vf) q.append('valid_from', vf); if(vu) q.append('valid_until', vu);
   if(advId) q.append('advertiser_id', advId); if(folderId) q.append('folder_id', folderId);
@@ -542,7 +549,12 @@ async function doUpload(){
   if(val('up-lic')) q.append('license_number', val('up-lic'));
   document.getElementById('up-progress').textContent = 'Загрузка и проверка файла…';
   try{
-    const res = await api('/media/upload?' + q, {method:'POST', body:fd});
+    const res = await uploadWithDuplicateCheck(fileEl.files[0], q);
+    if(!res){
+      // «Отмена» или «Открыть существующий» в окне про дубль: ничего не загружено
+      document.getElementById('up-progress').textContent = 'Файл не загружен: такой ролик уже есть в медиатеке.';
+      return;
+    }
     const info = res.duration_seconds?` (${Math.round(res.duration_seconds)} c, ${res.codec||''}${res.resolution?', '+res.resolution:''})`:'';
     if(res.warning){
       alert('Файл загружен, но есть предупреждение:\n\n⚠ ' + res.warning);
@@ -551,6 +563,153 @@ async function doUpload(){
   }catch(e){
     document.getElementById('up-progress').innerHTML = '<span style="color:var(--danger);">' + esc(e.message) + '</span>';
   }
+}
+
+//=============================================================================
+// ДУБЛИ: загрузка уже имеющегося файла и метка «дубль» на карточках
+//
+// Дубль — тот же файл (совпадает md5). Сервер на повторную загрузку отвечает
+// 409 с описанием существующего ролика и ничего не сохраняет; повтор с
+// allow_duplicate=true загружает файл всё равно.
+//   uploadWithDuplicateCheck(file, params) — единая загрузка в медиатеку (обычная
+//     форма и «Загрузить заглушки»): вернёт ответ сервера или null, если файл
+//     не загружен (в окне про дубль нажали «Отмена»/«Открыть существующий»).
+//     Прочие ошибки бросает как api().
+//=============================================================================
+
+const MDUP_DATE = new Intl.DateTimeFormat('ru-RU',
+  {timeZone: 'Europe/Moscow', day: '2-digit', month: '2-digit', year: 'numeric'});   // как везде в панели — по Москве
+
+// {"<id>": [{id,title}, …]} — у каких роликов есть копии. Сбой не ломает список: просто без меток.
+async function mdupLoad(){
+  try{
+    const d = await api('/media/duplicates');
+    return d && typeof d === 'object' ? d : {};
+  }catch(e){ return {}; }
+}
+
+// Подпись как в окне сборки плейлиста: «тот же файл, что „X“ и ещё N». Текст (без esc).
+function mdupText(list){
+  const first = list[0] || {};
+  return 'тот же файл, что „' + (first.title || 'без названия') + '“'
+    + (list.length > 1 ? ' и ещё ' + (list.length - 1) : '');
+}
+
+// Метка «дубль» (с подсказкой). inline — в строке названия (поиск), иначе на уголке миниатюры.
+function mdupBadge(dups, id, inline){
+  const list = dups && dups[id];
+  if(!list || !list.length) return '';
+  return `<span class="mdup-badge${inline ? ' inl' : ''}" title="${esc(mdupText(list))}">дубль</span>`;
+}
+
+// Подзаголовок под названием: «тот же файл, что „…“»
+function mdupLine(dups, id, inline){
+  const list = dups && dups[id];
+  if(!list || !list.length) return '';
+  return `<div class="mdup-line${inline ? ' inl' : ''}">${esc(mdupText(list))}</div>`;
+}
+
+// 409 «такой ролик уже есть» → duplicate_of; любая другая ошибка (в т.ч. detail-строка) → null.
+function mdupFromError(e){
+  try{
+    const j = JSON.parse(String((e && e.message) || ''));
+    const d = j && j.detail;
+    return d && typeof d === 'object' && d.duplicate_of && d.duplicate_of.id ? d.duplicate_of : null;
+  }catch(_){ return null; }
+}
+
+// «Папка: … · загружен dd.mm.yyyy · m:ss · используется в N плейлистах»; неизвестное опускаем. HTML.
+function mdupMeta(d){
+  const parts = [];
+  if(d.folder) parts.push('Папка: ' + esc(d.folder));
+  if(d.created_at){
+    const dt = parseServerTS(d.created_at);
+    if(!isNaN(dt)) parts.push('загружен ' + MDUP_DATE.format(dt));
+  }
+  const sec = Math.round(Number(d.duration_seconds) || 0);
+  if(sec > 0) parts.push(Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0'));
+  if(d.playlists != null && !isNaN(Number(d.playlists))){
+    const n = Math.max(0, Math.floor(Number(d.playlists)));
+    // «в 1 плейлисте», но «в 2 / 5 / 11 / 21… плейлистах»
+    parts.push(n === 0 ? 'не используется в плейлистах'
+      : 'используется в ' + n + (n % 10 === 1 && n % 100 !== 11 ? ' плейлисте' : ' плейлистах'));
+  }
+  return parts.join(' · ');
+}
+
+async function uploadWithDuplicateCheck(file, params){
+  const q = new URLSearchParams(params);   // копия: вызывающий свои параметры не теряет
+  const send = () => {
+    const fd = new FormData(); fd.append('file', file);
+    return api('/media/upload?' + q, {method:'POST', body:fd});
+  };
+  try{
+    return await send();
+  }catch(e){
+    const dup = mdupFromError(e);
+    if(!dup) throw e;
+    return mdupAsk(file, dup, () => { q.set('allow_duplicate', 'true'); return send(); });
+  }
+}
+
+// Окно «Такой ролик уже есть в медиатеке». force() — повторная загрузка с allow_duplicate=true.
+// Resolve: ответ сервера после «Всё равно загрузить» или null (Отмена / Esc / ✕ / фон / «Открыть
+// существующий»); reject — если повторная загрузка не удалась (окно к тому времени закрыто).
+function mdupAsk(file, dup, force){
+  return new Promise((resolve, reject) => {
+    let busy = false, settled = false;
+    const settle = (fn, v) => { if(!settled){ settled = true; fn(v); } };
+    const name = dup.title || dup.filename || 'без названия';
+    const meta = mdupMeta(dup);
+
+    const modal = openModal({
+      title: 'Такой ролик уже есть в медиатеке',
+      className: 'modal-mdup', width: 520,
+      body: `<div class="mdup">
+          <div class="mdup-th"><span aria-hidden="true">▶</span><img src="${API}/media/${Number(dup.id)}/thumbnail" alt="" onerror="this.remove()"></div>
+          <div class="mdup-txt">
+            <p>Вы загружаете <b>${esc(file.name)}</b> — это точно тот же файл, что и</p>
+            <p class="mdup-ttl">«${esc(name)}»</p>
+            ${meta ? `<p class="mdup-meta">${meta}</p>` : ''}
+          </div>
+        </div>`,
+      footer: `<button type="button" class="btn" data-mdup="cancel">Отмена</button>
+        <button type="button" class="btn" data-mdup="force">Всё равно загрузить</button>
+        <button type="button" class="btn primary" data-mdup="open" autofocus>Открыть существующий</button>`,
+      onClose(){ settle(resolve, null); },   // Esc, ✕, фон и кнопка «Отмена» — всё это «Отмена»
+    });
+
+    const btn = k => modal.el.querySelector(`[data-mdup="${k}"]`);
+    btn('cancel').addEventListener('click', () => modal.close());
+    btn('open').addEventListener('click', () => {
+      modal.close();
+      Signage.openMediaPreview(Number(dup.id));
+    });
+    btn('force').addEventListener('click', async () => {
+      if(busy) return;
+      busy = true;
+      modal.el.querySelectorAll('.modal-foot .btn').forEach(b => { b.disabled = true; });
+      btn('force').textContent = 'Загрузка…';
+      modal.el.focus();                     // фокус не должен уйти на body: иначе Esc пройдёт мимо окна
+      try{
+        const res = await force();
+        settle(resolve, res);
+      }catch(err){
+        settle(reject, err);
+      }
+      modal.close();
+    });
+
+    // Пока файл догружается, окно не закрывается ни Esc, ни ✕, ни кликом по фону
+    // (иначе загрузка пошла бы «в никуда»). Esc гасим в самом окне — раньше, чем
+    // его увидит modal.js; клики — в capture-фазе на фоне, раньше его обработчика.
+    const back = modal.el.parentNode;
+    back.addEventListener('click', e => {
+      if(!busy) return;
+      if(e.target === back || (e.target.closest && e.target.closest('[data-modal-close]'))) e.stopImmediatePropagation();
+    }, true);
+    modal.el.addEventListener('keydown', e => { if(busy && e.key === 'Escape') e.preventDefault(); });
+  });
 }
 
 async function dlMedia(id){ window.open(API + '/files/download/' + id, '_blank'); }
@@ -578,7 +737,7 @@ async function openCommonMedia(folderId){
   document.getElementById('topright').innerHTML = '';
   const view = document.getElementById('view');
   try{
-    const d = await api('/media/common');
+    const [d, dups] = await Promise.all([api('/media/common'), mdupLoad()]);
     const cur = folderId ? d.folders.find(f => f.id === folderId) : null;
 
     let h = `<div style="display:flex;align-items:center;gap:9px;margin-bottom:6px;">
@@ -623,10 +782,12 @@ async function openCommonMedia(folderId){
           ${f.in_playlist?'<span style="position:absolute;top:6px;left:6px;background:#0f6e56;color:#dffaf0;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;">в эфире</span>':''}
           ${f.review_status==='pending'?'<span style="position:absolute;top:6px;right:6px;background:#8a6d00;color:#ffe9a8;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;">на модерации</span>':''}
           ${f.review_status==='rejected'?`<span title="${esc(f.reject_reason||'')}" style="position:absolute;top:6px;right:6px;background:#7a1f1f;color:#ffd7d7;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;">отклонён</span>`:''}
-          ${f.age_rating?`<span style="position:absolute;bottom:6px;right:6px;background:rgba(0,0,0,.65);color:#fff;font-size:10px;padding:1px 6px;border-radius:5px;z-index:1;">${esc(f.age_rating)}</span>`:''}</div>
+          ${f.age_rating?`<span style="position:absolute;bottom:6px;right:6px;background:rgba(0,0,0,.65);color:#fff;font-size:10px;padding:1px 6px;border-radius:5px;z-index:1;">${esc(f.age_rating)}</span>`:''}
+          ${mdupBadge(dups, f.id)}</div>
         <div style="padding:9px 10px;">
           <div style="font-size:12px;font-weight:500;word-break:break-all;">${esc(f.title||f.filename)}</div>
           <div style="font-size:11px;color:var(--muted);margin:2px 0 7px;">${fmtSize(f.filesize)}${f.duration_seconds?' · '+fmtDurMin(f.duration_seconds):''}</div>
+          ${mdupLine(dups, f.id)}
           <div style="display:flex;gap:5px;align-items:center;border-top:0.5px solid var(--border2);padding-top:7px;">
             <button class="iconbtn" title="Скачать" data-action="media-download" data-file-id="${f.id}">⤓</button>
             ${canWrite()?`<select class="inp" title="Переложить в папку" data-action="media-move-to-folder" data-file-id="${f.id}" style="flex:1;padding:3px 6px;font-size:11px;">${folderOpts(f.folder_id||null)}</select>
@@ -680,7 +841,7 @@ async function openFillers(){
   document.getElementById('topright').innerHTML = '';
   const view = document.getElementById('view');
   try{
-    const d = await api('/media/fillers');
+    const [d, dups] = await Promise.all([api('/media/fillers'), mdupLoad()]);
     let h = `<div style="display:flex;align-items:center;gap:9px;margin-bottom:6px;">
       <button class="btn" data-action="media-back">← Назад</button>
       <span style="font-size:16px;">📼</span><span style="font-weight:500;">Заглушки</span>
@@ -703,10 +864,12 @@ async function openFillers(){
           <img src="${API}/media/${f.id}/thumbnail" alt=""
                style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;"
                onerror="this.remove()">▶
-          ${f.status!=='ready'||f.review_status!=='approved'?'<span style="position:absolute;top:6px;right:6px;background:#8a6d00;color:#ffe9a8;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;">не в эфире</span>':''}</div>
+          ${f.status!=='ready'||f.review_status!=='approved'?'<span style="position:absolute;top:6px;right:6px;background:#8a6d00;color:#ffe9a8;font-size:10px;padding:1px 7px;border-radius:5px;z-index:1;">не в эфире</span>':''}
+          ${mdupBadge(dups, f.id)}</div>
         <div style="padding:9px 10px;">
           <div style="font-size:12px;font-weight:500;word-break:break-all;">${esc(f.title||f.filename)}</div>
           <div style="font-size:11px;color:var(--muted);margin:2px 0 7px;">${fmtSize(f.filesize)}${f.duration_seconds?' · '+fmtDurMin(f.duration_seconds):''}</div>
+          ${mdupLine(dups, f.id)}
           ${canWrite()?`<div style="display:flex;gap:5px;align-items:center;border-top:0.5px solid var(--border2);padding-top:7px;">
             <button class="iconbtn" title="Скачать" data-action="media-download" data-file-id="${f.id}">⤓</button>
             <button class="iconbtn" title="Перевести в обычные ролики (убрать из заглушек)" data-action="media-filler-unmark" data-file-id="${f.id}">⬚</button>
@@ -720,18 +883,18 @@ async function openFillers(){
 async function uploadFillers(files){
   const prog = document.getElementById('fillers-progress');
   const list = Array.from(files);
-  let done = 0, failed = [];
+  let done = 0, skipped = 0, failed = [];
   for(const f of list){
-    if(prog) prog.textContent = `Загрузка ${done+1} из ${list.length}: ${f.name}…`;
-    const fd = new FormData(); fd.append('file', f);
+    if(prog) prog.textContent = `Загрузка ${done+skipped+failed.length+1} из ${list.length}: ${f.name}…`;
     const title = f.name.replace(/\.[^.]+$/, '');
     try{
-      await api('/media/upload?' + new URLSearchParams({title, is_filler:'true'}), {method:'POST', body:fd});
-      done++;
+      // Файл уже есть в медиатеке — окно про дубль (на каждый такой файл по очереди)
+      const res = await uploadWithDuplicateCheck(f, new URLSearchParams({title, is_filler:'true'}));
+      if(res) done++; else skipped++;
     }catch(e){ failed.push(`${f.name}: ${e.message}`); }
   }
   if(failed.length) alert('Не загружено:\n\n' + failed.join('\n'));
-  toast(`Загружено заглушек: ${done} из ${list.length}`);
+  toast(`Загружено заглушек: ${done} из ${list.length}` + (skipped ? `, пропущено (уже есть): ${skipped}` : ''));
   openFillers();
 }
 
@@ -807,6 +970,7 @@ function fmtSize(b){ if(!b) return '—'; const mb = b/1048576; return mb>1024?(
 // Экспорт в глобальный объект
 window.Signage = window.Signage || {};
 window.Signage.viewMedia = viewMedia;
+window.Signage.uploadWithDuplicateCheck = uploadWithDuplicateCheck;
 
 // Инициализация обработчиков
 initMediaViewActions();
