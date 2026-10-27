@@ -24,11 +24,18 @@
 
 - `server/main.py` — сборка FastAPI-приложения, подключение роутеров
 - `server/routers/` — роутеры по доменам: auth, users, screens, media, playlists,
-  schedule, campaigns, broadcast, billing, advertiser_office, reports,
+  placements, schedule, campaigns, broadcast, billing, advertiser_office, reports,
   notifications, backups, ticker, system, agent_ota, websockets
-- `server/migrations/` — SQL-миграции с номерами `001`…`030`, применяются
+- `server/playlist_rules.py` — правила плейлиста: повторы ×N, мягкие
+  предупреждения, «общий час» (чистая логика, без БД)
+- `server/placements_logic.py` — показы по датам: даты/часы, статусы, пересечения,
+  выбор плейлистов на час, `active_until` (чистая логика, без БД)
+- `server/placements_store.py` — SQL показов: чтение/запись, развёртывание групп
+  и «всех экранов», `resolve_placement_hour` (что играет на экране сейчас)
+- `server/migrations/` — SQL-миграции с номерами `001`…`031`, применяются
   автоматически при первом старте Postgres
-- `server/tests/` — pytest (billing, campaigns, контроль монитора), запуск через `run_tests.sh`
+- `server/tests/` — pytest (billing, campaigns, контроль монитора, плейлисты,
+  показы, дубли), запуск через `run_tests.sh`; тесты агента — `agent/tests/`
 - `ui_tests/ui_test.js` — браузерный E2E-прогон панели (puppeteer), запуск через `ui_test.sh`
 - `agent/` — код агента для мини-ПК: `ds_agent.py`, `ds_player.py` (mpv),
   `ds_sync.py`, `ds_downloader.py`, `ds_heartbeat.py`, `ds_ws_client.py`,
@@ -49,6 +56,9 @@
 
 - `bash install_server.sh` — собрать и поднять весь стек (идемпотентно)
 - `bash run_tests.sh` — прогнать pytest в контейнере `ds_api`
+- `bash dev_stand.sh up|down|reset` — локальный стенд разработки (проект
+  `dsdev`, панель `http://127.0.0.1:8088` только на loopback, пароль admin —
+  в `.dev_admin_pass`, он в `.gitignore`); только для разработки, не для сервера
 - `bash smoke_test.sh` — smoke-проверка ключевых HTTP-эндпоинтов
 - `bash ui_test.sh` — браузерный прогон панели (разделы, кнопки, циклы CRUD)
 - `docker compose logs -f api` — следить за логами backend
