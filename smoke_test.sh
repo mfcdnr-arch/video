@@ -70,7 +70,9 @@ SID=$(echo "$BODY" | python3 -c "import sys,json;print(json.load(sys.stdin).get(
 [ -n "$SID" ] && ok "экран создан (id=$SID)" || bad "экран не создан"
 # медиа (генерим тестовый ролик ffmpeg внутри контейнера)
 $DC sh -c "ffmpeg -f lavfi -i testsrc=duration=1:size=160x120:rate=5 -y /tmp/smoke.mp4 -loglevel quiet" 2>/dev/null
-req POST "/media/upload?title=SMOKE_media_$STAMP&category=service" -F "file=@/tmp/smoke.mp4"
+# ffmpeg-ролик байт в байт один и тот же, поэтому остаток любого прошлого прогона дал бы 409:
+# основную загрузку (и две следующие — это тот же файл) делаем с allow_duplicate=true
+req POST "/media/upload?title=SMOKE_media_$STAMP&category=service&allow_duplicate=true" -F "file=@/tmp/smoke.mp4"
 MID=$(echo "$BODY" | python3 -c "import sys,json;print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
 [ -n "$MID" ] && ok "медиа загружено (id=$MID)" || bad "загрузка медиа: HTTP $HTTP"
 # плейлист
@@ -92,10 +94,10 @@ fi
 # MID — одобренный ролик (service), MID3 — второй одобренный, MID2 — «на модерации».
 if [ -n "${MID:-}" ] && [ -n "${PID:-}" ]; then
   JSON_H='Content-Type: application/json'
-  req POST "/media/upload?title=SMOKE_media2_$STAMP&category=service" -F "file=@/tmp/smoke.mp4"
+  req POST "/media/upload?title=SMOKE_media2_$STAMP&category=service&allow_duplicate=true" -F "file=@/tmp/smoke.mp4"
   MID3=$(body_get id)
   [ -n "$MID3" ] && ok "второй одобренный ролик загружен (id=$MID3)" || bad "второй ролик: HTTP $HTTP"
-  req POST "/media/upload?title=SMOKE_pend_$STAMP&category=other&age_rating=0%2B" -F "file=@/tmp/smoke.mp4"
+  req POST "/media/upload?title=SMOKE_pend_$STAMP&category=other&age_rating=0%2B&allow_duplicate=true" -F "file=@/tmp/smoke.mp4"
   MID2=$(body_get id)
   if [ -n "$MID2" ] && body_has "r['review_status']=='pending'"; then ok "ролик на модерации загружен (id=$MID2)"; else bad "ролик на модерации: HTTP $HTTP"; fi
 
@@ -182,6 +184,90 @@ if [ -n "${MID:-}" ] && [ -n "${PID:-}" ]; then
   fi
   req PUT "/playlists/2147483000/items" -H "$JSON_H" -d "{\"items\": [{\"media_id\": $MID}]}"
   [ "$HTTP" = "404" ] && ok "замена в несуществующем плейлисте → 404" || bad "замена в несуществующем плейлисте: HTTP $HTTP (ждали 404)"
+fi
+
+# ── 4б. Медиатека: дубли и сведения о ролике ─────────────────────────────────
+step "Медиатека: дубли и сведения о ролике"
+if [ -n "${MID:-}" ]; then
+  JH='Content-Type: application/json'
+  # сколько файлов с таким куском имени лежит в каталоге медиа (внутри ds_api)
+  media_files(){ $DC sh -c "ls \"\${MEDIA_PATH:-/data/media}\" 2>/dev/null | grep -c \"$1\""; }
+
+  # статус модерации виден в списке медиатеки
+  req GET "/media"
+  if [ "$HTTP" = "200" ] && body_has "any(x['id']==$MID and x['review_status']=='approved' for x in r)"; then
+    ok "список медиатеки: у одобренного ролика review_status=approved"; else bad "список медиатеки без review_status: HTTP $HTTP"; fi
+  if [ -n "${MID2:-}" ]; then
+    if [ "$HTTP" = "200" ] && body_has "any(x['id']==$MID2 and x['review_status']=='pending' for x in r)"; then
+      ok "список медиатеки: у ролика на модерации review_status=pending"; else bad "список медиатеки: pending не виден"; fi
+  fi
+
+  # тот же файл без allow_duplicate → 409 и сведения о ролике из медиатеки
+  req GET "/media/$MID"; MD5_MID=$(body_get md5_hash)
+  req POST "/media/upload?title=SMOKE_dup_$STAMP&category=service" -F "file=@/tmp/smoke.mp4;filename=SMOKE_dup_$STAMP.mp4"
+  DUPX=$(body_get id)        # при 409 id нет; если файл всё же принят — запомним для уборки
+  D409="$BODY"; H409="$HTTP"
+  if [ "$H409" = "409" ] && body_has "r['detail']['message']=='Такой ролик уже есть в медиатеке' and isinstance(r['detail']['duplicate_of']['id'], int) and set(r['detail']['duplicate_of'])=={'id','title','filename','folder','advertiser','created_at','duration_seconds','playlists'} and r['detail']['duplicate_of']['title'] and r['detail']['duplicate_of']['filename'] and r['detail']['duplicate_of']['created_at'] and r['detail']['duplicate_of']['playlists']>=0"; then
+    ok "повторная загрузка того же файла → 409 со сведениями о дубле"; else bad "повторная загрузка: HTTP $H409 (ждали 409 с duplicate_of)"; fi
+  DUPOF=$(echo "$D409" | python3 -c "import sys,json;print(json.load(sys.stdin)['detail']['duplicate_of']['id'])" 2>/dev/null)
+  req GET "/media/${DUPOF:-0}"
+  if [ "$HTTP" = "200" ] && [ -n "$MD5_MID" ] && body_has "r['md5_hash']=='$MD5_MID'"; then
+    ok "duplicate_of указывает на ролик с тем же md5 (id=$DUPOF)"; else bad "duplicate_of не тот ролик: HTTP $HTTP"; fi
+  [ "$(media_files "SMOKE_dup_$STAMP")" = "0" ] && ok "после отказа файл с диска убран" || bad "после отказа файл остался на диске"
+  req GET "/media"
+  if [ "$HTTP" = "200" ] && ! body_has "any(x['title']=='SMOKE_dup_$STAMP' for x in r)"; then
+    ok "после отказа записи в медиатеке нет"; else bad "после отказа в медиатеке появилась запись"; fi
+
+  # allow_duplicate=true — загрузка проходит
+  req POST "/media/upload?title=SMOKE_dup_$STAMP&category=service&allow_duplicate=true" -F "file=@/tmp/smoke.mp4;filename=SMOKE_dup_$STAMP.mp4"
+  DUPID=$(body_get id)
+  if [ "$HTTP" = "200" ] && [ -n "$DUPID" ] && body_has "r['md5_hash']=='$MD5_MID' and r['status']=='ready'"; then
+    ok "allow_duplicate=true: дубль загружен (id=$DUPID)"; else bad "загрузка с allow_duplicate=true: HTTP $HTTP"; fi
+  [ "$(media_files "SMOKE_dup_$STAMP")" = "1" ] && ok "файл дубля лежит на диске" || bad "файла дубля нет на диске"
+
+  # список дублей: оба ролика видят друг друга, пустых групп и чужих полей нет
+  req GET "/media/duplicates"
+  if [ "$HTTP" = "200" ] && body_has "'$MID' in r and any(d['id']==${DUPID:-0} for d in r['$MID']) and all(d['id']!=$MID for d in r['$MID']) and '${DUPID:-0}' in r and any(d['id']==$MID for d in r['${DUPID:-0}']) and all(len(v)>=1 and all(set(d)=={'id','title'} for d in v) for v in r.values())"; then
+    ok "/media/duplicates: ролики с одним md5 видят друг друга"; else bad "/media/duplicates: HTTP $HTTP"; fi
+
+  # ролик с уникальным содержимым, рекламодателем, папкой и плейлистом: поля сведений
+  $DC sh -c "ffmpeg -f lavfi -i testsrc=duration=1:size=160x120:rate=5 -metadata comment=SMOKE_$STAMP -y /tmp/smoke_u_$STAMP.mp4 -loglevel quiet" 2>/dev/null
+  req POST "/advertisers" -H "$JH" -d "{\"name\": \"SMOKE_adv_$STAMP\", \"kind\": \"gov\"}"
+  ADVID=$(body_get id)
+  [ -n "$ADVID" ] && ok "владелец для проверки создан (id=$ADVID)" || bad "владелец не создан: HTTP $HTTP"
+  FLID=""
+  if [ -n "$ADVID" ]; then
+    req POST "/advertisers/$ADVID/folders" -H "$JH" -d "{\"name\": \"SMOKE_fld_$STAMP\"}"
+    FLID=$(body_get id)
+    [ -n "$FLID" ] && ok "папка для проверки создана (id=$FLID)" || bad "папка не создана: HTTP $HTTP"
+  fi
+  req POST "/media/upload?title=SMOKE_uniq_$STAMP&category=service&allow_duplicate=true&advertiser_id=${ADVID:-0}&folder_id=${FLID:-0}" -F "file=@/tmp/smoke_u_$STAMP.mp4"
+  MIDU=$(body_get id)
+  if [ "$HTTP" = "200" ] && [ -n "$MIDU" ] && ! body_has "r['md5_hash']=='$MD5_MID'"; then
+    ok "ролик с уникальным содержимым загружен (id=$MIDU)"; else bad "уникальный ролик: HTTP $HTTP"; fi
+  if [ -n "$MIDU" ]; then
+    req GET "/media/$MIDU"
+    if [ "$HTTP" = "200" ] && body_has "r['folder_name']=='SMOKE_fld_$STAMP' and r['advertiser_name']=='SMOKE_adv_$STAMP' and r['playlists_count']==0 and r['review_status']=='approved'"; then
+      ok "сведения о ролике: папка, владелец, 0 плейлистов"; else bad "сведения о ролике: HTTP $HTTP"; fi
+    if [ -n "${PID:-}" ]; then
+      req POST "/playlists/$PID/items?media_id=$MIDU"
+      req GET "/media/$MIDU"
+      if [ "$HTTP" = "200" ] && body_has "r['playlists_count']==1"; then
+        ok "сведения о ролике: после добавления в плейлист playlists_count=1"; else bad "playlists_count после добавления: HTTP $HTTP"; fi
+    fi
+    # у ролика без папки и владельца поля сведений есть и пусты
+    req GET "/media/$MID"
+    if [ "$HTTP" = "200" ] && body_has "r['folder_name'] is None and r['advertiser_name'] is None and isinstance(r['playlists_count'], int)"; then
+      ok "сведения о ролике без папки: folder_name и advertiser_name пусты"; else bad "сведения о ролике без папки: HTTP $HTTP"; fi
+    # повтор уникального файла: в 409 — папка, владелец, число плейлистов, длительность
+    EXPPL=0; [ -n "${PID:-}" ] && EXPPL=1          # он стоит в плейлисте $PID, если тот создан
+    req POST "/media/upload?title=SMOKE_uniq_$STAMP&category=service" -F "file=@/tmp/smoke_u_$STAMP.mp4"
+    UX=$(body_get id)
+    if [ "$HTTP" = "409" ] && body_has "(lambda d: d['id']==$MIDU and d['title']=='SMOKE_uniq_$STAMP' and d['folder']=='SMOKE_fld_$STAMP' and d['advertiser']=='SMOKE_adv_$STAMP' and d['playlists']==$EXPPL and d['duration_seconds']>0 and d['filename'].endswith('smoke_u_$STAMP.mp4'))(r['detail']['duplicate_of'])"; then
+      ok "409 о дубле: ролик, папка, владелец, плейлисты и длительность верны"; else bad "содержимое 409 о дубле: HTTP $HTTP"; fi
+  fi
+  req GET "/media/2147483000"
+  [ "$HTTP" = "404" ] && ok "сведения о несуществующем ролике → 404" || bad "несуществующий ролик: HTTP $HTTP (ждали 404)"
 fi
 
 # ── 4а. Показ по датам: предпросмотр и создание ─────────────────────────────
@@ -281,8 +367,27 @@ fi
 [ -n "${MID:-}" ] && req DELETE "/media/$MID"      && ok "медиа удалено"
 [ -n "${MID2:-}" ] && req DELETE "/media/$MID2"    && ok "ролик на модерации удалён"
 [ -n "${MID3:-}" ] && req DELETE "/media/$MID3"    && ok "второй ролик удалён"
+# Дубли и сведения: id берём из ответов сервера как есть (в т.ч. если проверка
+# выше упала и файл всё же принят), поэтому уборка не зависит от исхода проверок.
+for DID in "${DUPX:-}" "${UX:-}" "${DUPID:-}" "${MIDU:-}"; do
+  [ -n "$DID" ] || continue
+  req DELETE "/media/$DID"
+  [ "$HTTP" = "200" ] && ok "ролик проверки дублей удалён (id=$DID)" || bad "удаление ролика $DID: HTTP $HTTP"
+done
+if [ -n "${FLID:-}" ]; then
+  req DELETE "/folders/$FLID"
+  [ "$HTTP" = "200" ] && ok "папка проверки удалена" || bad "удаление папки проверки: HTTP $HTTP"
+fi
+if [ -n "${ADVID:-}" ]; then
+  req DELETE "/advertisers/$ADVID"
+  [ "$HTTP" = "200" ] && ok "владелец проверки удалён" || bad "удаление владельца проверки: HTTP $HTTP"
+fi
+if [ -n "${MD5_MID:-}" ]; then
+  [ "$(media_files "SMOKE_dup_$STAMP")" = "0" ] && ok "файлов дублей на диске не осталось" || bad "на диске остались файлы дублей"
+  [ "$(media_files "smoke_u_$STAMP")" = "0" ] && ok "файла уникального ролика на диске не осталось" || bad "на диске остался файл уникального ролика"
+fi
 [ -n "${SID:-}" ] && req DELETE "/minipc/$SID"     && ok "экран удалён"
-$DC rm -f /tmp/smoke.mp4 2>/dev/null
+$DC rm -f /tmp/smoke.mp4 /tmp/smoke_u_$STAMP.mp4 2>/dev/null
 
 # ── Итог ─────────────────────────────────────────────────────────────────────
 echo

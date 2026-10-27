@@ -109,6 +109,62 @@ def _make_thumbnail(src_path: str, media_id: int) -> Optional[str]:
     return None
 
 
+# ─── Дубли: один и тот же файл (по md5) загружен повторно ───────────────────
+
+DUPLICATE_MESSAGE = "Такой ролик уже есть в медиатеке"
+
+
+def group_duplicates(rows) -> dict:
+    """Дубли среди роликов: для каждого id — список ОСТАЛЬНЫХ роликов с тем же
+    md5_hash ({"id", "title"}, в порядке rows). Только группы из двух и более;
+    пустой md5_hash (None, "", пробелы) не считается совпадением. Чистая
+    функция: rows — строки с полями id, title, md5_hash."""
+    groups = {}
+    for r in rows:
+        h = (r.md5_hash or "").strip()
+        if h:
+            groups.setdefault(h, []).append(r)
+    result = {}
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        for r in members:
+            result[r.id] = [{"id": o.id, "title": o.title} for o in members if o.id != r.id]
+    return result
+
+
+def _duplicate_detail(row) -> dict:
+    """Тело ответа 409 «такой ролик уже есть»: сообщение + сведения о ролике
+    из медиатеки (row — результат _find_duplicate). Чистая функция. Дата
+    переводится в строку заранее: HTTPException(detail=...) уходит в
+    JSONResponse без jsonable_encoder, и datetime там упал бы с TypeError."""
+    created = row.created_at
+    return {"message": DUPLICATE_MESSAGE,
+            "duplicate_of": {"id": row.id, "title": row.title, "filename": row.filename,
+                             "folder": row.folder, "advertiser": row.advertiser,
+                             "created_at": created.isoformat() if created is not None else None,
+                             "duration_seconds": row.duration_seconds,
+                             "playlists": int(row.playlists or 0)}}
+
+
+def _find_duplicate(md5_hash: str):
+    """Самый старый не-документ с таким md5 (или None) и сведения о нём для
+    сообщения: папка, рекламодатель, число плейлистов, где он стоит."""
+    with Session(engine) as db:
+        return db.execute(text("""
+            SELECT m.id, m.title, m.filename, f.name AS folder, a.name AS advertiser,
+                   m.created_at, m.duration_seconds,
+                   (SELECT COUNT(DISTINCT pi.playlist_id) FROM playlist_items pi
+                     WHERE pi.media_id = m.id) AS playlists
+            FROM media m
+            LEFT JOIN media_folders f ON f.id = m.folder_id
+            LEFT JOIN advertisers a ON a.id = m.advertiser_id
+            WHERE m.md5_hash = :h AND m.status <> 'document'
+            ORDER BY m.created_at, m.id
+            LIMIT 1
+        """), {"h": md5_hash}).fetchone()
+
+
 # ─── Медиабиблиотека ────────────────────────────────────────────────────────
 
 @router.post("/media/upload")
@@ -126,6 +182,8 @@ async def upload_media(
     disclaimer_text: Optional[str] = Query(None, description="Текст обязательного предупреждения"),
     license_number: Optional[str] = Query(None, description="№ лицензии (финансовые услуги)"),
     is_filler: bool = Query(False, description="Загрузить как заглушку (папка «Заглушки»)"),
+    allow_duplicate: bool = Query(False,
+        description="Загрузить, даже если такой файл (по md5) уже есть в медиатеке"),
     admin: dict = Depends(require_write)
 ):
     """Загрузить видеофайл на сервер. Категория по 38-ФЗ обязательна;
@@ -133,7 +191,10 @@ async def upload_media(
     Новый файл попадает на модерацию (review_status='pending') и не
     выдаётся экранам до одобрения; служебный контент — сразу approved.
     is_filler=true — файл сразу в «Заглушки»: категория service (не реклама,
-    модерация не нужна), рекламодатель/папка «Служебное»/«Заглушки»."""
+    модерация не нужна), рекламодатель/папка «Служебное»/«Заглушки».
+    Если ролик с тем же md5 уже есть, загрузка отклоняется кодом 409 (в detail —
+    сведения о нём); allow_duplicate=true загружает файл всё равно. На документы
+    (папка «Документы») проверка не распространяется."""
     # Куда грузим, выясняем ДО проверок 38-ФЗ: скан договора — не реклама,
     # требовать у него возрастную маркировку и категорию бессмысленно.
     is_document = False
@@ -168,6 +229,18 @@ async def upload_media(
             size += len(chunk)
 
     md5_hash = md5.hexdigest()
+
+    # Тот же файл уже есть в медиатеке — предупреждаем (мягко: allow_duplicate
+    # пропускает). Файл уже записан на диск, поэтому при отказе его удаляем:
+    # до проверки плеером, миниатюры и INSERT ничего ещё не создано.
+    if not is_document and not allow_duplicate:
+        dup = _find_duplicate(md5_hash)
+        if dup:
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+            raise HTTPException(409, detail=_duplicate_detail(dup))
 
     # Файл из папки «Документы» — это не эфирный контент, а скан договора,
     # декларации или согласования. Такие файлы:
@@ -267,7 +340,7 @@ def list_media(admin: dict = Depends(get_current_admin), db: Session = Depends(g
     rows = db.execute(text(
         "SELECT m.id, m.title, m.filename, m.filesize, m.md5_hash, m.duration_seconds, "
         "m.status, m.created_at, COALESCE(m.is_filler, FALSE) AS is_filler, "
-        "m.advertiser_id, m.folder_id, a.name AS advertiser "
+        "m.review_status, m.advertiser_id, m.folder_id, a.name AS advertiser "
         "FROM media m LEFT JOIN advertisers a ON a.id = m.advertiser_id "
         # Это список ЭФИРНОГО контента (из него же выбирают ролик в плейлист),
         # поэтому сканы из папки «Документы» сюда не попадают. Их видно в самой
@@ -294,6 +367,17 @@ def search_media(q: str = Query(..., min_length=2, max_length=100),
         LIMIT 50
     """), {"pat": f"%{q}%"}).fetchall()
     return [dict(r._mapping) for r in rows]
+
+
+@router.get("/media/duplicates")
+def media_duplicates(admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    """Дубли по всей медиатеке (кроме документов): {"<id>": [{"id","title"}, ...]} —
+    для каждого ролика, у которого есть копии, список остальных копий.
+    Объявлен до /media/{media_id}, иначе «duplicates» разбирался бы как id."""
+    rows = db.execute(text(
+        "SELECT id, title, md5_hash FROM media WHERE status <> 'document' ORDER BY id"
+    )).fetchall()
+    return group_duplicates(rows)
 
 
 @router.get("/media/fillers")
@@ -400,7 +484,16 @@ def move_media_to_folder(media_id: int, body: dict = Body(...),
 @router.get("/media/{media_id}")
 def get_media(media_id: int, admin: dict = Depends(get_current_admin),
               db: Session = Depends(get_db)):
-    row = db.execute(text("SELECT * FROM media WHERE id = :id"), {"id": media_id}).fetchone()
+    # Сведения для окна просмотра ролика: где лежит, чей он и в скольких плейлистах.
+    row = db.execute(text("""
+        SELECT m.*, f.name AS folder_name, a.name AS advertiser_name,
+               (SELECT COUNT(DISTINCT pi.playlist_id) FROM playlist_items pi
+                 WHERE pi.media_id = m.id) AS playlists_count
+        FROM media m
+        LEFT JOIN media_folders f ON f.id = m.folder_id
+        LEFT JOIN advertisers a ON a.id = m.advertiser_id
+        WHERE m.id = :id
+    """), {"id": media_id}).fetchone()
     if not row:
         raise HTTPException(404, "Файл не найден")
     return dict(row._mapping)
