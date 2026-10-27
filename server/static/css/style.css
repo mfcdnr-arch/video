@@ -277,3 +277,43 @@
   .plb-alt{display:block;margin-top:5px;font-size:11px;color:var(--c-nike);overflow-wrap:anywhere;}
   .plb-acts{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap;}
   .plb-btn{padding:4px 10px;font-size:12px;}
+
+  /* Расписание, режим «По датам» (js/views/schedule.js): реальная неделя экрана, клетки по kind, карточка показа */
+  .schd-nav{display:inline-flex;align-items:center;gap:6px;}
+  .schd-nav .btn{padding:6px 11px;}
+  .schd-week{min-width:118px;text-align:center;font-size:13px;color:var(--txt2);white-space:nowrap;}
+  .schd-note{font-size:12px;margin-bottom:9px;}
+  .schd-scroll{overflow-x:auto;transition:opacity .15s;}
+  .schd-scroll.busy{opacity:.5;pointer-events:none;}
+  .schd-tbl{width:100%;min-width:640px;table-layout:fixed;border-collapse:separate;border-spacing:2px;font-size:11px;}
+  .schd-tbl th{padding:4px 2px 5px;text-align:center;font-size:11px;font-weight:500;color:var(--txt2);border-bottom:0;}
+  .schd-tbl th i{display:block;font-style:normal;font-weight:400;color:var(--dim);}
+  .schd-tbl th.today,.schd-tbl th.today i{color:var(--accent);}
+  .schd-tbl th.today{box-shadow:inset 0 -2px 0 var(--accent);}
+  .schd-tbl td{font-size:11px;}
+  .schd-tbl td.schd-h{padding:0 6px 0 0;border:0;text-align:right;color:var(--dim);font-size:10px;}
+  .schd-tbl td.schd-h,.schd-tbl th:first-child{position:sticky;left:0;z-index:1;background:var(--bg);}
+  .schd-c{height:26px;padding:0;border:1px solid var(--border);border-radius:4px;text-align:center;line-height:24px;color:var(--txt2);overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}
+  .schd-c.sel{outline:2px solid var(--txt);outline-offset:0;}
+  .schd-cb{display:block;width:100%;height:100%;padding:0 4px;border:0;background:none;color:inherit;font:inherit;line-height:inherit;text-align:center;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;cursor:pointer;}
+  .schd-cb:hover{background:rgba(255,255,255,.08);}
+  .schd-cb:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;}
+  /* цвета kind — и у клеток, и у образцов легенды */
+  .schd-tpl{background:rgba(138,184,255,.18);border:1px solid rgba(138,184,255,.5);}
+  .schd-plc{background:rgba(127,227,196,.22);border:1.5px dashed var(--accent);color:var(--txt);}
+  .schd-alt{background:repeating-linear-gradient(135deg,rgba(127,227,196,.28) 0 7px,rgba(255,138,94,.28) 7px 14px);border:1.5px dashed var(--c-nike);color:var(--txt);}
+  .schd-ovr{background:rgba(255,107,94,.16);border:1px solid rgba(255,107,94,.55);}
+  .schd-off{background:rgba(216,58,45,.14);border:1px solid rgba(216,58,45,.5);color:var(--danger);}
+  .schd-emp{border:1px solid var(--border);color:var(--dim);}
+  .schd-lg{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:10px;font-size:12px;color:var(--txt2);}
+  .schd-lg span{display:inline-flex;align-items:center;gap:6px;}
+  .schd-lg i{display:inline-block;box-sizing:border-box;width:22px;height:12px;border-radius:3px;}
+  .schd-card{margin:12px 0 0 auto;max-width:440px;padding:11px 12px;background:var(--panel);border:1px solid var(--border2);border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.5);font-size:12px;color:var(--txt2);}
+  .schd-card > div{margin:3px 0;}
+  .schd-card > .schd-card-h{display:flex;align-items:flex-start;gap:8px;margin:0 0 5px;}
+  .schd-card-h b{flex:1;min-width:0;font-size:13px;color:var(--txt);overflow-wrap:anywhere;}
+  .schd-x{flex:none;width:24px;height:24px;border:0;border-radius:5px;background:transparent;color:var(--dim);font-size:13px;line-height:1;cursor:pointer;}
+  .schd-x:hover{background:var(--bg2);color:var(--txt);}
+  .schd-x:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
+  .schd-card > .schd-acts{display:flex;flex-wrap:wrap;gap:6px;margin:9px 0 0;}
+  .schd-btn{padding:4px 10px;font-size:12px;}

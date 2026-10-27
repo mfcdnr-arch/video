@@ -82,7 +82,9 @@ function nav(v){
     (v === 'advertisers' && ME.role === 'advertiser') ? 'Мой кабинет' : t;
   document.getElementById('topright').innerHTML = '';
 
-  ({
+  // Промис вида возвращаем наружу: кто открывает раздел и сразу вид внутри него
+  // (Расписание → «Открыть плейлист»), ждёт отрисовки раздела, а не гонится с ним
+  const shown = ({
     dash:viewDash,
     broadcast:viewBroadcast,
     ticker:viewTicker,
@@ -100,6 +102,7 @@ function nav(v){
   }[v])();
 
   setTimeout(applyRoleGuard, 60);
+  return shown;
 }
 
 function applyRoleGuard(){
