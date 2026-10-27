@@ -1,9 +1,11 @@
 """Медиабиблиотека, рекламодатели/папки, файлы для мини ПК."""
 import hashlib
+import logging
 import os
 import subprocess
 import time
 import uuid
+from datetime import timedelta
 from typing import Optional
 
 import aiofiles
@@ -13,7 +15,10 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from deps import engine, get_db, get_current_admin, require_write, require_moderator, verify_device_token, MEDIA_PATH
+from placements_logic import playlists_for_screen
+from placements_store import load_overrides, load_placements, now_msk
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 
 THUMBS_DIR = os.path.join(MEDIA_PATH, ".thumbs")
@@ -697,32 +702,58 @@ def list_adv_media(adv_id: int, admin: dict = Depends(get_current_admin),
 
 # ─── Файлы для мини ПК ──────────────────────────────────────────────────────
 
+# На сколько дней вперёд (кроме сегодняшнего) экран заранее качает ролики
+# показов по датам и датовых переопределений.
+PRELOAD_DAYS = 7
+
+
 @router.get("/files/list/{screen_id}")
 def files_for_screen(screen_id: int, db: Session = Depends(get_db),
                       _screen=Depends(verify_device_token)):
-    """Список файлов которые мини ПК должен иметь локально.
-    Слоты — трёхуровневые (экран > группа > сеть), плюс переопределения дат;
-    алкоголь — только для площадок «магазин с алколицензией» (38-ФЗ ст. 21)."""
+    """Список файлов, которые мини ПК должен иметь локально.
+
+    Это единственный источник загрузки агента (ds_downloader.sync_files), и
+    по нему же ночная очистка агента (ds_cleanup) удаляет всё остальное —
+    поле files ленты экрана агент не читает. Сюда входят:
+      • плейлисты недельного шаблона — слоты экрана, его группы и всей сети;
+      • плейлисты показов по датам (не остановленных, в т. ч. «на все
+        экраны») и датовых переопределений экрана и его группы на сегодня и
+        PRELOAD_DAYS дней вперёд (МСК) — ролики лежат на диске до начала часа;
+      • все заглушки — их играют часовые блоки, «общий час» и фолбэк.
+    Только готовые и одобренные; алкоголь — только для площадок «магазин с
+    алколицензией» (38-ФЗ ст. 21). Каждый файл — один раз.
+    """
     venue = db.execute(text("SELECT COALESCE(venue_type,'other') FROM screens WHERE id = :sid"),
                        {"sid": screen_id}).scalar() or "other"
+    dated: set[int] = set()
+    try:
+        d_from = now_msk().date()
+        d_to = d_from + timedelta(days=PRELOAD_DAYS)
+        dated = playlists_for_screen(load_placements(db, d_from, d_to), load_overrides(db, d_from, d_to),
+                                     screen_id, d_from, d_to)
+    except Exception:
+        # Ответ с ошибкой агент читает как пустой список, и ночная очистка
+        # стёрла бы с экрана все ролики. Отдаём хотя бы шаблон и заглушки.
+        log.exception("screen %s: плейлисты показов и переопределений для загрузки не получены", screen_id)
+        db.rollback()
     rows = db.execute(text("""
         SELECT DISTINCT m.id, m.filename, m.filesize, m.md5_hash
         FROM media m
-        JOIN playlist_items pi ON pi.media_id = m.id
         WHERE m.status = 'ready' AND m.review_status = 'approved'
           AND (m.category IS NULL OR m.category <> 'alcohol' OR :venue = 'store_alcohol')
-          AND pi.playlist_id IN (
-            SELECT playlist_id FROM schedule_slots
-            WHERE playlist_id IS NOT NULL
-              AND (screen_id = :sid
-                   OR (screen_id IS NULL AND group_id IS NOT NULL
-                       AND group_id = (SELECT group_id FROM screens WHERE id = :sid))
-                   OR (screen_id IS NULL AND group_id IS NULL))
-            UNION
-            SELECT playlist_id FROM schedule_overrides
-            WHERE screen_id = :sid AND playlist_id IS NOT NULL
-        )
-    """), {"sid": screen_id, "venue": venue}).fetchall()
+          AND (m.is_filler = TRUE
+               OR m.id IN (
+                   SELECT pi.media_id FROM playlist_items pi
+                   WHERE pi.playlist_id = ANY(:dated)
+                      OR pi.playlist_id IN (
+                          SELECT playlist_id FROM schedule_slots
+                          WHERE playlist_id IS NOT NULL
+                            AND (screen_id = :sid
+                                 OR (screen_id IS NULL AND group_id IS NOT NULL
+                                     AND group_id = (SELECT group_id FROM screens WHERE id = :sid))
+                                 OR (screen_id IS NULL AND group_id IS NULL)))))
+        ORDER BY m.id
+    """), {"sid": screen_id, "venue": venue, "dated": sorted(dated)}).fetchall()
     return [{"media_id": r.id, "filename": r.filename,
              "filesize": r.filesize, "md5_hash": r.md5_hash,
              "download_url": f"/files/download/{r.id}"} for r in rows]

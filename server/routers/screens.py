@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from admin_panel import ad_sequence, build_hourly_sequence, filler_list
 from deps import get_db, get_current_admin, require_write, verify_device_token
 from dashboard_ws import dashboard_ws_manager
-from placements_logic import pick_active
+from placements_logic import active_until_for, pick_active
 from placements_store import load_playlist_names, now_msk, resolve_placement_hour
 from playlist_rules import build_shared_hour, expand_repeats, interleave
 from ws_manager import ws_manager
@@ -517,8 +517,10 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
 
     files_list = [{"media_id": f.id, "filename": f.filename,
                    "filesize": f.filesize, "md5_hash": f.md5_hash} for f in files]
-    # дополнить файлами активного плейлиста (эфир/показ/переопределение),
-    # чтобы агент успел их докачать; повторы ×N в active_items — по разу
+    # Дополнить файлами активного плейлиста (эфир/показ/переопределение);
+    # повторы ×N в active_items — по разу. Справочное поле: агент его не
+    # читает — качает и чистит диск по GET /files/list/{id} (routers/media.py,
+    # files_for_screen), где показы, переопределения и заглушки учтены.
     seen = {f["media_id"] for f in files_list}
     for it in active_items:
         if it["media_id"] not in seen:
@@ -528,7 +530,7 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
 
     # Часовая последовательность (реклама + заглушки равномерно), если у
     # активного плейлиста включён режим fill_to_hour. Агент проигрывает её
-    # по порядку. Файлы заглушек тоже добавляем в список загрузки.
+    # по порядку. Файлы заглушек тоже добавляем в files.
     # Несколько плейлистов показа («по очереди») — всегда общий час: ролики
     # чередуются, заглушки — до наибольшей цели среди тех, у кого включён
     # fill_to_hour; если ни у кого — просто чередование без заглушек.
@@ -546,7 +548,7 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
             elif targets:
                 hourly_sequence = build_hourly_sequence(db, ids[0], targets[0], venue_type=venue)
             if targets:
-                # докачать файлы заглушек
+                # файлы заглушек — в files
                 fillers = db.execute(text("""
                     SELECT id, filename, filesize, md5_hash FROM media
                     WHERE is_filler = TRUE AND status='ready' AND review_status='approved'
@@ -561,7 +563,7 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
 
     # Фолбэк: если по расписанию ничего не выпало (дыра между слотами),
     # агент крутит заглушки вместо чёрного экрана. Файлы заглушек всегда
-    # включаются в список загрузки, чтобы лежали на диске заранее.
+    # есть в files (а для загрузки — в /files/list, см. files_for_screen).
     fallback_rows = db.execute(text(f"""
         SELECT m.id, m.filename, m.filesize, m.md5_hash FROM media m
         WHERE m.is_filler = TRUE AND m.status = 'ready' AND m.review_status = 'approved'
@@ -635,6 +637,9 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
         "screen_id": screen_id,
         "active_playlist": active_playlist,   # что играть прямо сейчас (приоритет)
         "active_source": active_source,       # broadcast | override | placement | template
+        # до какого момента (наивное МСК, ISO) действуют active_* и
+        # hourly_sequence; потом агент без свежей ленты идёт к шаблону
+        "active_until": active_until_for(active_source, now),
         "active_items": active_items,         # повторы ×N развёрнуты
         "hourly_sequence": hourly_sequence,   # реклама + заглушки на час (по порядку)
         "schedule": [{**dict(r._mapping), "items": expand_repeats(r.items or [])} for r in slots],

@@ -8,7 +8,8 @@ from datetime import date, datetime, timedelta
 
 from placements_logic import (dates_overlap, hours_overlap, applies_at, placement_status,
                               find_conflicts, choose_playlists, template_playlist,
-                              week_cells, alternate_overlaps, pick_active)
+                              week_cells, alternate_overlaps, pick_active, playlists_for_screen,
+                              active_until_for)
 
 
 def P(id, d1, d2, h1, h2, screens, pl=10, stopped=None, saved=None):
@@ -431,3 +432,48 @@ def test_pick_active_keeps_order_and_treats_missing_as_empty():
     assert pick_active([30, 10, 20], {10: ["a.mp4"], 20: ["b.mp4"], 30: ["c.mp4"]}) == [30, 10, 20]
     assert pick_active([10, 99], {10: ["a.mp4"]}) == [10]                 # нет в playable — играть нечего
     assert pick_active([], {10: ["a.mp4"]}) == []
+
+
+# --- что экрану скачать заранее ----------------------------------------------
+
+def test_playlists_for_screen_placements_in_window_on_this_screen():
+    w1, w8 = date(2026, 11, 1), date(2026, 11, 8)
+    placements = [
+        P(1, date(2026, 10, 25), date(2026, 11, 1), 9, 13, [5], pl=10),          # последний день — в окне
+        P(2, date(2026, 11, 8), date(2026, 11, 30), 0, 1, [5, 6], pl=20),        # первый день — в окне
+        P(3, date(2026, 11, 9), date(2026, 11, 30), 9, 13, [5], pl=30),          # после окна
+        P(4, date(2026, 10, 1), date(2026, 10, 31), 9, 13, [5], pl=40),          # до окна
+        P(5, N1, N30, 9, 13, [6], pl=50),                                         # чужой экран
+        P(6, N1, N30, 9, 13, [5], pl=60, stopped=datetime(2026, 10, 31, 12)),    # остановлен
+    ]
+    assert playlists_for_screen(placements, [], 5, w1, w8) == {10, 20}
+    assert playlists_for_screen(placements, [], 6, w1, w8) == {20, 50}
+    assert playlists_for_screen([], [], 5, w1, w8) == set()
+
+
+def test_playlists_for_screen_overrides_with_playlist_in_window():
+    w1, w8 = date(2026, 11, 1), date(2026, 11, 8)
+    overrides = [
+        OV(1, 5, date(2026, 11, 1), pl=70),          # в окне
+        OV(2, 5, date(2026, 11, 8), pl=71),          # последний день окна
+        OV(3, 5, date(2026, 11, 9), pl=72),          # после окна
+        OV(4, 5, date(2026, 10, 31), pl=73),         # до окна
+        OV(5, 5, date(2026, 11, 3), off=True),       # «выключен» — качать нечего
+        OV(6, 6, date(2026, 11, 2), pl=74),          # чужой экран
+    ]
+    assert playlists_for_screen([P(1, N1, N30, 9, 13, [5], pl=10)], overrides, 5, w1, w8) == {10, 70, 71}
+
+
+# --- до какого момента действует активный источник ------------------------------
+
+def test_active_until_placement_is_next_full_hour():
+    assert active_until_for("placement", datetime(2026, 10, 27, 7, 37, 12)) == "2026-10-27T08:00:00"
+    assert active_until_for("placement", datetime(2026, 10, 27, 7, 0)) == "2026-10-27T08:00:00"
+    assert active_until_for("placement", datetime(2026, 10, 31, 23, 59, 59)) == "2026-11-01T00:00:00"
+
+
+def test_active_until_override_is_next_midnight_others_none():
+    assert active_until_for("override", datetime(2026, 10, 27, 7, 37)) == "2026-10-28T00:00:00"
+    assert active_until_for("override", datetime(2026, 10, 31, 0, 0)) == "2026-11-01T00:00:00"
+    assert active_until_for("broadcast", datetime(2026, 10, 27, 7, 37)) is None
+    assert active_until_for("template", datetime(2026, 10, 27, 7, 37)) is None

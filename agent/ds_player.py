@@ -3,11 +3,52 @@ ds_player.py — управление mpv через IPC Unix-сокет (JSON �
 """
 from __future__ import annotations
 import socket, json, time, threading, subprocess, logging, os
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 log = logging.getLogger(__name__)
 MPV_SOCKET = '/tmp/ds-mpv.sock'
+
+# Повторный опрос ленты сразу после active_until: не чаще раза в
+# EXPIRED_REPOLL_EVERY с и только первые EXPIRED_REPOLL_WINDOW с после него.
+EXPIRED_REPOLL_EVERY = 5
+EXPIRED_REPOLL_WINDOW = 120
+
+
+def _active_until(schedule) -> datetime | None:
+    """active_until ленты (наивное МСК) или None: нет поля, null или мусор."""
+    raw = (schedule or {}).get("active_until")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def active_expired(schedule: dict, now: datetime) -> bool:
+    """Истёк ли активный источник ленты (показ — с концом часа, переопределение
+    — в полночь). now — datetime.now(MSK): сравниваем московские «настенные»
+    часы, tzinfo отбрасываем. Нет active_until или он кривой — не истёк
+    (эфир сети, шаблон, лента старого сервера)."""
+    until = _active_until(schedule)
+    return until is not None and now.replace(tzinfo=None) >= until
+
+
+def repoll_after_expiry(schedule: dict, now: datetime, seconds_since_poll: float) -> bool:
+    """Опросить ленту раньше обычного интервала: активный источник только что истёк.
+
+    Многочасовой показ получает active_until на конец каждого часа; без этого
+    на стыке часов экран до интервала опроса играл бы шаблон и потом начинал
+    показ заново. Только первые EXPIRED_REPOLL_WINDOW с после истечения и не
+    чаще раза в EXPIRED_REPOLL_EVERY с — без связи сервер не долбим.
+    """
+    until = _active_until(schedule)
+    if until is None:
+        return False
+    late = (now.replace(tzinfo=None) - until).total_seconds()
+    return 0 <= late < EXPIRED_REPOLL_WINDOW and seconds_since_poll >= EXPIRED_REPOLL_EVERY
 
 
 def build_playable(files: list[str], broken: set[str],

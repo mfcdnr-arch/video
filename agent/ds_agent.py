@@ -82,7 +82,7 @@ log = logging.getLogger("ds_agent")
 # ── Импортируем модули ────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
 from ds_downloader import Downloader
-from ds_player    import VLCPlayer, build_playable
+from ds_player    import VLCPlayer, build_playable, active_expired, repoll_after_expiry
 from ds_sync      import SyncHandler
 from ds_heartbeat import Heartbeat, AGENT_VERSION
 from ds_cleanup   import Cleanup
@@ -123,30 +123,34 @@ def load_schedule_cache():
     return None
 
 
-def current_playlist_files(schedule):
+def current_playlist_files(schedule, now=None):
     """
     Вернуть упорядоченный список файлов плейлиста, актуального сейчас (МСК).
     Приоритет:
       1) hourly_sequence — час эфира (реклама + заглушки равномерно);
-      2) active_playlist (эфир/переопределение); off = экран выключен намеренно;
+      2) active_playlist (эфир/показ/переопределение); off = экран выключен намеренно;
       3) недельный шаблон;
       4) fallback — заглушки, если по расписанию ничего не выпало
          (чтобы в дыре между слотами не было чёрного экрана).
+    Пункты 1–2 действуют до active_until ленты (показ — до конца часа,
+    переопределение — до полуночи): без связи агент не доигрывает чужой час
+    оплаченного показа, а идёт к шаблону и заглушкам. now — для тестов.
     """
-    # 1) Часовая последовательность с заглушками
-    seq = schedule.get("hourly_sequence")
-    if seq:
-        return list(seq)
+    now = now or datetime.now(MSK)
+    if not active_expired(schedule, now):
+        # 1) Часовая последовательность с заглушками
+        seq = schedule.get("hourly_sequence")
+        if seq:
+            return list(seq)
 
-    active = schedule.get("active_playlist")
-    if active:
-        if active.get("off"):
-            return []   # выключено переопределением — фолбэк НЕ играем
-        files = [it.get("filename") for it in (schedule.get("active_items") or []) if it.get("filename")]
-        if files:
-            return files
+        active = schedule.get("active_playlist")
+        if active:
+            if active.get("off"):
+                return []   # выключено переопределением — фолбэк НЕ играем
+            files = [it.get("filename") for it in (schedule.get("active_items") or []) if it.get("filename")]
+            if files:
+                return files
 
-    now = datetime.now(MSK)
     weekday = now.weekday()
     hour = now.hour
     day_slot = None
@@ -354,7 +358,11 @@ def main():
             last_awake = now
 
         # ── Опрос расписания и синхронизация файлов ──
-        if now - last_schedule_poll >= POLL_INTERVAL:
+        # Сразу после active_until (конец часа показа, полночь переопределения)
+        # опрашиваем, не дожидаясь POLL_INTERVAL: многочасовой показ получит
+        # новый час без провала в шаблон (см. ds_player.repoll_after_expiry).
+        if now - last_schedule_poll >= POLL_INTERVAL or (
+                schedule and repoll_after_expiry(schedule, datetime.now(MSK), now - last_schedule_poll)):
             new_schedule = load_schedule_online(screen_id, sess)
             if new_schedule:
                 schedule = new_schedule

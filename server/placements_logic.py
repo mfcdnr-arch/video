@@ -194,6 +194,42 @@ def pick_active(playlist_ids: list[int], playable: dict[int, list]) -> list[int]
     return [pid for pid in playlist_ids if playable.get(pid)]
 
 
+def playlists_for_screen(placements: list[dict], overrides: list[dict], screen_id: int,
+                         d_from: date, d_to: date) -> set[int]:
+    """Плейлисты, ролики которых экрану `screen_id` надо иметь на диске заранее.
+
+    Окно — дни [d_from .. d_to] включительно. Берутся показы этого экрана,
+    у которых хоть один день в окне и которые не остановлены (у остановленного
+    будущих часов нет), и переопределения этого экрана с плейлистом (не
+    «выключен») на даты окна. Решения «заменить/по очереди» не учитываются:
+    качаем с запасом — плейлист может играть в другие часы того же показа.
+    """
+    out = {p["playlist_id"] for p in placements
+           if screen_id in p["screens"] and p.get("stopped_at") is None
+           and dates_overlap(p["date_from"], p["date_to"], d_from, d_to) is not None}
+    out |= {o["playlist_id"] for o in overrides
+            if o["screen_id"] == screen_id and d_from <= o["on_date"] <= d_to
+            and not o.get("is_off") and o.get("playlist_id") is not None}
+    return out
+
+
+def active_until_for(source: str, now: datetime) -> str | None:
+    """До какого момента действует активный источник ленты экрана (наивное МСК, ISO).
+
+    Показ выбирается на час — до начала следующего часа; переопределение
+    даты (в т. ч. «выключен») — до ближайшей полуночи. Эфир сети и шаблон —
+    None: эфир живёт, пока его не выключат, шаблон агент считает сам.
+    Агент без связи по истечении не доигрывает устаревший источник.
+    """
+    if source == "placement":
+        end = now.replace(minute=0, second=0, microsecond=0) + _HOUR
+    elif source == "override":
+        end = datetime.combine(now.date() + timedelta(days=1), time(0))
+    else:
+        return None
+    return end.isoformat()
+
+
 # --- недельный шаблон --------------------------------------------------------
 
 def template_playlist(slots: list[dict], dow: int, hour: int) -> int | None:
