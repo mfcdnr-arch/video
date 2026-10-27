@@ -4,6 +4,12 @@
 
 let CUR_PL = null;
 
+// Блок «Где и когда идёт» в карточке плейлиста (GET /placements?playlist_id=):
+let PLB_SEQ = 0;                 // номер последней загрузки блока — устаревший ответ отбрасываем
+const PLB_ROWS = new Map();      // id показа -> строка ответа (для текста подтверждений)
+const PLB_BUSY = new Set();      // id показов, по которым сейчас идёт запрос («Остановить» / «Отменить»)
+const PLB_DELETING = new Set();  // id плейлистов, у которых открыто подтверждение удаления
+
 function initPlaylistsViewActions(){
   if(window.__playlistsViewActionsInitialized) return;
   window.__playlistsViewActionsInitialized = true;
@@ -45,6 +51,25 @@ function initPlaylistsViewActions(){
         });
       }
 
+      case 'playlists-send': {
+        const id = Number(el.dataset.playlistId);
+        return plbOpenEditor({ playlistId: id, name: el.dataset.playlistName });
+      }
+
+      case 'playlists-plc-edit':
+        return plbOpenEditor({ playlistId: CUR_PL && CUR_PL.id, name: CUR_PL && CUR_PL.name,
+          placementId: Number(el.dataset.placementId) });
+
+      case 'playlists-plc-repeat':
+        return plbOpenEditor({ playlistId: CUR_PL && CUR_PL.id, name: CUR_PL && CUR_PL.name,
+          repeatFrom: Number(el.dataset.placementId) });
+
+      case 'playlists-plc-stop':
+        return plbStop(Number(el.dataset.placementId));
+
+      case 'playlists-plc-cancel':
+        return plbCancel(Number(el.dataset.placementId));
+
       case 'playlists-remove-item': {
         const playlistId = Number(el.dataset.playlistId);
         const itemId = Number(el.dataset.itemId);
@@ -56,6 +81,12 @@ function initPlaylistsViewActions(){
         return Signage.savePlaylistFill(id);
       }
     }
+  });
+
+  // Показ создан или изменён в окне «Куда и когда» — обновим блок, если карточка этого плейлиста открыта
+  document.addEventListener('placements-changed', e => {
+    const pid = e.detail && Number(e.detail.playlistId);
+    if(pid && CUR_PL && CUR_PL.id === pid) plbLoad(pid);
   });
 
   // Переключатель «фиксированная длительность» — прячем/показываем поле минут
@@ -152,14 +183,30 @@ function createPlaylistPrompt(){
 }
 
 async function deletePlaylist(id, name){
-  if(!confirm('Удалить плейлист «' + name + '»?')) return;
-
+  if(PLB_DELETING.has(id)) return;           // подтверждение уже открыто (двойной клик)
+  PLB_DELETING.add(id);
   try{
-    await api('/playlists/' + id, { method:'DELETE' });
-    toast('Плейлист удалён');
-    viewPlaylists();
-  }catch(e){
-    toast('Ошибка: ' + e.message);
+    // Показы плейлиста уйдут вместе с ним — предупредим, сколько их идёт и ждёт
+    let text = 'Удалить плейлист «' + name + '»?';
+    try{
+      const rows = await api('/placements?playlist_id=' + id);
+      const live = (rows || []).filter(p => p.status === 'active' || p.status === 'planned').length;
+      if(live) text = 'Плейлист стоит в ' + live + ' показах — они будут отменены. Удалить плейлист «' + name + '»?';
+    }catch(e){
+      if(!TOKEN) return;                     // сессия истекла — api() уже показал вход
+      text = 'Не удалось проверить, стоит ли плейлист в показах — если стоит, они будут отменены. Удалить плейлист «' + name + '»?';
+    }
+    if(!confirm(text)) return;
+
+    try{
+      await api('/playlists/' + id, { method:'DELETE' });
+      toast('Плейлист удалён');
+      viewPlaylists();
+    }catch(e){
+      toast('Ошибка: ' + e.message);
+    }
+  }finally{
+    PLB_DELETING.delete(id);
   }
 }
 
@@ -174,17 +221,26 @@ async function openPlaylist(id, name){
 
     let h = `<div style="display:flex;align-items:center;gap:9px;margin-bottom:13px;flex-wrap:wrap;">
       <button class="btn" data-action="playlists-back">← Назад</button>
-      <span style="font-weight:500;flex:1;min-width:0;overflow-wrap:anywhere;">▶ ${esc(name)}</span>
-      ${canWrite() ? `<button class="btn primary"
+      <span style="font-weight:500;flex:1 1 160px;min-width:0;overflow-wrap:anywhere;">▶ ${esc(name)}</span>
+      ${canWrite() ? `<button class="btn"
         data-action="playlists-edit-items"
         data-playlist-id="${id}"
-        data-playlist-name="${esc(name)}">✎ Изменить ролики</button>` : ''}
+        data-playlist-name="${esc(name)}">✎ Изменить ролики</button>
+      <button class="btn primary"
+        data-action="playlists-send"
+        data-playlist-id="${id}"
+        data-playlist-name="${esc(name)}">📤 Отправить на экраны</button>` : ''}
+    </div>
+    <div id="pl-placements" class="plb" style="margin-bottom:13px;">
+      <div class="plb-head"><b>Где и когда идёт</b></div>
+      <div class="plb-empty">Загрузка…</div>
     </div>
     <div id="pl-fill-panel" style="margin-bottom:13px;"></div>`;
 
     if(!items.length){
       h += '<div class="empty">Плейлист пуст — нажмите «✎ Изменить ролики» и отметьте ролики.</div>';
       view.innerHTML = h;
+      plbLoad(id);
       loadFillPanel(id);
       return;
     }
@@ -209,10 +265,220 @@ async function openPlaylist(id, name){
 
     h += '</table>';
     view.innerHTML = h;
+    plbLoad(id);
     loadFillPanel(id);
   }catch(e){
     view.innerHTML = '<div class="empty">Ошибка: ' + esc(e.message) + '</div>';
   }
+}
+
+//-----------------------------------------------------------------------------
+// Блок «Где и когда идёт» в карточке плейлиста: показы этого плейлиста
+// (GET /placements?playlist_id=) — экраны, даты, часы, статус, «по очереди»
+// и кнопки по статусу. Окно «Куда и когда» — js/views/placement-editor.js;
+// после его сохранения приходит событие placements-changed (см. выше).
+//-----------------------------------------------------------------------------
+
+const PLB_STATUS = {
+  active:  { text: 'идёт сейчас',  cls: 'now'  },
+  planned: { text: 'запланирован', cls: 'plan' },
+  done:    { text: 'закончился',   cls: 'done' },
+  stopped: { text: 'остановлен',   cls: 'stop' },
+};
+const PLB_SCREENS_SHOWN = 4;     // сколько экранов показа перечислять сразу, остальные — под «и ещё N»
+const PLB_ALT_SCREENS_SHOWN = 3; // и сколько экранов в строке «по очереди»
+
+function plbPlural(n, one, few, many){
+  const m10 = n % 10, m100 = n % 100;
+  if(m10 === 1 && m100 !== 11) return one;
+  if(m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+  return many;
+}
+
+// api() бросает Error(тело ответа); у FastAPI 400/404/409 — {"detail": "текст"}
+function plbErrText(e){
+  const t = String((e && e.message) || e || '');
+  try{
+    const j = JSON.parse(t);
+    if(j && typeof j.detail === 'string') return j.detail;
+  }catch(_){}
+  return 'Ошибка: ' + t;
+}
+
+// ГГГГ-ММ-ДД -> ДД.ММ.ГГГГ / ДД.ММ (строкой, без часовых поясов)
+function plbDmy(iso){ const s = String(iso || ''); return s.slice(8, 10) + '.' + s.slice(5, 7) + '.' + s.slice(0, 4); }
+function plbDm(iso){ const s = String(iso || ''); return s.slice(8, 10) + '.' + s.slice(5, 7); }
+
+// «01.11 – 30.11.2026»; год у начала — только если он другой; один день — «01.11.2026»
+function plbDates(a, b){
+  if(a === b) return plbDmy(a);
+  const same = String(a).slice(0, 4) === String(b).slice(0, 4);
+  return (same ? plbDm(a) : plbDmy(a)) + ' – ' + plbDmy(b);
+}
+
+function plbHH(n){ return String(n).padStart(2, '0'); }
+function plbHours(a, b){ return plbHH(a) + ':00 – ' + plbHH(b) + ':00'; }
+
+// Строки «по очереди»: одинаковые для нескольких экранов склеиваем в одну
+// «05.11–10.11, 10–12 ч: по очереди с «Акция» (на экранах: А, Б)». Экраны не
+// называем, если строка относится ко всем экранам показа (или он на один экран).
+function plbAlternates(p){
+  const groups = new Map();
+  (p.alternates || []).forEach(a => {
+    const key = [a.date_from, a.date_to, a.hour_from, a.hour_to, a.other_playlist_name].join('|');
+    if(!groups.has(key)) groups.set(key, { a, screens: [] });
+    const g = groups.get(key);
+    if(!g.screens.includes(a.screen_name)) g.screens.push(a.screen_name);
+  });
+  const total = p.all_screens ? p.screen_count : (p.screens || []).length;
+  return Array.from(groups.values()).map(({ a, screens }) => {
+    const days = a.date_from === a.date_to ? plbDm(a.date_from)
+      : (String(a.date_from).slice(0, 4) === String(a.date_to).slice(0, 4)
+        ? plbDm(a.date_from) + '–' + plbDm(a.date_to)
+        : plbDmy(a.date_from) + '–' + plbDmy(a.date_to));
+    let where = '';
+    if(total > 1 && screens.length < total){
+      const shown = screens.slice(0, PLB_ALT_SCREENS_SHOWN).join(', ');
+      const rest = screens.length - PLB_ALT_SCREENS_SHOWN;
+      where = ' (на ' + (screens.length === 1 ? 'экране' : 'экранах') + ': ' + shown
+        + (rest > 0 ? ' и ещё ' + rest : '') + ')';
+    }
+    return days + ', ' + plbHH(a.hour_from) + '–' + plbHH(a.hour_to) + ' ч: по очереди с «'
+      + a.other_playlist_name + '»' + where;
+  });
+}
+
+function plbWhereHtml(p){
+  if(p.all_screens) return `<b>Все экраны сети · ${esc(p.screen_count)}</b>`;
+  const names = (p.screens || []).map(s => s.name);
+  if(!names.length) return '<i>нет экранов</i>';
+  if(names.length <= PLB_SCREENS_SHOWN) return names.map(n => `<b>${esc(n)}</b>`).join('');
+  const head = names.slice(0, PLB_SCREENS_SHOWN - 1).map(n => `<b>${esc(n)}</b>`).join('');
+  const rest = names.slice(PLB_SCREENS_SHOWN - 1);
+  return head + `<details class="plb-more"><summary>и ещё ${esc(rest.length)}</summary>`
+    + rest.map(n => `<b>${esc(n)}</b>`).join('') + '</details>';
+}
+
+// Показ одной строкой для текста подтверждения (это plain text — esc не нужен)
+function plbDescribe(p){
+  let where;
+  if(p.all_screens) where = 'все экраны сети (' + p.screen_count + ')';
+  else{
+    const names = (p.screens || []).map(s => s.name);
+    where = names.length > 3 ? names.slice(0, 3).join(', ') + ' и ещё ' + (names.length - 3) : names.join(', ');
+  }
+  return where + ', ' + plbDates(p.date_from, p.date_to) + ', ' + plbHours(p.hour_from, p.hour_to);
+}
+
+function plbActionsHtml(p){
+  const id = esc(p.id);
+  const btn = (action, label, cls) =>
+    `<button type="button" class="btn${cls ? ' ' + cls : ''} plb-btn" data-action="${action}" data-placement-id="${id}"${PLB_BUSY.has(p.id) ? ' disabled' : ''}>${label}</button>`;
+  switch(p.status){
+    case 'active':  return btn('playlists-plc-edit', 'Изменить') + btn('playlists-plc-stop', 'Остановить', 'danger');
+    case 'planned': return btn('playlists-plc-edit', 'Изменить') + btn('playlists-plc-cancel', 'Отменить', 'danger');
+    case 'done':
+    case 'stopped': return btn('playlists-plc-repeat', 'Повторить');
+  }
+  return '';
+}
+
+function plbRowHtml(p, write){
+  const st = PLB_STATUS[p.status] || { text: p.status, cls: 'done' };
+  // «по очереди» показываем только у идущих и запланированных: у закончившихся и остановленных они устарели
+  const alts = (p.status === 'active' || p.status === 'planned')
+    ? plbAlternates(p).map(t => `<span class="plb-alt">${esc(t)}</span>`).join('') : '';
+  return `<tr>
+    <td class="plb-scr">${plbWhereHtml(p)}</td>
+    <td class="plb-nw">${esc(plbDates(p.date_from, p.date_to))}</td>
+    <td class="plb-nw">${esc(plbHours(p.hour_from, p.hour_to))}</td>
+    <td><span class="plb-st ${st.cls}">${esc(st.text)}</span>${alts}</td>
+    ${write ? `<td><div class="plb-acts">${plbActionsHtml(p)}</div></td>` : ''}
+  </tr>`;
+}
+
+function plbRender(box, rows){
+  const write = canWrite();
+  PLB_ROWS.clear();
+  rows.forEach(p => PLB_ROWS.set(p.id, p));
+  const n = rows.length;
+  const count = n ? `<span class="plb-count">${n} ${plbPlural(n, 'показ', 'показа', 'показов')}</span>` : '';
+  let body;
+  if(!n){
+    body = `<div class="plb-empty">${write
+      ? 'Плейлист пока не отправлен на экраны — нажмите «📤 Отправить на экраны».'
+      : 'Плейлист пока не отправлен на экраны.'}</div>`;
+  }else{
+    body = `<div class="plb-scroll"><table class="plb-table">
+      <tr><th>Экраны</th><th>Даты</th><th>Часы</th><th>Статус</th>${write ? '<th></th>' : ''}</tr>
+      ${rows.map(p => plbRowHtml(p, write)).join('')}
+    </table></div>`;
+  }
+  box.innerHTML = `<div class="plb-head"><b>Где и когда идёт</b>${count}</div>${body}`;
+}
+
+// Загрузить показы плейлиста в блок карточки (первый раз и после любого изменения)
+async function plbLoad(pid){
+  const box = document.getElementById('pl-placements');
+  if(!box) return;
+  const seq = ++PLB_SEQ;
+  try{
+    const rows = await api('/placements?playlist_id=' + pid);
+    // карточка успела закрыться / перерисоваться, или пришёл более свежий ответ
+    if(seq !== PLB_SEQ || document.getElementById('pl-placements') !== box) return;
+    plbRender(box, Array.isArray(rows) ? rows : []);
+  }catch(e){
+    if(seq !== PLB_SEQ || document.getElementById('pl-placements') !== box) return;
+    PLB_ROWS.clear();
+    box.innerHTML = `<div class="plb-head"><b>Где и когда идёт</b></div>
+      <div class="plb-empty">Не удалось получить показы: ${esc(plbErrText(e))}</div>`;
+  }
+}
+
+// Окно «Куда и когда»: новый показ, правка (placementId) или «Повторить» (repeatFrom)
+function plbOpenEditor(opts){
+  if(typeof Signage.openPlacementEditor !== 'function'){ toast('Окно отправки на экраны не загружено'); return; }
+  if(!opts.playlistId) return;
+  return Signage.openPlacementEditor({
+    playlistId: opts.playlistId,
+    name: opts.name || undefined,
+    placementId: opts.placementId,
+    repeatFrom: opts.repeatFrom,
+  });
+}
+
+// Запрос по одному показу: пока он идёт, кнопки этой строки заблокированы; по
+// итогу (и успех, и 409 «статус уже другой») блок перечитывается с сервера
+async function plbRequest(placementId, method, path, okText){
+  const pid = CUR_PL && CUR_PL.id;
+  if(!pid || PLB_BUSY.has(placementId)) return;
+  PLB_BUSY.add(placementId);
+  document.querySelectorAll(`#pl-placements [data-placement-id="${placementId}"]`)
+    .forEach(b => { b.disabled = true; });
+  try{
+    await api(path, { method });
+    toast(okText);
+  }catch(e){
+    toast(plbErrText(e));
+  }finally{
+    PLB_BUSY.delete(placementId);
+  }
+  if(CUR_PL && CUR_PL.id === pid) plbLoad(pid);
+}
+
+function plbStop(placementId){
+  const p = PLB_ROWS.get(placementId);
+  if(!p || PLB_BUSY.has(placementId)) return;
+  if(!confirm('Остановить показ?\n\n' + plbDescribe(p)
+    + '\n\nС этого момента плейлист на экранах идти не будет. Уже прошедшие часы останутся в истории.')) return;
+  return plbRequest(placementId, 'POST', '/placements/' + placementId + '/stop', 'Показ остановлен');
+}
+
+function plbCancel(placementId){
+  const p = PLB_ROWS.get(placementId);
+  if(!p || PLB_BUSY.has(placementId)) return;
+  if(!confirm('Отменить запланированный показ?\n\n' + plbDescribe(p) + '\n\nПоказ будет удалён.')) return;
+  return plbRequest(placementId, 'DELETE', '/placements/' + placementId, 'Показ отменён');
 }
 
 // Панель «Длительность эфирного блока»: режим, факт/цель, предупреждения

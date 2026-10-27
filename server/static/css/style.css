@@ -252,3 +252,28 @@
     .plc-grid{grid-template-columns:minmax(0,1fr);}
     .plc-col + .plc-col{border-left:0;border-top:1px solid var(--border);}
   }
+
+  /* карточка плейлиста, блок «Где и когда идёт» (js/views/playlists.js): показы, статусы, кнопки */
+  .plb{background:var(--panel);border:1px solid var(--border);border-radius:10px;}
+  .plb-head{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--border);}
+  .plb-head b{flex:1;font-size:13px;font-weight:600;}
+  .plb-count{font-size:12px;color:var(--dim);}
+  .plb-empty{padding:14px;font-size:12px;color:var(--muted);overflow-wrap:anywhere;}
+  .plb-scroll{overflow-x:auto;}
+  .plb-table{min-width:680px;}
+  .plb-table th{padding:7px 12px;border-bottom:0;font-size:11px;font-weight:500;color:var(--dim);text-transform:uppercase;letter-spacing:.4px;white-space:nowrap;}
+  .plb-table td{padding:9px 12px;border-bottom:0;border-top:1px solid var(--border);vertical-align:top;font-size:12px;color:var(--txt2);}
+  .plb-nw{white-space:nowrap;}
+  .plb-scr b{display:block;font-weight:500;color:var(--txt);overflow-wrap:anywhere;}
+  .plb-scr i{display:block;font-style:normal;color:var(--dim);}
+  .plb-more{margin-top:2px;}
+  .plb-more summary{cursor:pointer;color:var(--accent);font-size:11px;}
+  .plb-more summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:2px;}
+  .plb-st{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;white-space:nowrap;}
+  .plb-st.now{background:rgba(60,207,145,.15);color:#3ccf91;}
+  .plb-st.plan{background:rgba(91,163,236,.15);color:#8ab8ff;}
+  .plb-st.done{background:rgba(139,145,156,.15);color:var(--muted);}
+  .plb-st.stop{padding:1px 7px;border:1px dashed var(--dim);color:var(--muted);}
+  .plb-alt{display:block;margin-top:5px;font-size:11px;color:var(--c-nike);overflow-wrap:anywhere;}
+  .plb-acts{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap;}
+  .plb-btn{padding:4px 10px;font-size:12px;}
