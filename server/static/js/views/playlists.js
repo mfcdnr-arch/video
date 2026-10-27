@@ -35,9 +35,14 @@ function initPlaylistsViewActions(){
       case 'playlists-back':
         return Signage.nav('playlists');
 
-      case 'playlists-add-item': {
+      case 'playlists-edit-items': {
         const id = Number(el.dataset.playlistId);
-        return Signage.addToPlaylist(id);
+        const name = el.dataset.playlistName || '';
+        return Signage.openPlaylistEditor({
+          playlistId: id,
+          name,
+          onSaved: r => openPlaylist(id, r.name)
+        });
       }
 
       case 'playlists-remove-item': {
@@ -59,26 +64,40 @@ function initPlaylistsViewActions(){
       const wrap = document.getElementById('pl-fill-minutes-wrap');
       if(wrap) wrap.style.display = e.target.checked ? '' : 'none';
     }
-    if(e.target && e.target.id === 'pl-add-folder'){
-      plFillMediaSelect();
-    }
   });
 }
 
-// Ролики выбранной папки → во второй селект
-let PL_PICK_MEDIA = [];
-function plFillMediaSelect(){
-  const folderSel = document.getElementById('pl-add-folder');
-  const mediaSel = document.getElementById('pl-add-media');
-  if(!folderSel || !mediaSel) return;
-  const key = folderSel.value;
-  let list = PL_PICK_MEDIA;
-  if(key === 'root')             list = list.filter(m => !m.advertiser_id && !m.folder_id);
-  else if(key.startsWith('f:'))  { const fid = Number(key.slice(2)); list = list.filter(m => m.folder_id === fid); }
-  else if(key.startsWith('a:'))  { const aid = Number(key.slice(2)); list = list.filter(m => m.advertiser_id === aid && !m.folder_id); }
-  mediaSel.innerHTML = list.length
-    ? list.map(m => `<option value="${m.id}">${esc(m.title || m.filename)}</option>`).join('')
-    : '<option value="">— в этой папке нет роликов —</option>';
+// Папки для выбора ролика (окно «Плейлист», js/views/playlist-editor.js):
+// «Все», «Общая медиатека» (без рекламодателя и папки), общие папки,
+// рекламодатель без папки, папки рекламодателей. media — ролики, из которых
+// выбирают (без заглушек); показываются только папки, где есть такие ролики.
+// -> [{key, label}], ключи: all | root | f:<id папки> | a:<id рекламодателя>
+function buildMediaGroups(media, folders){
+  folders = folders || [];
+  const hasRoot = media.some(m => !m.advertiser_id && !m.folder_id);
+  const folderIds = new Set(media.filter(m => m.folder_id).map(m => m.folder_id));
+  const groups = [{key:'all', label:'Все ролики'}];
+  if(hasRoot) groups.push({key:'root', label:'🗂 Общая медиатека (без папки)'});
+  folders.filter(f => !f.advertiser_id && folderIds.has(f.id)).forEach(f =>
+    groups.push({key:'f:'+f.id, label:'🗂 Общая / ' + f.name}));
+  const advSeen = new Set();
+  media.forEach(m => {
+    if(m.advertiser_id && !m.folder_id && !advSeen.has(m.advertiser_id)){
+      advSeen.add(m.advertiser_id);
+      groups.push({key:'a:'+m.advertiser_id, label:(m.advertiser||('Рекламодатель '+m.advertiser_id)) + ' (без папки)'});
+    }
+  });
+  folders.filter(f => f.advertiser_id && folderIds.has(f.id)).forEach(f =>
+    groups.push({key:'f:'+f.id, label:(f.advertiser||'') + ' / ' + f.name}));
+  return groups;
+}
+
+// Ролики группы с ключом из buildMediaGroups.
+function filterMediaByGroup(list, key){
+  if(key === 'root')            return list.filter(m => !m.advertiser_id && !m.folder_id);
+  if(key.startsWith('f:'))      { const fid = Number(key.slice(2)); return list.filter(m => m.folder_id === fid); }
+  if(key.startsWith('a:'))      { const aid = Number(key.slice(2)); return list.filter(m => m.advertiser_id === aid && !m.folder_id); }
+  return list;
 }
 
 async function viewPlaylists(){
@@ -127,17 +146,9 @@ async function viewPlaylists(){
   }
 }
 
-async function createPlaylistPrompt(){
-  const name = prompt('Название плейлиста:');
-  if(!name || !name.trim()) return;
-
-  try{
-    await api('/playlists?name=' + encodeURIComponent(name.trim()), { method:'POST' });
-    toast('Плейлист создан');
-    viewPlaylists();
-  }catch(e){
-    toast('Ошибка: ' + e.message);
-  }
+// «+ Плейлист»: окно с названием и плитками роликов (вместо prompt и пары списков)
+function createPlaylistPrompt(){
+  Signage.openPlaylistEditor({ onSaved: () => viewPlaylists() });
 }
 
 async function deletePlaylist(id, name){
@@ -159,53 +170,21 @@ async function openPlaylist(id, name){
   const view = document.getElementById('view');
 
   try{
-    const [items, media, folders] = await Promise.all([
-      api('/playlists/' + id + '/items'),
-      api('/media'),
-      api('/media/folders-all').catch(() => [])
-    ]);
+    const items = await api('/playlists/' + id + '/items');
 
-    let h = `<div style="display:flex;align-items:center;gap:9px;margin-bottom:13px;">
+    let h = `<div style="display:flex;align-items:center;gap:9px;margin-bottom:13px;flex-wrap:wrap;">
       <button class="btn" data-action="playlists-back">← Назад</button>
-      <span style="font-weight:500;flex:1;">▶ ${esc(name)}</span>
+      <span style="font-weight:500;flex:1;min-width:0;overflow-wrap:anywhere;">▶ ${esc(name)}</span>
+      ${canWrite() ? `<button class="btn primary"
+        data-action="playlists-edit-items"
+        data-playlist-id="${id}"
+        data-playlist-name="${esc(name)}">✎ Изменить ролики</button>` : ''}
     </div>
     <div id="pl-fill-panel" style="margin-bottom:13px;"></div>`;
 
-    if(canWrite()){
-      // Заглушки в выпадашке не показываем: они добавляются в блок автоматически
-      PL_PICK_MEDIA = media.filter(m => !m.is_filler);
-      // Папки для первого селекта: «Все», «Общая медиатека» (без рекламодателя
-      // и папки), общие папки, рекламодатель без папки, папки рекламодателей
-      // Показываем только папки, где есть подходящие ролики (заглушки не в счёт)
-      const hasRoot = PL_PICK_MEDIA.some(m => !m.advertiser_id && !m.folder_id);
-      const folderIds = new Set(PL_PICK_MEDIA.filter(m => m.folder_id).map(m => m.folder_id));
-      const groups = [{key:'all', label:'Все ролики'}];
-      if(hasRoot) groups.push({key:'root', label:'🗂 Общая медиатека (без папки)'});
-      folders.filter(f => !f.advertiser_id && folderIds.has(f.id)).forEach(f =>
-        groups.push({key:'f:'+f.id, label:'🗂 Общая / ' + f.name}));
-      const advSeen = new Set();
-      PL_PICK_MEDIA.forEach(m => {
-        if(m.advertiser_id && !m.folder_id && !advSeen.has(m.advertiser_id)){
-          advSeen.add(m.advertiser_id);
-          groups.push({key:'a:'+m.advertiser_id, label:(m.advertiser||('Рекламодатель '+m.advertiser_id)) + ' (без папки)'});
-        }
-      });
-      folders.filter(f => f.advertiser_id && folderIds.has(f.id)).forEach(f =>
-        groups.push({key:'f:'+f.id, label:(f.advertiser||'') + ' / ' + f.name}));
-
-      h += `<div style="display:flex;gap:8px;margin-bottom:14px;align-items:center;flex-wrap:wrap;">
-        <select class="inp" id="pl-add-folder" style="min-width:220px;" title="Из какой папки выбирать ролик">
-          ${groups.map(g => `<option value="${g.key}">${esc(g.label)}</option>`).join('')}</select>
-        <select class="inp" id="pl-add-media" style="flex:1;min-width:220px;"></select>
-        <input class="inp" id="pl-add-repeat" type="number" min="1" max="99" value="1" style="width:60px;" title="Повторов">
-        <button class="btn primary" data-action="playlists-add-item" data-playlist-id="${id}">+ Добавить</button>
-      </div>`;
-    }
-
     if(!items.length){
-      h += '<div class="empty">Плейлист пуст — добавьте ролики выше.</div>';
+      h += '<div class="empty">Плейлист пуст — нажмите «✎ Изменить ролики» и отметьте ролики.</div>';
       view.innerHTML = h;
-      plFillMediaSelect();
       loadFillPanel(id);
       return;
     }
@@ -230,7 +209,6 @@ async function openPlaylist(id, name){
 
     h += '</table>';
     view.innerHTML = h;
-    plFillMediaSelect();
     loadFillPanel(id);
   }catch(e){
     view.innerHTML = '<div class="empty">Ошибка: ' + esc(e.message) + '</div>';
@@ -286,24 +264,6 @@ async function savePlaylistFill(pid){
   }catch(e){ toast('Ошибка: ' + e.message); }
 }
 
-async function addToPlaylist(pid){
-  const mid = document.getElementById('pl-add-media')?.value;
-  const rc = parseInt(document.getElementById('pl-add-repeat')?.value) || 1;
-
-  if(!mid){
-    toast('Выберите ролик');
-    return;
-  }
-
-  try{
-    const res = await api(`/playlists/${pid}/items?media_id=${mid}&repeat_count=${rc}`, { method:'POST' });
-    toast(res && res.warning ? ('Добавлен. ⚠ ' + res.warning) : 'Ролик добавлен');
-    openPlaylist(pid, CUR_PL?.name || '');
-  }catch(e){
-    toast('Ошибка: ' + e.message);
-  }
-}
-
 async function removeFromPlaylist(pid, itemId){
   if(!confirm('Удалить ролик из плейлиста?')) return;
 
@@ -321,7 +281,8 @@ window.Signage.viewPlaylists = viewPlaylists;
 window.Signage.createPlaylistPrompt = createPlaylistPrompt;
 window.Signage.deletePlaylist = deletePlaylist;
 window.Signage.openPlaylist = openPlaylist;
-window.Signage.addToPlaylist = addToPlaylist;
+window.Signage.buildMediaGroups = buildMediaGroups;
+window.Signage.filterMediaByGroup = filterMediaByGroup;
 window.Signage.removeFromPlaylist = removeFromPlaylist;
 window.Signage.savePlaylistFill = savePlaylistFill;
 

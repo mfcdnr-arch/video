@@ -271,18 +271,24 @@ async function clickNth(page, action, n) {
       still ? bad('экран остался в списке после удаления') : ok('экран удалён, список обновился');
     }
 
-    // ── 5. Плейлист: создать → найти → удалить ─────────────────────────────
+    // ── 5. Плейлист: окно открывается → создать → найти → удалить ──────────
+    // «+ Плейлист» открывает окно со списком роликов; на пустом стенде роликов
+    // нет, поэтому плейлист для цикла создаётся прямым запросом (полный сценарий
+    // окна — отдельным шагом E2E).
     head('Цикл «плейлист»: создание и удаление');
     step = 'создание плейлиста';
     await gotoSection(page, 'playlists');
     dialogMode = 'accept';
-    promptAnswer = PLAYLIST_NAME;
     const createBtn = await page.$('[data-action="playlists-create"]');
     if (!createBtn) {
       bad('кнопка «+ Плейлист» не найдена');
     } else {
       await createBtn.click();
-      await sleep(1200);
+      const winOpen = await page.waitForSelector('#pled-name', { timeout: 8000 }).then(() => true, () => false);
+      winOpen ? ok('окно «Новый плейлист» открылось') : bad('окно «Новый плейлист» не открылось');
+      await page.keyboard.press('Escape');     // пустое окно закрывается без вопросов
+      await sleep(300);
+      await page.evaluate(n => api('/playlists?name=' + encodeURIComponent(n), { method: 'POST' }), PLAYLIST_NAME);
       await gotoSection(page, 'playlists');
       const has = await page.evaluate(n => document.getElementById('view').innerText.includes(n), PLAYLIST_NAME);
       has ? ok('плейлист создан и виден в списке') : bad('плейлист не появился в списке');
