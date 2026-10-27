@@ -8,6 +8,13 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
+class FileListError(Exception):
+    """Список файлов с сервера получить не удалось: нет сети, ответ не 200,
+    тело — не JSON или не список записей. Отличается от пустого списка: пустой
+    ответ сервера — законное «ничего не нужно», а сбой — «не знаем, что нужно»,
+    и по такому сбою ничего удалять нельзя."""
+
+
 def md5_file(path: str) -> str:
     h = hashlib.md5()
     with open(path, "rb") as f:
@@ -29,14 +36,27 @@ class Downloader:
         return f"{self.server}{path}"
 
     def get_file_list(self, screen_id: int) -> list[dict]:
-        """Получить список файлов, которые должны быть на этом устройстве."""
+        """Получить список файлов, которые должны быть на этом устройстве.
+
+        Успешный пустой список [] — законный ответ «ничего не нужно». Любой сбой
+        (сеть, ответ не 200, не JSON, не список, запись без имени файла) —
+        исключение FileListError: по нему вызывающий код не должен удалять файлы."""
         try:
             r = self.session.get(self._url(f"/api/files/list/{screen_id}"), timeout=15)
-            r.raise_for_status()
-            return r.json()
+            if r.status_code != 200:
+                raise FileListError(f"сервер ответил {r.status_code}")
+            data = r.json()
+        except FileListError:
+            raise
         except Exception as e:
-            log.error(f"Не удалось получить список файлов: {e}")
-            return []
+            raise FileListError(f"запрос списка файлов не удался: {e}")
+        if not isinstance(data, list):
+            raise FileListError(f"ответ сервера — не список ({type(data).__name__})")
+        for item in data:
+            if not isinstance(item, dict) or not isinstance(item.get("filename"), str) \
+                    or not item["filename"]:
+                raise FileListError("в списке есть запись без имени файла")
+        return data
 
     def download_file(self, media_id: int, filename: str, expected_md5: str,
                       expected_size: int) -> bool:
@@ -98,7 +118,12 @@ class Downloader:
         """
         Синхронизировать файлы: скачать нужные, вернуть (downloaded, failed).
         """
-        needed = self.get_file_list(screen_id)
+        try:
+            needed = self.get_file_list(screen_id)
+        except FileListError as e:
+            # Нет списка — нечего качать; цикл агента не падает, повторим при следующем опросе
+            log.error(f"Синхронизация файлов пропущена: {e}")
+            return 0, 0
         downloaded = 0
         failed = 0
 
@@ -121,8 +146,13 @@ class Downloader:
         return downloaded, failed
 
     def cleanup_unused(self, screen_id: int):
-        """Удалить файлы, которые больше не нужны для расписания."""
-        needed = {item["filename"] for item in self.get_file_list(screen_id)}
+        """Удалить файлы, которые больше не нужны для расписания.
+        Если список с сервера получить не удалось — не удаляем ничего."""
+        try:
+            needed = {item["filename"] for item in self.get_file_list(screen_id)}
+        except FileListError as e:
+            log.error(f"Очистка пропущена: {e}")
+            return
         for path in self.media_dir.iterdir():
             # Скрытые файлы (начинающиеся с '.') не трогаем:
             # .schedule_cache.json нужен для офлайн-работы агента.
