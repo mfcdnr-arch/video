@@ -12,12 +12,22 @@
  *   2. Проходит ВСЕ разделы левого меню, проверяя, что вью отрисовалось.
  *   3. Жмёт все «безопасные» кнопки раздела (открыть форму, вкладку, фильтр,
  *      отчёт) — список действий белый, разрушающие не трогаются НИКОГДА.
- *   4. Прогоняет два цикла с уборкой за собой: экран и плейлист
- *      (создать → увидеть в списке → удалить).
+ *   4. Прогоняет циклы с уборкой за собой: экран (создать → увидеть →
+ *      удалить) и ПЛЕЙЛИСТ целиком — окно «Новый плейлист» (поиск, галочка,
+ *      повторы ×N, предупреждение «подряд»), шаг «Куда и когда» (все экраны
+ *      сети, завтра, 10–11 ч, пересечения), строка «запланирован» в карточке,
+ *      режим «По датам» в Расписании, отмена показа и удаление плейлиста.
+ *      Плюс просмотр ролика в Медиатеке.
  *   5. Копит ошибки консоли, необработанные исключения и ответы HTTP ≥400.
  *
  * Любая ошибка консоли/JS и любой ответ ≥400 — это провал прогона: именно
  * так выглядели дефекты, которые ловили руками.
+ *
+ * Тестовые объекты. Для плейлиста нужны экран и одобренный ролик, а на пустом
+ * стенде их нет: прогон сам заводит экран «E2E_стенд_…» и картинку-ролик
+ * «E2E_ролик_…» (служебная категория — одобрена без модерации) и в конце
+ * убирает ВСЁ, что создал, — и когда проверка упала. Плейлист с показом,
+ * созданный по ходу, удаляется страховочной уборкой по названию.
  *
  * Запуск — через ui_test.sh (поднимает контейнер с Chromium).
  * Переменные: DS_URL (по умолч. http://nginx), ADMIN_USER, ADMIN_PASS.
@@ -30,6 +40,10 @@ const PASS = process.env.ADMIN_PASS || 'admin123';
 const STAMP = new Date().toISOString().slice(11, 19).replace(/:/g, '');
 const SCREEN_NAME = `E2E_экран_${STAMP}`;
 const PLAYLIST_NAME = `E2E_плейлист_${STAMP}`;
+const CLIP_TITLE = `E2E_ролик_${STAMP}`;
+const CLIP_QUERY = `ролик_${STAMP}`;        // часть названия: проверяем и поиск по подстроке
+const FIXTURE_SCREEN = `E2E_стенд_${STAMP}`;
+const DUP_TITLE = `E2E_дубль_${STAMP}`;
 
 // Разделы левого меню: [data-nav, заголовок в шапке].
 const SECTIONS = [
@@ -54,7 +68,9 @@ const SAFE_ACTIONS = new Set([
   'media-open-upload', 'media-open-adv', 'media-open-common', 'media-open-fillers',
   'media-back', 'media-select-all', 'media-common-folder',
   'playlists-open', 'playlists-back',
+  'mprev-open',
   'schedule-mode-week', 'schedule-mode-month', 'schedule-change-month',
+  'schedule-mode-dates', 'schedule-week-next',
   'schedule-toggle-list', 'schedule-target-network', 'schedule-target-group',
   'schedule-target-screen', 'schedule-select-target', 'schedule-simulate',
   'campaigns-open-create', 'campaigns-cancel-create', 'campaigns-toggle-daily',
@@ -89,8 +105,13 @@ const bad = (m) => { FAIL_N++; console.log('  ✗ ' + m); };
 const head = (m) => console.log('\n▶ ' + m);
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// Ожидаемые «ошибки» на время одного шага (например, 409 «такой ролик уже есть» —
+// сервер так и должен ответить на повторную загрузку). Список очищает сам шаг.
+let expected = [];
+
 function record(kind, text) {
   if (IGNORE_TEXT.some(re => re.test(text))) return;
+  if (expected.some(re => re.test(`${kind}: ${text}`))) return;
   problems.push(`[${step}] ${kind}: ${text}`);
 }
 
@@ -130,6 +151,94 @@ async function clickNth(page, action, n) {
   return true;
 }
 
+/** Закрыть открытые окна клавишей Esc (как это сделал бы человек). Безопасные
+ *  кнопки вроде «Просмотр» открывают модальное окно поверх страницы — без
+ *  закрытия следующий клик по меню попал бы в затемнённый фон. */
+async function closeModals(page) {
+  for (let i = 0; i < 4; i++) {
+    if (!await page.$('.modal-backdrop')) return true;
+    await page.keyboard.press('Escape');
+    await sleep(250);
+  }
+  return !await page.$('.modal-backdrop');
+}
+
+/** Ждать условия в странице; true/false вместо исключения по таймауту. */
+const waitUntil = (page, fn, arg, timeout = 10000) =>
+  page.waitForFunction(fn, { timeout }, arg).then(() => true, () => false);
+
+/** Запрос к API от имени вошедшего администратора (токен берётся из страницы).
+ *  opts.json — JSON-тело; opts.file {b64, type, name} — загрузка файла. */
+async function apiCall(page, method, path, opts = {}) {
+  return page.evaluate(async (method, path, opts) => {
+    const headers = { 'Authorization': 'Bearer ' + localStorage.getItem('ds_token') };
+    let body;
+    if (opts.file) {
+      body = new FormData();
+      const bin = Uint8Array.from(atob(opts.file.b64), c => c.charCodeAt(0));
+      body.append('file', new Blob([bin], { type: opts.file.type }), opts.file.name);
+    } else if (opts.json) {
+      headers['Content-Type'] = 'application/json';
+      body = JSON.stringify(opts.json);
+    }
+    const r = await fetch('/api' + path, { method, headers, body });
+    let data = null;
+    try { data = await r.json(); } catch (_) { /* пустое тело */ }
+    return { status: r.status, data };
+  }, method, path, opts);
+}
+
+/** Минимальный валидный PNG 64×36 (цвет и текстовая метка зависят от stamp —
+ *  у каждого прогона свой md5, окно «такой ролик уже есть» не мешает). */
+function makePng(stamp) {
+  const zlib = require('zlib');
+  const table = new Uint32Array(256).map((_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc32 = (buf) => {
+    let c = 0xFFFFFFFF;
+    for (const b of buf) c = table[(c ^ b) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  };
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(body));
+    return Buffer.concat([len, body, crc]);
+  };
+  const W = 64, H = 36;
+  const n = parseInt(stamp, 10) || 0;
+  const px = Buffer.from([40 + n % 180, 60 + (n >> 3) % 160, 90 + (n >> 6) % 140]);
+  const row = Buffer.concat([Buffer.from([0]), ...Array(W).fill(px)]);      // фильтр 0 + RGB
+  const raw = Buffer.concat(Array(H).fill(row));
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(W, 0); ihdr.writeUInt32BE(H, 4);
+  ihdr[8] = 8; ihdr[9] = 2;                                                 // 8 бит, RGB
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+    chunk('IHDR', ihdr),
+    chunk('tEXt', Buffer.from('Comment\0e2e-' + stamp, 'latin1')),
+    chunk('IDAT', zlib.deflateSync(raw)),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+// «Сегодня» по Москве (так считает и сама панель) и сдвиг даты на n суток.
+const MSK_FMT = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Europe/Moscow', year: 'numeric', month: '2-digit', day: '2-digit' });
+function mskToday() {
+  const parts = MSK_FMT.formatToParts(new Date());
+  const g = t => parts.find(p => p.type === t).value;
+  return `${g('year')}-${g('month')}-${g('day')}`;
+}
+function addDays(iso, n) {
+  const d = new Date(iso + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
 (async () => {
   console.log('════════════════════════════════════════════');
   console.log(' UI/E2E ТЕСТ ПАНЕЛИ — ' + new Date().toLocaleString('ru-RU'));
@@ -158,6 +267,9 @@ async function clickNth(page, action, n) {
     else await d.dismiss();
   });
 
+  // Что прогон создал сам и должен убрать (даже если проверка упала).
+  const fx = { screenId: null, mediaId: null };
+
   try {
     // ── 1. Вход ────────────────────────────────────────────────────────────
     head('Вход в панель');
@@ -181,6 +293,32 @@ async function clickNth(page, action, n) {
       const err = await page.$eval('#lg-err', el => el.textContent).catch(() => '');
       bad(`вход не удался${err ? ' — ' + err : ''}`);
       throw new Error('без входа продолжать нечего');
+    }
+
+    // ── 1а. Тестовые объекты ───────────────────────────────────────────────
+    // Плейлист не отправить без экрана и не собрать без одобренного ролика, а
+    // на чистом стенде нет ни того, ни другого. Экран живёт до конца прогона
+    // (на нём же проверяется бейдж монитора), ролик — до уборки.
+    head('Подготовка: тестовый экран и ролик');
+    step = 'подготовка';
+    const scr = await apiCall(page, 'POST',
+      `/minipc/register?name=${encodeURIComponent(FIXTURE_SCREEN)}&city=E2E`);
+    if (scr.status === 200 && scr.data && scr.data.id) {
+      fx.screenId = scr.data.id;
+      ok(`тестовый экран заведён (id ${fx.screenId})`);
+    } else {
+      bad(`тестовый экран не заведён (HTTP ${scr.status})`);
+    }
+    // category=service — служебный контент: одобряется сразу, без модерации
+    const clip = await apiCall(page, 'POST',
+      `/media/upload?title=${encodeURIComponent(CLIP_TITLE)}&category=service&allow_duplicate=true`,
+      { file: { b64: makePng(STAMP).toString('base64'), type: 'image/png', name: `e2e_${STAMP}.png` } });
+    if (clip.status === 200 && clip.data && clip.data.id && clip.data.review_status === 'approved') {
+      fx.mediaId = clip.data.id;
+      ok(`тестовый ролик загружен и одобрен (id ${fx.mediaId})`);
+    } else {
+      if (clip.data && clip.data.id) fx.mediaId = clip.data.id;       // чтобы уборка его нашла
+      bad(`тестовый ролик не загружен (HTTP ${clip.status})`);
     }
 
     // ── 2. Все разделы меню открываются ────────────────────────────────────
@@ -219,6 +357,7 @@ async function clickNth(page, action, n) {
           await sleep(500);
           clicked++;
           if (problems.length > before) failed++;
+          await closeModals(page);       // «Просмотр» и подобные открывают окно — закрываем Esc
         } catch (e) {
           record('клик не прошёл', `${b.action}: ${e.message.split('\n')[0]}`);
           failed++;
@@ -271,43 +410,299 @@ async function clickNth(page, action, n) {
       still ? bad('экран остался в списке после удаления') : ok('экран удалён, список обновился');
     }
 
-    // ── 5. Плейлист: окно открывается → создать → найти → удалить ──────────
-    // «+ Плейлист» открывает окно со списком роликов; на пустом стенде роликов
-    // нет, поэтому плейлист для цикла создаётся прямым запросом (полный сценарий
-    // окна — отдельным шагом E2E).
-    head('Цикл «плейлист»: создание и удаление');
-    step = 'создание плейлиста';
-    await gotoSection(page, 'playlists');
-    dialogMode = 'accept';
-    const createBtn = await page.$('[data-action="playlists-create"]');
-    if (!createBtn) {
-      bad('кнопка «+ Плейлист» не найдена');
-    } else {
-      await createBtn.click();
-      const winOpen = await page.waitForSelector('#pled-name', { timeout: 8000 }).then(() => true, () => false);
-      winOpen ? ok('окно «Новый плейлист» открылось') : bad('окно «Новый плейлист» не открылось');
-      await page.keyboard.press('Escape');     // пустое окно закрывается без вопросов
-      await sleep(300);
-      await page.evaluate(n => api('/playlists?name=' + encodeURIComponent(n), { method: 'POST' }), PLAYLIST_NAME);
+    // ── 5. Просмотр ролика в Медиатеке ─────────────────────────────────────
+    head('Просмотр ролика');
+    step = 'просмотр ролика';
+    dialogMode = 'dismiss';
+    try {
+      await gotoSection(page, 'media');
+      await page.click('[data-action="media-open-common"]');
+      await page.waitForSelector('#view [data-action="mprev-open"]', { timeout: 10000 });
+      await page.click('#view [data-action="mprev-open"]');
+      const shown = await waitUntil(page,
+        () => !!document.querySelector('.modal-mprev video, .modal-mprev img'), null, 10000);
+      shown ? ok('клик по миниатюре открыл просмотр с видео или картинкой')
+            : bad('просмотр ролика не открылся (нет ни <video>, ни <img>)');
+      await page.keyboard.press('Escape');
+      const closed = await waitUntil(page, () => !document.querySelector('.modal-backdrop'), null, 5000);
+      closed ? ok('Esc закрыл просмотр') : bad('просмотр не закрылся по Esc');
+    } catch (e) {
+      bad('просмотр ролика: ' + e.message.split('\n')[0]);
+      await closeModals(page);
+    }
+
+    // ── 5а. Дубль при загрузке: окно «Такой ролик уже есть» ────────────────
+    // Тот же файл (совпадает md5), что и тестовый ролик, грузим через форму.
+    // Сервер отвечает 409 — это ожидаемо; «Отмена» не должна оставить дубль.
+    head('Дубль при загрузке');
+    step = 'дубль при загрузке';
+    const dupFile = `/tmp/e2e_dup_${STAMP}.png`;
+    try {
+      require('fs').writeFileSync(dupFile, makePng(STAMP));
+      expected = [/^HTTP 409: .*\/api\/media\/upload/, /^console: .*status of 409/];
+      await gotoSection(page, 'media');
+      await page.click('[data-action="media-open-upload"]');
+      await page.waitForSelector('#up-file', { timeout: 10000 });
+      await page.waitForSelector('#up-cat option[value="service"]', { timeout: 10000 });
+      await page.select('#up-cat', 'service');
+      await (await page.$('#up-file')).uploadFile(dupFile);
+      await page.type('#up-title', DUP_TITLE);
+      await page.click('[data-action="media-submit-upload"]');
+      const asked = await waitUntil(page, () => !!document.querySelector('.modal-mdup'), null, 15000);
+      asked ? ok('повторная загрузка того же файла открыла окно про дубль')
+            : bad('окно про дубль не открылось');
+      const dupText = await page.$eval('.modal-mdup', el => el.innerText).catch(() => '');
+      (dupText.includes('Такой ролик уже есть') && dupText.includes(CLIP_TITLE))
+        ? ok('окно называет существующий ролик') : bad(`в окне про дубль нет названия ролика: «${dupText.slice(0, 80)}»`);
+      const btns = await page.$$eval('.modal-mdup .modal-foot button', els => els.map(b => b.textContent.trim()));
+      (btns.includes('Отмена') && btns.includes('Всё равно загрузить') && btns.includes('Открыть существующий'))
+        ? ok('в окне три кнопки: Отмена, Всё равно загрузить, Открыть существующий')
+        : bad(`кнопки окна про дубль: ${btns.join(' | ')}`);
+      await page.click('.modal-mdup [data-mdup="cancel"]');
+      (await waitUntil(page, () => !document.querySelector('.modal-backdrop'), null, 5000))
+        ? ok('«Отмена» закрыла окно') : bad('«Отмена» не закрыла окно');
+      const progress = await page.$eval('#up-progress', el => el.textContent).catch(() => '');
+      /не загружен/.test(progress) ? ok('форма сообщила: файл не загружен')
+                                   : bad(`форма не сообщила об отказе: «${progress}»`);
+      const after = await apiCall(page, 'GET', '/media');
+      const extra = (after.data || []).filter(m => m.title === DUP_TITLE);
+      extra.length === 0 ? ok('после «Отмена» дубля в медиатеке нет')
+                         : bad('после «Отмена» дубль остался в медиатеке (уберёт уборка)');
+    } catch (e) {
+      bad('дубль при загрузке: ' + e.message.split('\n')[0]);
+      await closeModals(page);
+    } finally {
+      expected = [];
+      try { require('fs').unlinkSync(dupFile); } catch (_) { /* файла могло не быть */ }
+    }
+
+    // ── 6. Плейлист целиком: окно → повторы → «Куда и когда» → карточка ────
+    // Тот же путь, что у человека: «+ Плейлист» → название → поиск → галочка →
+    // повторы ×N (предупреждение «подряд») → «Создать и отправить» → все
+    // экраны сети, завтра, 10–11 ч → «Отправить». Дальше — карточка плейлиста
+    // и «По датам» в Расписании, потом отмена показа и удаление плейлиста.
+    head('Цикл «плейлист»: окно, повторы, «Куда и когда»');
+    const tomorrow = addDays(mskToday(), 1);
+    let plId = null;
+    try {
+      step = 'окно «Новый плейлист»';
+      dialogMode = 'dismiss';
       await gotoSection(page, 'playlists');
-      const has = await page.evaluate(n => document.getElementById('view').innerText.includes(n), PLAYLIST_NAME);
-      has ? ok('плейлист создан и виден в списке') : bad('плейлист не появился в списке');
+      await page.click('[data-action="playlists-create"]');
+      await page.waitForSelector('#pled-name', { timeout: 10000 });
+      ok('окно «Новый плейлист» открылось');
+
+      step = 'плейлист: название и поиск';
+      await page.type('#pled-name', PLAYLIST_NAME);
+      await page.type('#pled-search', CLIP_QUERY);
+      const found = await waitUntil(page,
+        () => /найдено/.test(document.getElementById('pled-found').textContent), null, 8000);
+      found ? ok('поиск по части названия нашёл ролик') : bad('поиск не нашёл тестовый ролик');
+
+      step = 'плейлист: галочка и повторы';
+      const tiles = await page.$$('.pled-tile .pled-pick[data-action="pled-toggle"]');
+      if (!tiles.length) throw new Error('в окне нет ни одного выбираемого ролика');
+      await tiles[0].click();
+      const picked = await page.evaluate(() => ({
+        sel: document.querySelectorAll('.pled-tile.sel').length,
+        num: (document.querySelector('.pled-tile.sel .pled-chk') || {}).textContent,
+      }));
+      (picked.sel === 1 && picked.num === '1')
+        ? ok('клик по плитке поставил галочку №1')
+        : bad(`галочка не встала (выбрано ${picked.sel}, номер «${picked.num}»)`);
+      for (let i = 0; i < 4; i++) await page.click('.pled-tile.sel [data-action="pled-rep-plus"]');
+      const rep = await page.$eval('.pled-tile.sel .pled-rep b', el => el.textContent);
+      rep === '×5' ? ok('«+» ×4 довело повторы до ×5') : bad(`повторы показывают «${rep}», ожидалось ×5`);
+      const warned = await waitUntil(page, () => {
+        const w = document.getElementById('pled-warns');
+        return !!w && !w.hidden && /подряд/.test(w.textContent);
+      }, null, 8000);
+      warned ? ok('появилось предупреждение «подряд»') : bad('предупреждения «подряд» нет');
+      const labels = await page.evaluate(() => ({
+        save: document.getElementById('pled-save').textContent.trim(),
+        sum: document.getElementById('pled-sum').textContent.trim(),
+      }));
+      /всё равно/.test(labels.save) ? ok(`кнопка предупреждает: «${labels.save}»`)
+                                    : bad(`кнопка без «всё равно»: «${labels.save}»`);
+      /5 показов/.test(labels.sum) ? ok('итог считает показы с повторами')
+                                   : bad(`итог не посчитал 5 показов: «${labels.sum}»`);
+
+      step = 'плейлист: создать и отправить';
+      await page.click('#pled-save-send');
+      await page.waitForSelector('#plc-date-from', { timeout: 10000 });
+      ok('«Создать и отправить →» открыл шаг «Куда и когда»');
+      const lst = await apiCall(page, 'GET', '/playlists');
+      const made = (lst.data || []).find(p => p.name === PLAYLIST_NAME);
+      made ? (plId = made.id, ok(`плейлист создан (id ${plId})`)) : bad('плейлиста нет в списке после «Создать»');
+
+      step = 'куда и когда';
+      await page.evaluate(() =>
+        document.querySelector('input[data-action="plc-target-all"]').click());
+      await page.select('#plc-hour-from', '10');
+      await page.select('#plc-hour-to', '11');
+      for (const id of ['#plc-date-from', '#plc-date-to']) {
+        await page.$eval(id, (el, v) => {
+          el.value = v;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }, tomorrow);
+      }
+      const previewed = await waitUntil(page, () => {
+        const r = document.getElementById('plc-result');
+        return !!r && !r.hidden && !r.classList.contains('plc-stale');
+      }, null, 12000);
+      previewed ? ok('предпросмотр пересечений пришёл') : bad('предпросмотр пересечений не пришёл');
+
+      // Пересечения на чистом стенде не ожидаются; если есть — «Заменить на это время»
+      // (и «ко всем», когда пересечений два и больше — тогда флажок есть в окне).
+      const nConf = (await page.$$('.plc-conf')).length;
+      if (nConf) {
+        step = 'куда и когда: пересечения';
+        console.log(`    пересечений: ${nConf} — выбираем «Заменить»`);
+        const first = await page.$('input[data-action="plc-decide"][data-mode="replace"]');
+        await page.evaluate(el => el.click(), first);
+        if (await page.$('#plc-apply-all')) {
+          await page.evaluate(() => document.getElementById('plc-apply-all').click());
+        }
+        for (const r of await page.$$('input[data-action="plc-decide"][data-mode="replace"]')) {
+          if (!await page.evaluate(el => el.checked, r)) await page.evaluate(el => el.click(), r);
+        }
+      }
+      const canSend = await waitUntil(page, () => !document.getElementById('plc-send').disabled, null, 8000);
+      canSend ? ok('«Отправить на экраны» доступна') : bad('«Отправить на экраны» осталась недоступной');
+
+      step = 'куда и когда: отправка';
+      await page.click('#plc-send');
+      const modalGone = await waitUntil(page, () => !document.querySelector('.modal-backdrop'), null, 10000);
+      if (modalGone) {
+        ok('показ отправлен, окно закрылось');
+      } else {
+        const err = await page.$eval('#plc-err', el => el.textContent.trim()).catch(() => '');
+        bad(`окно «Куда и когда» не закрылось после отправки${err ? ' — ' + err : ''}`);
+        await closeModals(page);
+      }
+
+      // ── карточка плейлиста: «Где и когда идёт» ──
+      step = 'карточка плейлиста';
+      await gotoSection(page, 'playlists');
+      await page.click(`[data-action="playlists-open"][data-playlist-name="${PLAYLIST_NAME}"]`);
+      await page.waitForSelector('#pl-placements', { timeout: 10000 });
+      const planned = await waitUntil(page, () => {
+        const b = document.getElementById('pl-placements');
+        return !!b && /запланирован/.test(b.innerText);
+      }, null, 10000);
+      planned ? ok('в карточке строка «запланирован»') : bad('в карточке нет строки «запланирован»');
+      const rowText = await page.$eval('#pl-placements', el => el.innerText.replace(/\s+/g, ' '));
+      (/Все экраны сети/.test(rowText) && /10:00 – 11:00/.test(rowText))
+        ? ok('в строке «Все экраны сети», 10:00 – 11:00')
+        : bad(`строка показа не та: «${rowText.slice(0, 120)}»`);
+
+      step = 'карточка: изменить ролики';
+      await page.click('[data-action="playlists-edit-items"]');
+      await page.waitForSelector('#pled-name', { timeout: 10000 });
+      const edit = await page.evaluate(() => ({
+        name: document.getElementById('pled-name').value,
+        sel: document.querySelectorAll('.pled-tile.sel').length,
+        rep: (document.querySelector('.pled-tile.sel .pled-rep b') || {}).textContent,
+      }));
+      (edit.name === PLAYLIST_NAME && edit.sel === 1 && edit.rep === '×5')
+        ? ok('«Изменить ролики» открыл окно с названием, роликом и ×5')
+        : bad(`окно правки открылось не так: название «${edit.name}», выбрано ${edit.sel}, повторы «${edit.rep}»`);
+      await page.keyboard.press('Escape');
+      (await waitUntil(page, () => !document.querySelector('.modal-backdrop'), null, 5000))
+        ? ok('окно правки без изменений закрылось по Esc') : bad('окно правки не закрылось по Esc');
+
+      step = 'карточка: отправить на экраны';
+      await page.click('[data-action="playlists-send"]');
+      (await waitUntil(page, () => !!document.getElementById('plc-date-from'), null, 10000))
+        ? ok('«📤 Отправить на экраны» открыла «Куда и когда»') : bad('«Отправить на экраны» не открыла окно');
+      await page.keyboard.press('Escape');
+      (await waitUntil(page, () => !document.querySelector('.modal-backdrop'), null, 5000))
+        ? ok('окно отправки закрылось по Esc') : bad('окно отправки не закрылось по Esc');
+
+      // ── Расписание → «По датам» ──
+      step = 'расписание: По датам';
+      const gridReady = () => waitUntil(page, () => {
+        const g = document.getElementById('sch-d-grid');
+        return !!g && !g.classList.contains('busy') && !!g.querySelector('.schd-tbl');
+      }, null, 12000);
+      await gotoSection(page, 'schedule');
+      await page.click('[data-action="schedule-target-screen"]');
+      await page.waitForSelector('select[data-action="schedule-select-target"]', { timeout: 10000 });
+      await page.select('select[data-action="schedule-select-target"]', String(fx.screenId));
+      await sleep(800);
+      await page.click('[data-action="schedule-mode-dates"]');
+      (await gridReady()) ? ok('«По датам»: недельная сетка отрисована') : bad('«По датам»: сетка не отрисовалась');
+
+      for (const [a, label] of [['schedule-week-next', '›'], ['schedule-week-prev', '‹']]) {
+        await page.click(`[data-action="${a}"]`);
+        (await gridReady()) ? ok(`«${label}» перелистнула неделю`) : bad(`«${label}»: сетка не обновилась`);
+      }
+      const cellSel = `[data-action="schedule-cell-open"][data-date="${tomorrow}"][data-hour="10"]`;
+      let cell = await page.$(cellSel);
+      if (!cell) {                                   // завтра — уже следующая неделя (сегодня воскресенье)
+        await page.click('[data-action="schedule-week-next"]');
+        await gridReady();
+        cell = await page.$(cellSel);
+      }
+      if (!cell) {
+        bad(`в сетке нет клетки показа на ${tomorrow} в 10:00`);
+      } else {
+        const cellText = await page.evaluate(el => el.textContent, cell);
+        cellText.includes(PLAYLIST_NAME) ? ok('завтра в 10:00 стоит клетка показа плейлиста')
+                                         : bad(`клетка показа не с тем плейлистом: «${cellText}»`);
+        await cell.click();
+        const card = await waitUntil(page, n => {
+          const c = document.querySelector('#sch-d-card .schd-card');
+          return !!c && c.innerText.includes(n) && /запланирован/.test(c.innerText);
+        }, PLAYLIST_NAME, 10000);
+        card ? ok('клик по клетке открыл карточку показа («запланирован»)') : bad('карточка показа не открылась');
+        await page.click('[data-action="schedule-plc-close"]').catch(() => {});
+        (await waitUntil(page, () => !document.querySelector('#sch-d-card .schd-card'), null, 5000))
+          ? ok('карточка показа закрылась') : bad('карточка показа не закрылась');
+      }
+      await page.click('[data-action="schedule-week-today"]');
+      (await gridReady()) ? ok('«Сегодня» вернуло текущую неделю') : bad('«Сегодня»: сетка не обновилась');
+      // вернуть Расписание в исходный вид — дальше им пользуются другие шаги
+      await page.click('[data-action="schedule-mode-week"]');
+      await waitUntil(page, () => !!document.querySelector('#topright [data-action="schedule-mode-week"].on'), null, 8000);
+      await page.click('[data-action="schedule-target-network"]');
+      await waitUntil(page, () => !!document.querySelector('#topright [data-action="schedule-target-network"].on'), null, 8000);
+      await waitViewReady(page);
+
+      // ── отмена показа и удаление плейлиста ──
+      step = 'отмена показа';
+      dialogMode = 'accept';
+      await gotoSection(page, 'playlists');
+      await page.click(`[data-action="playlists-open"][data-playlist-name="${PLAYLIST_NAME}"]`);
+      await page.waitForSelector('[data-action="playlists-plc-cancel"]', { timeout: 10000 });
+      await page.click('[data-action="playlists-plc-cancel"]');
+      const gone = await waitUntil(page, () => {
+        const b = document.getElementById('pl-placements');
+        return !!b && /пока не отправлен/.test(b.innerText);
+      }, null, 10000);
+      gone ? ok('«Отменить» убрала показ из карточки') : bad('после «Отменить» показ остался в карточке');
 
       step = 'удаление плейлиста';
-      const el = await page.$(
-        `[data-action="playlists-delete"][data-playlist-name="${PLAYLIST_NAME}"]`);
-      if (!el) {
+      await gotoSection(page, 'playlists');
+      const del = await page.$(`[data-action="playlists-delete"][data-playlist-name="${PLAYLIST_NAME}"]`);
+      if (!del) {
         bad('кнопка удаления тестового плейлиста не найдена');
       } else {
-        await el.click();
+        await del.click();
         await sleep(1200);
         await gotoSection(page, 'playlists');
         const still = await page.evaluate(n => document.getElementById('view').innerText.includes(n), PLAYLIST_NAME);
         still ? bad('плейлист остался в списке после удаления') : ok('плейлист удалён, список обновился');
       }
+    } catch (e) {
+      bad('цикл «плейлист» прерван на шаге «' + step + '»: ' + e.message.split('\n')[0]);
+    } finally {
+      dialogMode = 'dismiss';
+      await closeModals(page).catch(() => {});
     }
 
-    // ── 5а. Карточка рекламодателя: все вкладки открываются ────────────────
+    // ── 7. Карточка рекламодателя: все вкладки открываются ────────────────
     head('Карточка рекламодателя');
     step = 'открытие карточки';
     dialogMode = 'dismiss';
@@ -333,7 +728,7 @@ async function clickNth(page, action, n) {
       }
     }
 
-    // ── 5б. Роль «рекламодатель»: кабинет свой, остальное закрыто ──────────
+    // ── 8. Роль «рекламодатель»: кабинет свой, остальное закрыто ──────────
     // Самая дорогая ошибка этого раздела — если рекламодатель увидит чужой
     // эфир или деньги. Проверяем на живой учётке и убираем её за собой.
     head('Изоляция роли «рекламодатель»');
@@ -416,7 +811,7 @@ async function clickNth(page, action, n) {
         : bad(`уборка не прошла (учётка ${del.user}, кабинет ${del.adv})`);
     }
 
-    // ── 6. Индикатор монитора (V2, миграция 028) ───────────────────────────
+    // ── 9. Индикатор монитора (V2, миграция 028) ───────────────────────────
     head('Контроль монитора');
     step = 'бейдж монитора';
     await gotoSection(page, 'screens');
@@ -428,6 +823,38 @@ async function clickNth(page, action, n) {
   } catch (e) {
     bad('прогон прерван: ' + e.message.split('\n')[0]);
   } finally {
+    // ── Уборка: всё, что прогон создал сам, убирается ВСЕГДА — и когда проверка выше упала ──
+    if (fx.screenId || fx.mediaId) {
+      head('Уборка тестовых объектов');
+      step = 'уборка';
+      dialogMode = 'dismiss';
+      try {
+        await closeModals(page);
+        // Плейлист ищем по названию: цикл мог упасть до удаления. Показы уходят вместе с ним.
+        const pls = await apiCall(page, 'GET', '/playlists');
+        for (const p of (pls.data || []).filter(p => p.name === PLAYLIST_NAME)) {
+          const r = await apiCall(page, 'DELETE', '/playlists/' + p.id);
+          r.status === 200 ? ok('недоудалённый тестовый плейлист убран (вместе с показами)')
+                           : bad(`тестовый плейлист не удалился (HTTP ${r.status})`);
+        }
+        // Копия, если шаг про дубль всё же загрузил её (в норме её нет)
+        const ml = await apiCall(page, 'GET', '/media');
+        for (const m of (ml.data || []).filter(m => m.title === DUP_TITLE)) {
+          const r = await apiCall(page, 'DELETE', '/media/' + m.id);
+          r.status === 200 ? ok('лишняя копия ролика удалена') : bad(`копия ролика не удалилась (HTTP ${r.status})`);
+        }
+        if (fx.mediaId) {
+          const r = await apiCall(page, 'DELETE', '/media/' + fx.mediaId);
+          r.status === 200 ? ok('тестовый ролик удалён') : bad(`тестовый ролик не удалился (HTTP ${r.status})`);
+        }
+        if (fx.screenId) {
+          const r = await apiCall(page, 'DELETE', '/minipc/' + fx.screenId);
+          r.status === 200 ? ok('тестовый экран удалён') : bad(`тестовый экран не удалился (HTTP ${r.status})`);
+        }
+      } catch (e) {
+        bad('уборка не завершилась: ' + e.message.split('\n')[0]);
+      }
+    }
     await browser.close();
   }
 
