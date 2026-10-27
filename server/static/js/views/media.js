@@ -655,10 +655,26 @@ async function uploadWithDuplicateCheck(file, params){
 // Окно «Такой ролик уже есть в медиатеке». force() — повторная загрузка с allow_duplicate=true.
 // Resolve: ответ сервера после «Всё равно загрузить» или null (Отмена / Esc / ✕ / фон / «Открыть
 // существующий»); reject — если повторная загрузка не удалась (окно к тому времени закрыто).
+// Пока идёт повторная загрузка, итог всегда по факту загрузки (ответ сервера или её ошибка), а не
+// null — даже если окно закрыли из кода (closeAllModals, выход из панели).
 function mdupAsk(file, dup, force){
   return new Promise((resolve, reject) => {
     let busy = false, settled = false;
-    const settle = (fn, v) => { if(!settled){ settled = true; fn(v); } };
+    let back = null;                       // подложка окна (.modal-backdrop); задаётся после openModal
+    // Пока идёт повторная загрузка, Esc окно закрывать не должен — при любом фокусе (в т.ч. на body
+    // после клика по подложке): поэтому слушаем на document в capture-фазе, раньше обработчика
+    // modal.js. Если поверх нашего окна открыто другое, Esc относится к нему — не вмешиваемся.
+    const escGuard = e => {
+      if(!busy || e.key !== 'Escape') return;
+      const all = document.querySelectorAll('.modal-backdrop');
+      if(all[all.length - 1] === back) e.preventDefault();
+    };
+    const settle = (fn, v) => {
+      if(settled) return;
+      settled = true;
+      document.removeEventListener('keydown', escGuard, true);
+      fn(v);
+    };
     const name = dup.title || dup.filename || 'без названия';
     const meta = mdupMeta(dup);
 
@@ -676,7 +692,9 @@ function mdupAsk(file, dup, force){
       footer: `<button type="button" class="btn" data-mdup="cancel">Отмена</button>
         <button type="button" class="btn" data-mdup="force">Всё равно загрузить</button>
         <button type="button" class="btn primary" data-mdup="open" autofocus>Открыть существующий</button>`,
-      onClose(){ settle(resolve, null); },   // Esc, ✕, фон и кнопка «Отмена» — всё это «Отмена»
+      // Esc, ✕, фон и кнопка «Отмена» — всё это «Отмена». Во время повторной загрузки окно закрыть
+      // можно только из кода: тогда не решаем за неё, итог придёт из force().
+      onClose(){ if(!busy) settle(resolve, null); },
     });
 
     const btn = k => modal.el.querySelector(`[data-mdup="${k}"]`);
@@ -690,7 +708,7 @@ function mdupAsk(file, dup, force){
       busy = true;
       modal.el.querySelectorAll('.modal-foot .btn').forEach(b => { b.disabled = true; });
       btn('force').textContent = 'Загрузка…';
-      modal.el.focus();                     // фокус не должен уйти на body: иначе Esc пройдёт мимо окна
+      modal.el.focus();                     // фокус — в окно (кнопки отключены, на них его держать нельзя)
       try{
         const res = await force();
         settle(resolve, res);
@@ -700,15 +718,16 @@ function mdupAsk(file, dup, force){
       modal.close();
     });
 
-    // Пока файл догружается, окно не закрывается ни Esc, ни ✕, ни кликом по фону
-    // (иначе загрузка пошла бы «в никуда»). Esc гасим в самом окне — раньше, чем
-    // его увидит modal.js; клики — в capture-фазе на фоне, раньше его обработчика.
-    const back = modal.el.parentNode;
+    // Пока файл догружается, окно не закрывается ни Esc, ни ✕, ни кликом по фону (иначе загрузка
+    // пошла бы «в никуда»). Клики — в capture-фазе на подложке, раньше обработчика modal.js;
+    // mousedown по подложке гасим, чтобы фокус не уходил на body; Esc — escGuard выше.
+    back = modal.el.parentNode;
+    back.addEventListener('mousedown', e => { if(busy && e.target === back) e.preventDefault(); }, true);
     back.addEventListener('click', e => {
       if(!busy) return;
       if(e.target === back || (e.target.closest && e.target.closest('[data-modal-close]'))) e.stopImmediatePropagation();
     }, true);
-    modal.el.addEventListener('keydown', e => { if(busy && e.key === 'Escape') e.preventDefault(); });
+    document.addEventListener('keydown', escGuard, true);
   });
 }
 
