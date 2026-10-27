@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta
 
 from placements_logic import (dates_overlap, hours_overlap, applies_at, placement_status,
                               find_conflicts, choose_playlists, template_playlist,
-                              week_cells, alternate_overlaps)
+                              week_cells, alternate_overlaps, pick_active)
 
 
 def P(id, d1, d2, h1, h2, screens, pl=10, stopped=None, saved=None):
@@ -418,3 +418,16 @@ def test_alternate_overlaps_override_stopped_other_and_same_playlist():
     out = alternate_overlaps(p, [p, stopped, twin], [ov], dec)
     assert [(a["other_kind"], a["other_id"], a["date_from"], a["hour_from"], a["hour_to"]) for a in out] == \
         [("override", 4, date(2026, 11, 9), 9, 13)]
+
+
+# --- что из выбранного реально играть ------------------------------------------
+
+def test_pick_active_skips_playlists_without_items():
+    assert pick_active([20, 10], {20: [], 10: ["a.mp4"]}) == [10]
+    assert pick_active([20], {20: []}) == []
+
+
+def test_pick_active_keeps_order_and_treats_missing_as_empty():
+    assert pick_active([30, 10, 20], {10: ["a.mp4"], 20: ["b.mp4"], 30: ["c.mp4"]}) == [30, 10, 20]
+    assert pick_active([10, 99], {10: ["a.mp4"]}) == [10]                 # нет в playable — играть нечего
+    assert pick_active([], {10: ["a.mp4"]}) == []

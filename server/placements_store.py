@@ -9,6 +9,9 @@ placements_logic (чистая логика); этот модуль отдаёт
   переопределение id, screen_id, on_date, playlist_id, playlist_name, is_off
   решения         {(placement_id, screen_id, other_kind, other_id): mode}
 
+resolve_placement_hour — единственная склейка «прочитать + выбрать»: какие
+плейлисты показов играют на экране в данный час (лента экрана и симулятор).
+
 Все отметки времени — наивное МСК. Пишем их из Python (now_msk), а не NOW()
 Postgres: контейнер БД живёт в UTC, и приоритет «последний сохранённый»
 поехал бы на три часа относительно stopped_at и часов эфира.
@@ -18,6 +21,8 @@ Postgres: контейнер БД живёт в UTC, и приоритет «п�
 from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import text
+
+from placements_logic import applies_at, choose_playlists
 
 # Как в routers/screens.py: вся сеть живёт по Москве, сезонного перевода нет.
 MSK = timezone(timedelta(hours=3))
@@ -127,6 +132,32 @@ def load_decisions(db, placement_ids: list[int]) -> dict:
         FROM placement_decisions WHERE placement_id = ANY(:ids)
     """), {"ids": list(placement_ids)}).fetchall()
     return {(r.placement_id, r.screen_id, r.other_kind, r.other_id): r.mode for r in rows}
+
+
+def resolve_placement_hour(db, screen_id: int, now: datetime) -> list[int]:
+    """Плейлисты показов на экране `screen_id` в час `now` (наивное МСК).
+
+    Новейший показ первым, остальные — только по его решениям «по очереди»
+    (placements_logic.choose_playlists). Сегодняшнее переопределение экрана
+    с плейлистом передаётся в выбор: при решении «по очереди» оно играет
+    вместе с показом. Переопределение «выключен» здесь не учитывается — его
+    вызывающие (лента экрана, симулятор) проверяют раньше показов.
+    [] — показов в этот час нет. Фильтры роликов (модерация, площадка, срок)
+    не проверяет: пустые плейлисты отсеивает placements_logic.pick_active.
+
+    Загрузчики берутся по именам модуля (load_placements и т. п.) — так их
+    подменяют тесты.
+    """
+    day, hour = now.date(), now.hour
+    applicable = [p for p in load_placements(db, day, day)
+                  if screen_id in p["screens"] and applies_at(p, day, hour)]
+    if not applicable:
+        return []
+    override = next((o for o in load_overrides(db, day, day)
+                     if o["screen_id"] == screen_id and o["on_date"] == day
+                     and not o.get("is_off") and o.get("playlist_id") is not None), None)
+    decisions = load_decisions(db, [p["id"] for p in applicable])
+    return choose_playlists(applicable, decisions, override, screen_id)
 
 
 def get_placement(db, placement_id: int) -> dict | None:

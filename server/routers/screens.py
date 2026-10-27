@@ -1,6 +1,7 @@
 """Экраны/мини ПК: регистрация, heartbeat, расписание для агента, команды, группы синхронизации."""
 import asyncio
 import json
+import logging
 import secrets
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -14,10 +15,15 @@ from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from admin_panel import ad_sequence, build_hourly_sequence, filler_list
 from deps import get_db, get_current_admin, require_write, verify_device_token
 from dashboard_ws import dashboard_ws_manager
+from placements_logic import pick_active
+from placements_store import load_playlist_names, now_msk, resolve_placement_hour
+from playlist_rules import build_shared_hour, expand_repeats, interleave
 from ws_manager import ws_manager
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -354,17 +360,25 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
                          _screen=Depends(verify_device_token)):
     """
     Расписание для мини ПК + список нужных файлов.
-    Приоритет источника плейлиста на текущий момент:
+    Приоритет источника плейлиста на текущий час (МСК):
       1) Общий эфир сети (network_broadcast.is_on) — перекрывает всё;
-      2) Датовое переопределение на сегодня (schedule_overrides) для экрана
-         или его группы;
-      3) Недельный шаблон (schedule_slots) — как раньше.
+      2) Датовое переопределение на сегодня «показ выключен» (экран или его
+         группа) — экран молчит;
+      3) Показ по датам (placements) на этот час: один плейлист — как
+         активный; несколько («по очереди») — общий час с чередованием;
+         плейлисты без проигрываемых роликов пропускаются;
+      4) Датовое переопределение на сегодня с плейлистом;
+      5) Недельный шаблон (schedule_slots) — как раньше.
     Поле active_playlist подсказывает агенту, что играть прямо сейчас;
     поле schedule (недельный шаблон) сохранено для обратной совместимости.
+    Повторы ×N развёрнуты везде (active_items, items слотов шаблона,
+    hourly_sequence): агент 1.3.0 играет список как есть.
     """
-    today = datetime.now(MSK).date()
+    now = now_msk()              # наивное МСК: по нему живут показы и переопределения
+    today = now.date()
     active_playlist = None
     active_source = "template"
+    active_items = []
 
     # Тип площадки: реклама алкоголя (ст. 21 38-ФЗ) выдаётся только на
     # экраны «магазин с алколицензией» — фильтр :venue во всех выборках ниже.
@@ -372,6 +386,20 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
                           "FROM screens WHERE id = :sid"), {"sid": screen_id}).fetchone()
     venue = scr.venue_type if scr else "other"
     VENUE_FILTER = " AND (m.category IS NULL OR m.category <> 'alcohol' OR :venue = 'store_alcohol') "
+
+    def playlist_rows(pid):
+        """Проигрываемые ролики плейлиста по порядку; повторы ещё не развёрнуты."""
+        return [dict(r._mapping) for r in db.execute(text(f"""
+            SELECT m.id AS media_id, m.filename, m.filesize, m.md5_hash,
+                   pi.repeat_count, pi.position
+            FROM playlist_items pi
+            JOIN media m ON m.id = pi.media_id
+            WHERE pi.playlist_id = :p AND m.status = 'ready' AND m.review_status = 'approved'
+              {VENUE_FILTER}
+              AND (m.valid_from  IS NULL OR m.valid_from  <= NOW())
+              AND (m.valid_until IS NULL OR m.valid_until >= NOW())
+            ORDER BY pi.position
+        """), {"p": pid, "venue": venue}).fetchall()]
 
     # 1) Общий эфир
     bc = db.execute(text("""
@@ -383,7 +411,10 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
         active_playlist = {"playlist_id": bc[0], "playlist_name": bc[1]}
         active_source = "broadcast"
 
-    # 2) Датовое переопределение (экран или его группа), если эфир выключен
+    # Датовое переопределение на сегодня (экран или его группа), если эфир
+    # выключен. «Выключен» (2) бьёт показы, переопределение с плейлистом (4)
+    # уступает им.
+    ov = None
     if active_playlist is None:
         ov = db.execute(text("""
             SELECT so.playlist_id, p.name, so.is_off
@@ -395,27 +426,43 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
             ORDER BY so.screen_id NULLS LAST  -- приоритет переопределению на экран
             LIMIT 1
         """), {"d": today, "sid": screen_id}).fetchone()
-        if ov:
-            if ov[2]:  # is_off
-                active_playlist = {"playlist_id": None, "playlist_name": None, "off": True}
-            else:
-                active_playlist = {"playlist_id": ov[0], "playlist_name": ov[1]}
+        if ov and ov[2]:  # is_off
+            active_playlist = {"playlist_id": None, "playlist_name": None, "off": True}
             active_source = "override"
 
-    # Файлы активного плейлиста (если определён переопределением/эфиром)
-    active_items = []
-    if active_playlist and active_playlist.get("playlist_id"):
-        active_items = [dict(r._mapping) for r in db.execute(text(f"""
-            SELECT m.id AS media_id, m.filename, m.filesize, m.md5_hash,
-                   pi.repeat_count, pi.position
-            FROM playlist_items pi
-            JOIN media m ON m.id = pi.media_id
-            WHERE pi.playlist_id = :p AND m.status = 'ready' AND m.review_status = 'approved'
-              {VENUE_FILTER}
-              AND (m.valid_from  IS NULL OR m.valid_from  <= NOW())
-              AND (m.valid_until IS NULL OR m.valid_until >= NOW())
-            ORDER BY pi.position
-        """), {"p": active_playlist["playlist_id"], "venue": venue}).fetchall()]
+    # 3) Показ по датам на этот час. Ошибка здесь не должна гасить ленту
+    # экрана целиком: откатываем (до этого были только SELECT) и идём дальше
+    # по приоритетам, как если бы показа не было.
+    if active_playlist is None:
+        try:
+            ids = resolve_placement_hour(db, screen_id, now)
+            rows_by_pid = {pid: playlist_rows(pid) for pid in ids}
+            ids = pick_active(ids, rows_by_pid)
+            if ids:
+                names = load_playlist_names(db, ids)
+                if len(ids) == 1:
+                    active_playlist = {"playlist_id": ids[0], "playlist_name": names.get(ids[0])}
+                else:
+                    active_playlist = {
+                        "playlist_id": ids[0], "playlist_ids": ids,
+                        "playlist_name": " ⇄ ".join(names.get(pid) or f"Плейлист #{pid}" for pid in ids),
+                    }
+                # несколько плейлистов — ролики по очереди (для одного это он сам)
+                active_items = interleave([expand_repeats(rows_by_pid[pid]) for pid in ids])
+                active_source = "placement"
+        except Exception:
+            log.exception("screen %s: показ по датам не вычислен, играем по остальным правилам", screen_id)
+            db.rollback()
+            active_playlist, active_items = None, []
+
+    # 4) Переопределение с плейлистом
+    if active_playlist is None and ov:
+        active_playlist = {"playlist_id": ov[0], "playlist_name": ov[1]}
+        active_source = "override"
+
+    # Файлы активного плейлиста эфира/переопределения (у показа уже собраны)
+    if active_source != "placement" and active_playlist and active_playlist.get("playlist_id"):
+        active_items = expand_repeats(playlist_rows(active_playlist["playlist_id"]))
 
     # Трёхуровневая резолюция недельного шаблона: на каждый (день, час)
     # берётся слот с наивысшим приоритетом: экран (3) > группа (2) > сеть (1).
@@ -470,8 +517,8 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
 
     files_list = [{"media_id": f.id, "filename": f.filename,
                    "filesize": f.filesize, "md5_hash": f.md5_hash} for f in files]
-    # дополнить файлами активного плейлиста (эфир/переопределение),
-    # чтобы агент успел их докачать
+    # дополнить файлами активного плейлиста (эфир/показ/переопределение),
+    # чтобы агент успел их докачать; повторы ×N в active_items — по разу
     seen = {f["media_id"] for f in files_list}
     for it in active_items:
         if it["media_id"] not in seen:
@@ -482,16 +529,23 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
     # Часовая последовательность (реклама + заглушки равномерно), если у
     # активного плейлиста включён режим fill_to_hour. Агент проигрывает её
     # по порядку. Файлы заглушек тоже добавляем в список загрузки.
+    # Несколько плейлистов показа («по очереди») — всегда общий час: ролики
+    # чередуются, заглушки — до наибольшей цели среди тех, у кого включён
+    # fill_to_hour; если ни у кого — просто чередование без заглушек.
     hourly_sequence = []
     if active_playlist and active_playlist.get("playlist_id"):
         try:
-            from admin_panel import build_hourly_sequence
-            plrow = db.execute(text(
-                "SELECT fill_to_hour, COALESCE(target_seconds,3600) FROM playlists WHERE id = :p"),
-                {"p": active_playlist["playlist_id"]}).fetchone()
-            if plrow and plrow[0]:
-                hourly_sequence = build_hourly_sequence(
-                    db, active_playlist["playlist_id"], plrow[1], venue_type=venue)
+            ids = active_playlist.get("playlist_ids") or [active_playlist["playlist_id"]]
+            targets = [r[1] for r in db.execute(text(
+                "SELECT fill_to_hour, COALESCE(target_seconds,3600) FROM playlists WHERE id = ANY(:ids)"),
+                {"ids": ids}).fetchall() if r[0]]
+            if len(ids) > 1:
+                hourly_sequence = build_shared_hour(
+                    [ad_sequence(db, pid, venue) for pid in ids], filler_list(db, venue),
+                    max(targets) if targets else None)
+            elif targets:
+                hourly_sequence = build_hourly_sequence(db, ids[0], targets[0], venue_type=venue)
+            if targets:
                 # докачать файлы заглушек
                 fillers = db.execute(text("""
                     SELECT id, filename, filesize, md5_hash FROM media
@@ -559,9 +613,8 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
         if active_playlist is not None:
             cur_pid = active_playlist.get("playlist_id")  # None при is_off
         else:
-            now_msk = datetime.now(MSK)
-            day_rows = [r for r in slots if r.day_of_week == now_msk.weekday()]
-            hit = (next((r for r in day_rows if r.hour == now_msk.hour), None)
+            day_rows = [r for r in slots if r.day_of_week == now.weekday()]
+            hit = (next((r for r in day_rows if r.hour == now.hour), None)
                    or next((r for r in day_rows if r.hour is None), None))
             cur_pid = hit.playlist_id if hit else None
         prev_pid = db.execute(text(
@@ -581,10 +634,10 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
     return {
         "screen_id": screen_id,
         "active_playlist": active_playlist,   # что играть прямо сейчас (приоритет)
-        "active_source": active_source,       # broadcast | override | template
-        "active_items": active_items,
+        "active_source": active_source,       # broadcast | override | placement | template
+        "active_items": active_items,         # повторы ×N развёрнуты
         "hourly_sequence": hourly_sequence,   # реклама + заглушки на час (по порядку)
-        "schedule": [dict(r._mapping) for r in slots],
+        "schedule": [{**dict(r._mapping), "items": expand_repeats(r.items or [])} for r in slots],
         "files": files_list,
         "fallback": fallback,                 # заглушки на случай дыры в расписании
         "image_durations": image_durations,   # баннер → секунды показа

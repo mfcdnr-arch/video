@@ -183,6 +183,17 @@ def choose_playlists(applicable: list[dict], decisions: dict, override: dict | N
     return list(dict.fromkeys(chosen))   # без повторов, порядок сохраняется
 
 
+def pick_active(playlist_ids: list[int], playable: dict[int, list]) -> list[int]:
+    """Оставить из playlist_ids (порядок сохраняется) те, у кого есть что играть.
+
+    playable — {playlist_id: проигрываемые ролики после фильтров модерации,
+    площадки и срока}; плейлист без ключа считается пустым. Пустой плейлист
+    показа не должен держать экран: если не осталось никого — показа нет и
+    экран берёт следующий источник (переопределение, шаблон, заглушки).
+    """
+    return [pid for pid in playlist_ids if playable.get(pid)]
+
+
 # --- недельный шаблон --------------------------------------------------------
 
 def template_playlist(slots: list[dict], dow: int, hour: int) -> int | None:

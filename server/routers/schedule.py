@@ -1,5 +1,5 @@
 """Недельное расписание и датовые переопределения."""
-from datetime import date
+from datetime import date, datetime, time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -7,6 +7,9 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from deps import get_db, get_current_admin, require_write
+from placements_logic import pick_active
+from placements_store import load_playlist_names, resolve_placement_hour
+from playlist_rules import expand_repeats, interleave
 
 router = APIRouter()
 
@@ -358,10 +361,12 @@ def simulate_schedule(
 ):
     """
     Симулятор эфира: что реально будет играть на экране в указанный час,
-    с учётом всех приоритетов (переопределение даты → недельные слоты
+    с учётом всех приоритетов (переопределение даты «показ выключен» →
+    показ по датам → переопределение даты с плейлистом → недельные слоты
     экран/группа/сеть → заглушки) и всех фильтров (модерация, тип площадки,
-    срок действия ролика). «Эфир сети» — ручной рубильник текущего момента,
-    для будущих дат он не предсказуем; если он включён СЕЙЧАС, отмечаем.
+    срок действия ролика). Повторы ×N развёрнуты — как играет экран.
+    «Эфир сети» — ручной рубильник текущего момента, для будущих дат он не
+    предсказуем; если он включён СЕЙЧАС, отмечаем.
     """
     try:
         sim_date = date.fromisoformat(on_date)
@@ -386,13 +391,16 @@ def simulate_schedule(
     """
 
     def playlist_items(pid):
+        """Ролики плейлиста в порядке эфира, повторы ×N развёрнуты."""
         rows = db.execute(text(f"""
-            SELECT m.filename, COALESCE(m.title, m.filename) AS title
+            SELECT m.filename, COALESCE(m.title, m.filename) AS title, pi.repeat_count
             FROM playlist_items pi JOIN media m ON m.id = pi.media_id
             WHERE pi.playlist_id = :p AND {MEDIA_FILTER}
             ORDER BY pi.position
         """), {"p": pid, "venue": venue, "simd": sim_date}).fetchall()
-        return [{"filename": r.filename, "title": r.title} for r in rows]
+        items = expand_repeats([{"filename": r.filename, "title": r.title, "repeat_count": r.repeat_count}
+                                for r in rows])
+        return [{"filename": i["filename"], "title": i["title"]} for i in items]
 
     # эфир сети (только пометка — он живёт «сейчас», а не по датам)
     bc = db.execute(text("""
@@ -411,18 +419,37 @@ def simulate_schedule(
           AND (so.screen_id = :sid OR so.group_id = :gid)
         ORDER BY so.screen_id NULLS LAST LIMIT 1
     """), {"d": sim_date, "sid": screen_id, "gid": scr.group_id}).fetchone()
-    if ov:
-        if ov.is_off:
+    if ov and ov.is_off:
+        return {"screen": scr.name, "date": on_date, "hour": hour,
+                "source": "override_off",
+                "source_label": "Переопределение даты: показ выключен",
+                "playlist": None, "items": [], "notes": notes}
+
+    # 2) показ по датам на этот час — тот же выбор, что у ленты экрана;
+    # несколько плейлистов («по очереди») — ролики чередуются
+    ids = resolve_placement_hour(db, screen_id, datetime.combine(sim_date, time(hour)))
+    if ids:
+        items_by_pid = {pid: playlist_items(pid) for pid in ids}
+        playing = pick_active(ids, items_by_pid)
+        if playing:
+            names = load_playlist_names(db, playing)
             return {"screen": scr.name, "date": on_date, "hour": hour,
-                    "source": "override_off",
-                    "source_label": "Переопределение даты: показ выключен",
-                    "playlist": None, "items": [], "notes": notes}
+                    "source": "placement",
+                    "source_label": "Показ по датам" if len(playing) == 1 else "Показ по датам: по очереди",
+                    "playlist": " ⇄ ".join(names.get(pid) or f"Плейлист #{pid}" for pid in playing),
+                    "items": interleave([items_by_pid[pid] for pid in playing]),
+                    "notes": notes}
+        notes.append("Плейлист показа по датам пуст после фильтров (модерация/площадка/срок) — "
+                     "показ пропущен, экран играет следующий источник")
+
+    # 3) переопределение даты с плейлистом
+    if ov:
         return {"screen": scr.name, "date": on_date, "hour": hour,
                 "source": "override", "source_label": "Переопределение даты",
                 "playlist": ov.name, "items": playlist_items(ov.playlist_id),
                 "notes": notes}
 
-    # 2) недельные слоты: экран > группа > сеть; почасовой > «весь день»
+    # 4) недельные слоты: экран > группа > сеть; почасовой > «весь день»
     slot = db.execute(text("""
         SELECT ss.playlist_id, p.name, ss.hour,
                CASE WHEN ss.screen_id IS NOT NULL THEN 3
@@ -448,7 +475,7 @@ def simulate_schedule(
                     "source": "slot", "source_label": f"Недельный шаблон ({level}, {kind})",
                     "playlist": slot.name, "items": items, "notes": notes}
 
-    # 3) заглушки (фолбэк)
+    # 5) заглушки (фолбэк)
     fillers = db.execute(text(f"""
         SELECT m.filename, COALESCE(m.title, m.filename) AS title FROM media m
         WHERE m.is_filler = TRUE AND {MEDIA_FILTER} ORDER BY m.id
