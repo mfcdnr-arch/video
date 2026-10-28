@@ -215,6 +215,16 @@ def test_decisions_text_without_names_falls_back_to_numbers():
     assert text == "экран «#5»: заменяет переопределение #9; экран «#5»: по очереди с показом #7"
 
 
+def test_decisions_text_yield_names_who_stays():
+    text = store.decisions_text(
+        [DEC(1, "placement", 7, "yield"), DEC(2, "override", 30, "yield")],
+        {1: "Холл", 2: "Касса"},
+        {("placement", 7): ("Утро", None), ("override", 30): ("Осень", D1)})
+    assert text == ("экран «Касса»: уступает переопределению 01.11 «Осень»; "
+                    "экран «Холл»: уступает показу #7 «Утро»")
+    assert store.decisions_text([DEC(5, "placement", 7, "yield")], {}, {}) == "экран «#5»: уступает показу #7"
+
+
 def test_decisions_text_is_cut_with_and_more():
     decisions = [DEC(i, "placement", 7, "replace") for i in range(1, 9)]
     text = store.decisions_text(decisions, {i: f"Э{i}" for i in range(1, 9)}, {("placement", 7): ("Утро", None)},

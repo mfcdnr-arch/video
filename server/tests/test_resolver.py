@@ -96,3 +96,13 @@ def test_resolver_ignores_is_off_override_and_stopped_hours(monkeypatch):
     patch(monkeypatch, [P(1, 10, [5], stopped=datetime(2026, 11, 1, 10, 37))])
     assert st.resolve_placement_hour(None, 5, datetime(2026, 11, 1, 9, 30)) == [10]
     assert st.resolve_placement_hour(None, 5, datetime(2026, 11, 1, 10, 50)) == []
+
+
+def test_resolver_yield_plays_the_other_placement_or_falls_to_override(monkeypatch):
+    old = P(1, 10, [5], saved=datetime(2026, 10, 20))
+    new = P(2, 20, [5], saved=datetime(2026, 10, 25))
+    patch(monkeypatch, [old, new], decisions={(2, 5, "placement", 1): "yield"})
+    assert st.resolve_placement_hour(None, 5, datetime(2026, 11, 1, 9, 0)) == [10]
+    # уступить сегодняшнему переопределению: показов нет — лента возьмёт переопределение
+    patch(monkeypatch, [new], [OV(7, 5, pl=30)], {(2, 5, "override", 7): "yield"})
+    assert st.resolve_placement_hour(None, 5, datetime(2026, 11, 1, 9, 0)) == []

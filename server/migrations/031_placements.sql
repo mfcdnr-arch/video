@@ -10,7 +10,8 @@
 --
 -- Пересечения с другими показами и датовыми переопределениями админ решает
 -- сам при сохранении, отдельно для каждого экрана: «replace» — сохраняемый
--- показ вытесняет другой, «alternate» — играют по очереди в общем часу.
+-- показ вытесняет другой, «alternate» — играют по очереди в общем часу,
+-- «yield» — сохраняемый показ уступает: в часы пересечения идёт другой.
 -- Решения лежат под id показа, который сохраняли, поэтому приоритет у показа
 -- с самым поздним saved_at (см. server/placements_logic.py).
 --
@@ -51,7 +52,7 @@ CREATE TABLE IF NOT EXISTS placement_decisions (
     screen_id    INTEGER NOT NULL REFERENCES screens(id) ON DELETE CASCADE,
     other_kind   VARCHAR(10) NOT NULL CHECK (other_kind IN ('placement', 'override')),
     other_id     INTEGER NOT NULL,
-    mode         VARCHAR(10) NOT NULL CHECK (mode IN ('replace', 'alternate')),
+    mode         VARCHAR(10) NOT NULL CHECK (mode IN ('replace', 'alternate', 'yield')),
     PRIMARY KEY (placement_id, screen_id, other_kind, other_id)
 );
 

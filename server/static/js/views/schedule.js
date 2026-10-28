@@ -355,7 +355,8 @@ function schCellOpen(el){
 }
 
 // Карточка показа выбранной клетки. Строку показа берём из списка показов плейлиста:
-// первым в клетке стоит плейлист новейшего показа (его placement_id), остальные — «по очереди».
+// первым в клетке стоит плейлист показа-вершины часа (его placement_id; уступивший «Оставить
+// «X» на это время» показ в клетке не стоит), остальные — «по очереди».
 // reveal — после клика: сетка высокая (24 часа), карточка под ней может оказаться за краем окна
 async function schCardLoad(reveal){
   const box = document.getElementById('sch-d-card');
@@ -415,12 +416,29 @@ function schCardActions(row){
   return h;
 }
 
+// Строки «уступает «X»» показа на этом экране: в эти даты и часы вместо него идёт другой
+// плейлист (решение «Оставить «X» на это время»). Обычный текст, без esc. У закончившихся и
+// остановленных показов не выводим — как в карточке плейлиста.
+function schYieldLines(row){
+  if(row.status !== 'active' && row.status !== 'planned') return [];
+  const lines = (row.alternates || [])
+    .filter(a => a.mode === 'yield' && a.screen_id === SCH_TARGET_ID)
+    .map(a => {
+      const days = a.date_from === a.date_to ? schDm(a.date_from)
+        : (String(a.date_from).slice(0, 4) === String(a.date_to).slice(0, 4)
+          ? schDm(a.date_from) + '–' + schDm(a.date_to) : schDmy(a.date_from) + '–' + schDmy(a.date_to));
+      return days + ', ' + schHH(a.hour_from) + '–' + schHH(a.hour_to) + ' ч: уступает «' + a.other_playlist_name + '»';
+    });
+  return Array.from(new Set(lines));
+}
+
 function schCardHtml(card){
   const {row, name, cell} = card;
   const st = SCH_D_STATUS[row.status] || {text: row.status, cls: 'done'};
   const scr = (SCH_D_LIST.find(x => x.id === SCH_TARGET_ID) || {}).name || '';
-  const alt = cell.kind === 'alternate' && (cell.playlists || []).length > 1
-    ? `<div class="plb-alt">⇄ В этот час по очереди: ${esc(cell.playlists.join(' / '))}</div>` : '';
+  const alt = (cell.kind === 'alternate' && (cell.playlists || []).length > 1
+    ? `<div class="plb-alt">⇄ В этот час по очереди: ${esc(cell.playlists.join(' / '))}</div>` : '')
+    + schYieldLines(row).map(t => `<div class="plb-alt">${esc(t)}</div>`).join('');
   return `<div class="schd-card">
     <div class="schd-card-h"><b>📅 ${esc(name)}${scr ? ' — ' + esc(scr) : ''}</b>
       <button type="button" class="schd-x" data-action="schedule-plc-close" aria-label="Закрыть карточку" title="Закрыть">✕</button></div>

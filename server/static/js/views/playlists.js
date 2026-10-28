@@ -274,9 +274,10 @@ async function openPlaylist(id, name){
 
 //-----------------------------------------------------------------------------
 // Блок «Где и когда идёт» в карточке плейлиста: показы этого плейлиста
-// (GET /placements?playlist_id=) — экраны, даты, часы, статус, «по очереди»
-// и кнопки по статусу. Окно «Куда и когда» — js/views/placement-editor.js;
-// после его сохранения приходит событие placements-changed (см. выше).
+// (GET /placements?playlist_id=) — экраны, даты, часы, статус, строки «по
+// очереди» / «уступает» и кнопки по статусу. Окно «Куда и когда» —
+// js/views/placement-editor.js; после его сохранения приходит событие
+// placements-changed (см. выше).
 //-----------------------------------------------------------------------------
 
 const PLB_STATUS = {
@@ -286,7 +287,7 @@ const PLB_STATUS = {
   stopped: { text: 'остановлен',   cls: 'stop' },
 };
 const PLB_SCREENS_SHOWN = 4;     // сколько экранов показа перечислять сразу, остальные — под «и ещё N»
-const PLB_ALT_SCREENS_SHOWN = 3; // и сколько экранов в строке «по очереди»
+const PLB_ALT_SCREENS_SHOWN = 3; // и сколько экранов в строке «по очереди» / «уступает»
 
 function plbPlural(n, one, few, many){
   const m10 = n % 10, m100 = n % 100;
@@ -319,13 +320,15 @@ function plbDates(a, b){
 function plbHH(n){ return String(n).padStart(2, '0'); }
 function plbHours(a, b){ return plbHH(a) + ':00 – ' + plbHH(b) + ':00'; }
 
-// Строки «по очереди»: одинаковые для нескольких экранов склеиваем в одну
-// «05.11–10.11, 10–12 ч: по очереди с «Акция» (на экранах: А, Б)». Экраны не
-// называем, если строка относится ко всем экранам показа (или он на один экран).
+// Строки решений по пересечениям: «по очереди» (mode alternate) и «уступает»
+// (mode yield — в эти часы идёт другой плейлист). Одинаковые для нескольких
+// экранов склеиваем в одну: «05.11–10.11, 10–12 ч: по очереди с «Акция» (на
+// экранах: А, Б)», «05.11, 10–12 ч: уступает «Акция»». Экраны не называем, если
+// строка относится ко всем экранам показа (или он на один экран).
 function plbAlternates(p){
   const groups = new Map();
   (p.alternates || []).forEach(a => {
-    const key = [a.date_from, a.date_to, a.hour_from, a.hour_to, a.other_playlist_name].join('|');
+    const key = [a.mode, a.date_from, a.date_to, a.hour_from, a.hour_to, a.other_playlist_name].join('|');
     if(!groups.has(key)) groups.set(key, { a, screens: [] });
     const g = groups.get(key);
     if(!g.screens.includes(a.screen_name)) g.screens.push(a.screen_name);
@@ -343,7 +346,8 @@ function plbAlternates(p){
       where = ' (на ' + (screens.length === 1 ? 'экране' : 'экранах') + ': ' + shown
         + (rest > 0 ? ' и ещё ' + rest : '') + ')';
     }
-    return days + ', ' + plbHH(a.hour_from) + '–' + plbHH(a.hour_to) + ' ч: по очереди с «'
+    const what = a.mode === 'yield' ? 'уступает «' : 'по очереди с «';
+    return days + ', ' + plbHH(a.hour_from) + '–' + plbHH(a.hour_to) + ' ч: ' + what
       + a.other_playlist_name + '»' + where;
   });
 }
@@ -385,7 +389,7 @@ function plbActionsHtml(p){
 
 function plbRowHtml(p, write){
   const st = PLB_STATUS[p.status] || { text: p.status, cls: 'done' };
-  // «по очереди» показываем только у идущих и запланированных: у закончившихся и остановленных они устарели
+  // «по очереди» / «уступает» — только у идущих и запланированных: у закончившихся и остановленных они устарели
   const alts = (p.status === 'active' || p.status === 'planned')
     ? plbAlternates(p).map(t => `<span class="plb-alt">${esc(t)}</span>`).join('') : '';
   return `<tr>

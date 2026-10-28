@@ -344,6 +344,10 @@ fi
 # к показу не возвращается, ролик из закачки уходит. Плейлист — отдельный, с
 # роликом MID3, которого нет ни в шаблоне, ни в других плейлистах экрана:
 # иначе ролик был бы в списке закачки и без показа.
+# Пересечение на том же часе и экране: второй показ (плейлист PID) без
+# решения → 409, с «Заменить» — в ленте он; предпросмотр правки подставляет
+# сохранённое решение; после правки на «Оставить «…» на это время» (yield)
+# лента снова отдаёт первый показ.
 step "Экран: что играет и что качает"
 # dreq — запрос агента: только X-Token экрана, без админского токена
 dreq(){ # dreq PATH
@@ -385,7 +389,8 @@ print(h.date(), h.hour, (h + d.timedelta(hours=1)).isoformat())" 2>/dev/null)
 
   if [ -n "$PLCN" ]; then
     req GET "/broadcast"
-    if body_has "r.get('is_on')"; then
+    BC_ON=""; body_has "r.get('is_on')" && BC_ON=1
+    if [ -n "$BC_ON" ]; then
       echo "  – включён «Эфир сети»: он перекрывает показы, проверка ленты пропущена"
     else
       dreq "/schedule/minipc/$SID"
@@ -398,6 +403,44 @@ print(h.date(), h.hour, (h + d.timedelta(hours=1)).isoformat())" 2>/dev/null)
     dreq "/files/list/$SID"
     if [ "$HTTP" = "200" ] && body_has "any(f['filename']=='$NOW_FILE' for f in r)"; then
       ok "ролик показа в списке закачки экрана"; else bad "ролика показа нет в списке закачки: HTTP $HTTP"; fi
+
+    # пересечение: второй показ на тот же час — сначала «Заменить», потом правка на «Оставить …»
+    PLCY=""
+    if [ -n "${PID:-}" ]; then
+      YJ="\"playlist_id\": $PID, \"all_screens\": false, \"screen_ids\": [$SID], \"date_from\": \"$DN\", \"date_to\": \"$DN\", \"hour_from\": $HN, \"hour_to\": $((HN + 1))"
+      ydec(){ echo "[{\"screen_id\": $SID, \"other_kind\": \"placement\", \"other_id\": $PLCN, \"mode\": \"$1\"}]"; }
+      req POST "/placements" -H 'Content-Type: application/json' -d "{$YJ, \"decisions\": []}"
+      [ "$HTTP" = "409" ] && ok "второй показ на тот же час без решения → 409" || bad "пересечение без решения: HTTP $HTTP (ждали 409)"
+      req POST "/placements" -H 'Content-Type: application/json' -d "{$YJ, \"decisions\": $(ydec replace)}"
+      PLCY=$(body_get id)
+      if [ "$HTTP" = "200" ] && [ -n "$PLCY" ]; then
+        ok "второй показ «Заменить на это время» создан (id=$PLCY)"; else bad "второй показ с решением: HTTP $HTTP"; fi
+    fi
+    if [ -n "$PLCY" ]; then
+      req POST "/placements/preview" -H 'Content-Type: application/json' -d "{$YJ, \"exclude_id\": $PLCY}"
+      if [ "$HTTP" = "200" ] && body_has "r['decisions']==[{'screen_id': $SID, 'other_kind': 'placement', 'other_id': $PLCN, 'mode': 'replace'}]"; then
+        ok "предпросмотр правки отдаёт сохранённое решение «заменить»"; else bad "предпросмотр правки без сохранённого решения: HTTP $HTTP"; fi
+      if [ -z "$BC_ON" ]; then
+        dreq "/schedule/minipc/$SID"
+        if [ "$HTTP" = "200" ] && body_has "r['active_source']=='placement' and r['active_playlist']['playlist_id']==$PID"; then
+          ok "лента экрана: в час пересечения идёт заменивший показ"; else bad "лента при «Заменить»: HTTP $HTTP"; fi
+      fi
+      req PUT "/placements/$PLCY" -H 'Content-Type: application/json' -d "{$YJ, \"decisions\": $(ydec yield)}"
+      [ "$HTTP" = "200" ] && ok "правка: «Оставить … на это время» (yield)" || bad "правка на yield: HTTP $HTTP"
+      if [ -z "$BC_ON" ]; then
+        dreq "/schedule/minipc/$SID"
+        if [ "$HTTP" = "200" ] && body_has "r['active_source']=='placement' and r['active_playlist']['playlist_id']==$PIDN"; then
+          ok "лента экрана: после yield в час пересечения снова идёт первый показ"
+        else
+          bad "лента после yield: ждали плейлист $PIDN, получили HTTP $HTTP: $(echo "$BODY" | python3 -c "import sys,json;r=json.load(sys.stdin);print(r.get('active_source'), (r.get('active_playlist') or {}).get('playlist_id'))" 2>/dev/null)"
+        fi
+      fi
+      req GET "/placements?playlist_id=$PID"
+      if [ "$HTTP" = "200" ] && body_has "any(x['id']==$PLCY and [a['mode'] for a in x['alternates']]==['yield'] for x in r)"; then
+        ok "в списке показов строка «уступает»"; else bad "в списке показов нет строки «уступает»: HTTP $HTTP"; fi
+      req POST "/placements/$PLCY/stop"
+      [ "$HTTP" = "200" ] && ok "второй показ на текущий час остановлен" || bad "остановка второго показа: HTTP $HTTP"
+    fi
 
     req POST "/placements/$PLCN/stop"
     [ "$HTTP" = "200" ] && ok "показ на текущий час остановлен" || bad "остановка показа на текущий час: HTTP $HTTP"

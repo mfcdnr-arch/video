@@ -8,7 +8,8 @@ from datetime import date, datetime
 import pytest
 from fastapi import HTTPException
 from routers.placements import (parse_body, parse_decisions, unresolved, summary_text, overflow_notes,
-                                week_start, sort_listing, listing_row, check_stoppable, check_deletable)
+                                week_start, sort_listing, listing_row, check_stoppable, check_deletable,
+                                saved_decisions)
 
 T = date(2026, 10, 26)
 B = {"playlist_id": 1, "all_screens": False, "screen_ids": [3], "date_from": "2026-11-01",
@@ -56,6 +57,29 @@ def test_parse_decisions_rejects(raw):
     with pytest.raises(HTTPException) as e:
         parse_decisions(raw)
     assert e.value.status_code == 400
+
+def test_parse_decisions_accepts_all_three_modes():
+    raw = [{"screen_id": 3, "other_kind": "placement", "other_id": 5, "mode": "yield"},
+           {"screen_id": 3, "other_kind": "override", "other_id": 9, "mode": "yield"},
+           {"screen_id": 4, "other_kind": "placement", "other_id": 5, "mode": "replace"},
+           {"screen_id": 5, "other_kind": "placement", "other_id": 5, "mode": "alternate"}]
+    assert parse_decisions(raw) == {(3, "placement", 5): "yield", (3, "override", 9): "yield",
+                                    (4, "placement", 5): "replace", (5, "placement", 5): "alternate"}
+
+def test_saved_decisions_only_for_current_conflicts_of_this_placement():
+    conflicts = [{**C, "screen_id": 3, "other_kind": "placement", "other_id": 5},
+                 {**C, "screen_id": 4, "other_kind": "placement", "other_id": 5},
+                 {**C, "screen_id": 3, "other_kind": "override", "other_id": 9}]
+    stored = {(7, 3, "placement", 5): "yield",           # пересечение есть — подставляем
+              (7, 3, "override", 9): "alternate",
+              (7, 6, "placement", 5): "replace",          # экрана 6 в показе больше нет — пересечения нет
+              (7, 3, "placement", 8): "replace",          # показа 8 в этих датах больше нет
+              (8, 4, "placement", 5): "replace"}          # чужое решение (другого показа)
+    assert saved_decisions(7, conflicts, stored) == [
+        {"screen_id": 3, "other_kind": "placement", "other_id": 5, "mode": "yield"},
+        {"screen_id": 3, "other_kind": "override", "other_id": 9, "mode": "alternate"}]
+    assert saved_decisions(7, [], stored) == []
+    assert saved_decisions(7, conflicts, {}) == []
 
 def test_unresolved_counts_conflicts_without_decision():
     other = {**C, "screen_id": 4}
@@ -114,15 +138,20 @@ def test_listing_row_shape_status_screens_and_alternates():
          "stopped_at": None, "created_by": "admin", "created_at": datetime(2026, 10, 26, 12, 0)}
     alt = {"screen_id": 3, "other_kind": "placement", "other_id": 8, "other_playlist_id": 20,
            "other_playlist_name": "Акция", "date_from": date(2026, 11, 5), "date_to": date(2026, 11, 7),
-           "hour_from": 10, "hour_to": 12}
-    row = listing_row(p, datetime(2026, 11, 3, 10), {1: "Бета", 3: "Альфа"}, [alt])
+           "hour_from": 10, "hour_to": 12, "mode": "alternate"}
+    gives_way = {"screen_id": 1, "other_kind": "override", "other_id": 4, "other_playlist_id": 30,
+                 "other_playlist_name": "Вечер", "date_from": date(2026, 11, 8), "date_to": date(2026, 11, 8),
+                 "hour_from": 9, "hour_to": 13, "mode": "yield"}
+    row = listing_row(p, datetime(2026, 11, 3, 10), {1: "Бета", 3: "Альфа"}, [alt, gives_way])
     assert row == {
         "id": 7, "playlist_id": 10, "all_screens": False, "screen_count": 3,
         "screens": [{"id": 3, "name": "Альфа"}, {"id": 1, "name": "Бета"}, {"id": 9, "name": "Экран #9"}],
         "date_from": date(2026, 11, 1), "date_to": date(2026, 11, 30), "hour_from": 9, "hour_to": 13,
         "status": "active",
-        "alternates": [{"screen_name": "Альфа", "other_playlist_name": "Акция", "date_from": date(2026, 11, 5),
-                        "date_to": date(2026, 11, 7), "hour_from": 10, "hour_to": 12}],
+        "alternates": [{"screen_id": 3, "screen_name": "Альфа", "mode": "alternate", "other_playlist_name": "Акция",
+                        "date_from": date(2026, 11, 5), "date_to": date(2026, 11, 7), "hour_from": 10, "hour_to": 12},
+                       {"screen_id": 1, "screen_name": "Бета", "mode": "yield", "other_playlist_name": "Вечер",
+                        "date_from": date(2026, 11, 8), "date_to": date(2026, 11, 8), "hour_from": 9, "hour_to": 13}],
         "created_by": "admin", "created_at": datetime(2026, 10, 26, 12, 0)}
     assert listing_row(p, datetime(2026, 10, 30, 10), {}, [])["status"] == "planned"
     assert listing_row({**p, "stopped_at": datetime(2026, 11, 2)}, datetime(2026, 11, 3), {}, [])["status"] == "stopped"

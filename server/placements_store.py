@@ -7,7 +7,8 @@ placements_logic (чистая логика); этот модуль отдаёт
                   hour_to, stopped_at, saved_at, screens (set[int]) + all_screens,
                   created_by, created_at
   переопределение id, screen_id, on_date, playlist_id, playlist_name, is_off
-  решения         {(placement_id, screen_id, other_kind, other_id): mode}
+  решения         {(placement_id, screen_id, other_kind, other_id): mode},
+                  mode — "replace" | "alternate" | "yield"
 
 resolve_placement_hour — единственная склейка «прочитать + выбрать»: какие
 плейлисты показов играют на экране в данный час (лента экрана и симулятор).
@@ -229,8 +230,11 @@ def _audit(db, title: str, detail: str, actor: str) -> None:
 # Сколько решений по пересечениям расписывать в журнале поимённо; остальные — «и ещё N».
 AUDIT_DECISIONS_SHOWN = 5
 
-# Как назвать «другое» в решении: (винительный — «заменяет …», творительный — «по очереди с …»)
-_OTHER_NOUNS = {"placement": ("показ", "показом"), "override": ("переопределение", "переопределением")}
+# Как назвать «другое» в решении: (винительный — «заменяет …», творительный — «по очереди с …»,
+# дательный — «уступает …»)
+_OTHER_NOUNS = {"placement": ("показ", "показом", "показу"),
+                "override": ("переопределение", "переопределением", "переопределению")}
+_MODE_TEXT = {"replace": ("заменяет", 0), "alternate": ("по очереди с", 1), "yield": ("уступает", 2)}
 
 
 def decisions_text(decisions: list[dict], screen_names: dict[int, str], others: dict,
@@ -238,15 +242,16 @@ def decisions_text(decisions: list[dict], screen_names: dict[int, str], others: 
     """Решения по пересечениям человеческим текстом для журнала операций.
 
     «экран «Холл»: заменяет показ #7 «Утро»; экран «Касса»: по очереди с
-    переопределением 01.11 «Осень»; и ещё 2». others — {(other_kind,
-    other_id): (плейлист | None, дата переопределения | None)}; чего нет —
-    пишем только номер. Порядок — по экрану, затем по «другому».
+    переопределением 01.11 «Осень»; экран «Вход»: уступает показу #9 «Акция»;
+    и ещё 2». others — {(other_kind, other_id): (плейлист | None, дата
+    переопределения | None)}; чего нет — пишем только номер. Порядок — по
+    экрану, затем по «другому».
     """
     def screen(sid):
         return screen_names.get(sid) or f"#{sid}"
 
     def other(kind, oid, case):
-        noun = _OTHER_NOUNS.get(kind, ("источник", "источником"))[case]
+        noun = _OTHER_NOUNS.get(kind, ("источник", "источником", "источнику"))[case]
         name, on_date = others.get((kind, oid), (None, None))
         label = f"{noun} {on_date:%d.%m}" if kind == "override" and on_date else f"{noun} #{oid}"
         return f"{label} «{name}»" if name else label
@@ -255,8 +260,8 @@ def decisions_text(decisions: list[dict], screen_names: dict[int, str], others: 
                                             d["other_kind"], d["other_id"]))
     parts = []
     for d in rows[:shown]:
-        what = (f"по очереди с {other(d['other_kind'], d['other_id'], 1)}" if d["mode"] == "alternate"
-                else f"заменяет {other(d['other_kind'], d['other_id'], 0)}")
+        verb, case = _MODE_TEXT.get(d["mode"], _MODE_TEXT["replace"])
+        what = f"{verb} {other(d['other_kind'], d['other_id'], case)}"
         parts.append(f"экран «{screen(d['screen_id'])}»: {what}")
     if len(rows) > shown:
         parts.append(f"и ещё {len(rows) - shown}")

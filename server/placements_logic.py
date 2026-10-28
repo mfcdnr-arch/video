@@ -15,12 +15,14 @@
                  последний раз; нужен для приоритета, см. choose_playlists)
   переопределение id, screen_id, on_date, playlist_id, playlist_name, is_off
                  (групповые переопределения уже развёрнуты по экранам)
-  решения        {(placement_id, screen_id, other_kind, other_id): "replace" | "alternate"},
+  решения        {(placement_id, screen_id, other_kind, other_id): "replace" | "alternate" | "yield"},
                  other_kind — "placement" или "override"
 
 Пересечение показов админ разрешает отдельно для каждого экрана:
 «replace» — последний сохранённый показ вытесняет остальные, «alternate» —
-играют по очереди в общем часу. Недельный шаблон пересечением не считается.
+играют по очереди в общем часу, «yield» — сохранённый показ уступает: в часы
+пересечения он не идёт, идёт другой показ или переопределение («Оставить «X»
+на это время»). Недельный шаблон пересечением не считается.
 Решения хранятся под id показа, который админ сохранял (создавал или правил),
 — поэтому приоритет у показа с самым поздним saved_at, а не с наибольшим id.
 """
@@ -28,6 +30,7 @@ from datetime import date, datetime, time, timedelta
 
 REPLACE = "replace"
 ALTERNATE = "alternate"
+YIELD = "yield"
 
 KIND_PLACEMENT = "placement"
 KIND_OVERRIDE = "override"
@@ -147,6 +150,52 @@ def _recency(p: dict) -> tuple[datetime, int]:
     return (p.get("saved_at") or datetime.min, p["id"])
 
 
+def _top(ordered: list[dict], decisions: dict, screen_id: int) -> tuple[dict, set[int]]:
+    """Вершина часа и id показов, пройденных по пути к ней (уступивших и её самой).
+
+    ordered — применимые показы от новейшего к старшему (_recency), не пуст.
+    Начинаем с новейшего. Если у вершины есть решение "yield" против другого
+    показа из ordered, вершиной становится тот (из нескольких — новейший), и
+    так дальше. Пройденные показы второй раз не берутся: цикл (A уступает B,
+    B уступает A) останавливается на последней непосещённой вершине —
+    детерминированно и без зависания.
+    """
+    top = ordered[0]
+    visited = {top["id"]}
+    while True:
+        nxt = next((p for p in ordered if p["id"] not in visited
+                    and decisions.get((top["id"], screen_id, KIND_PLACEMENT, p["id"])) == YIELD), None)
+        if nxt is None:
+            return top, visited
+        top = nxt
+        visited.add(top["id"])
+
+
+def _choose(applicable: list[dict], decisions: dict, override: dict | None,
+            screen_id: int) -> tuple[list[int], int | None]:
+    """choose_playlists + id показа-вершины (None, если показов в этот час нет)."""
+    if not applicable:
+        return [], None
+    ordered = sorted(applicable, key=_recency, reverse=True)   # новейший первым
+    top, visited = _top(ordered, decisions, screen_id)
+
+    def decided(kind: str, other_id: int) -> str | None:
+        return decisions.get((top["id"], screen_id, kind, other_id))
+
+    has_override = bool(override) and not override.get("is_off") and override.get("playlist_id") is not None
+    if has_override and decided(KIND_OVERRIDE, override["id"]) == YIELD:
+        return [], None
+
+    chosen = [top["playlist_id"]]
+    for other in ordered:
+        if other["id"] not in visited and decided(KIND_PLACEMENT, other["id"]) == ALTERNATE:
+            chosen.append(other["playlist_id"])
+    if has_override and decided(KIND_OVERRIDE, override["id"]) == ALTERNATE:
+        chosen.append(override["playlist_id"])
+
+    return list(dict.fromkeys(chosen)), top["id"]   # без повторов, порядок сохраняется
+
+
 def choose_playlists(applicable: list[dict], decisions: dict, override: dict | None, screen_id: int) -> list[int]:
     """Какие плейлисты играют на экране `screen_id` в конкретный час.
 
@@ -158,29 +207,20 @@ def choose_playlists(applicable: list[dict], decisions: dict, override: dict | N
     записываются под его id — значит, они лежат именно у новейшего.
     Без saved_at (или при равных) порядок по id: больший id новее.
 
-    Новейший показ идёт первым. Старшие показы (в том же порядке, от новых
-    к старым) и переопределение с плейлистом (не is_off) добавляются только
-    если у новейшего на них стоит решение "alternate" — по очереди после
-    него. Без решения или при "replace" они вытеснены. Без повторов
-    playlist_id. Пусто, если applicable пуст.
+    «Вершина» — новейший, если он никому не уступил. Решение "yield"
+    новейшего против другого показа из applicable отдаёт вершину тому (см.
+    _top: цепочки и циклы). Уступившие показы в результат не попадают, даже
+    если у вершины на них стоит "alternate". Если вершина уступает
+    переопределению с плейлистом (не is_off) — [] : показов в этот час нет,
+    лента берёт следующий шаг (переопределение с плейлистом, спека §4.7).
+
+    Вершина идёт первой. Остальные показы (от новых к старым) и
+    переопределение с плейлистом добавляются только если у вершины на них
+    стоит решение "alternate" — по очереди после неё. Без решения или при
+    "replace" они вытеснены. Без повторов playlist_id. Пусто, если
+    applicable пуст.
     """
-    if not applicable:
-        return []
-    ordered = sorted(applicable, key=_recency, reverse=True)   # новейший первым
-    newest = ordered[0]
-
-    def alternates(kind: str, other_id: int) -> bool:
-        return decisions.get((newest["id"], screen_id, kind, other_id)) == ALTERNATE
-
-    chosen = [newest["playlist_id"]]
-    for older in ordered[1:]:
-        if alternates(KIND_PLACEMENT, older["id"]):
-            chosen.append(older["playlist_id"])
-    if override and not override.get("is_off") and override.get("playlist_id") is not None \
-            and alternates(KIND_OVERRIDE, override["id"]):
-        chosen.append(override["playlist_id"])
-
-    return list(dict.fromkeys(chosen))   # без повторов, порядок сохраняется
+    return _choose(applicable, decisions, override, screen_id)[0]
 
 
 def pick_active(playlist_ids: list[int], playable: dict[int, list]) -> list[int]:
@@ -271,8 +311,10 @@ def week_cells(days: list[date], screen_id: int, placements: list[dict], decisio
     Клетка: {"date", "hour", "kind", "playlists": [названия], "playlist_ids": [id],
     "placement_id"}. kind: "off" | "placement" | "alternate" (в клетке ≥2
     плейлиста, они чередуются) | "override" | "template" | "empty".
-    placement_id — новейший из показов, действующих в этот час (иначе None).
-    Порядок клеток: по дням, внутри дня — по часам.
+    placement_id — показ-вершина часа (choose_playlists): его плейлист первый в
+    клетке; иначе None. Час, который показ уступил («yield»), показывает того,
+    кому уступили: другой показ, а если уступил переопределению — само
+    переопределение. Порядок клеток: по дням, внутри дня — по часам.
     """
     mine = [p for p in placements if screen_id in p["screens"]]
     override_on = {o["on_date"]: o for o in overrides if o["screen_id"] == screen_id}
@@ -290,12 +332,12 @@ def week_cells(days: list[date], screen_id: int, placements: list[dict], decisio
         is_off = bool(ov and ov.get("is_off"))
         for hour in range(24):
             kind, ids, placement_id = KIND_EMPTY, [], None
-            applicable = [] if is_off else [p for p in mine if applies_at(p, day, hour)]
+            if not is_off:                       # уступленный переопределению час — ids пуст, см. ниже
+                ids, placement_id = _choose([p for p in mine if applies_at(p, day, hour)],
+                                            decisions, ov, screen_id)
             if is_off:
                 kind = KIND_OFF
-            elif applicable:
-                ids = choose_playlists(applicable, decisions, ov, screen_id)
-                placement_id = max(applicable, key=_recency)["id"]
+            elif ids:
                 kind = KIND_ALTERNATE if len(ids) >= 2 else KIND_PLACEMENT
             elif ov and ov.get("playlist_id") is not None:
                 kind, ids = KIND_OVERRIDE, [ov["playlist_id"]]
@@ -310,14 +352,16 @@ def week_cells(days: list[date], screen_id: int, placements: list[dict], decisio
 
 
 def alternate_overlaps(p: dict, others: list[dict], overrides: list[dict], decisions: dict) -> list[dict]:
-    """Пересечения показа `p`, которые админ решил «крутить по очереди».
+    """Пересечения показа `p` с решением «по очереди» или «уступает» — строки карточки.
 
     Возвращает элементы find_conflicts (экран, другой плейлист, даты и часы
-    пересечения). Решение берётся у того из пары, кто сохранён позже, — как в
-    choose_playlists, где решает новейший показ; поэтому «по очереди» видно в
-    карточках обоих показов. Переопределение «новее» быть не может — его
-    решение лежит у самого p. Пересечение с тем же плейлистом пропускается:
-    сам с собой он не чередуется. `others` может содержать и сам p.
+    пересечения) с полем "mode": "alternate" | "yield". Решение берётся у
+    того из пары, кто сохранён позже, — как в choose_playlists, где решает
+    новейший показ. «По очереди» видно в карточках обоих показов; «уступает
+    «X»» — только у уступившего (тот, кому уступили, идёт как обычно).
+    Переопределение «новее» быть не может — его решение лежит у самого p.
+    Пересечение с тем же плейлистом пропускается: сам с собой он не
+    чередуется. `others` может содержать и сам p.
     """
     conflicts, _ = find_conflicts(p, others, overrides)
     by_id = {o["id"]: o for o in others}
@@ -325,12 +369,15 @@ def alternate_overlaps(p: dict, others: list[dict], overrides: list[dict], decis
     for c in conflicts:
         if c["other_playlist_id"] == p["playlist_id"]:
             continue
+        owner = p
         if c["other_kind"] == KIND_PLACEMENT:
             other = by_id[c["other_id"]]
             owner, rest = (p, other) if _recency(p) >= _recency(other) else (other, p)
             key = (owner["id"], c["screen_id"], KIND_PLACEMENT, rest["id"])
         else:
             key = (p["id"], c["screen_id"], KIND_OVERRIDE, c["other_id"])
-        if decisions.get(key) == ALTERNATE:
+        mode = decisions.get(key)
+        if mode == ALTERNATE or (mode == YIELD and owner is p):
+            c["mode"] = mode
             out.append(c)
     return out

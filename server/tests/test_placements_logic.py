@@ -269,6 +269,114 @@ def test_choose_empty_applicable():
     assert choose_playlists([], {(2, 1, "override", 3): "alternate"}, ov, 1) == []
 
 
+# --- «Оставить «X» на это время» (yield) ----------------------------------------
+
+def _saved(day):
+    return datetime(2026, 10, day, 12)
+
+
+def test_choose_yield_to_older_placement_plays_the_older():
+    # A — кампания на месяц, её правили позже (старшинство выше), но в часы
+    # пересечения админ оставил разовый B: решение yield лежит у A.
+    a = P(1, N1, N30, 9, 13, [1], pl=10, saved=_saved(28))
+    b = P(2, N1, N30, 9, 13, [1], pl=20, saved=_saved(20))
+    assert choose_playlists([a, b], {(1, 1, "placement", 2): "yield"}, None, 1) == [20]
+    # yield — на своём экране: на экране 2 решения нет, A вытесняет B
+    a2, b2 = P(1, N1, N30, 9, 13, [1, 2], pl=10, saved=_saved(28)), P(2, N1, N30, 9, 13, [1, 2], pl=20, saved=_saved(20))
+    assert choose_playlists([a2, b2], {(1, 1, "placement", 2): "yield"}, None, 2) == [10]
+
+
+def test_choose_yield_to_override_falls_through_to_override():
+    p = P(2, N1, N30, 9, 13, [1], pl=20)
+    ov = {"id": 3, "playlist_id": 30, "is_off": False}
+    # [] — показа в этот час нет, лента берёт следующий шаг: переопределение с плейлистом
+    assert choose_playlists([p], {(2, 1, "override", 3): "yield"}, ov, 1) == []
+    # переопределения нет (другой день) или оно «выключен» — уступать некому, показ идёт
+    assert choose_playlists([p], {(2, 1, "override", 3): "yield"}, None, 1) == [20]
+    off = {"id": 3, "playlist_id": None, "is_off": True}
+    assert choose_playlists([p], {(2, 1, "override", 3): "yield"}, off, 1) == [20]
+    # решение про другое переопределение (id 4) к сегодняшнему (id 3) не относится
+    assert choose_playlists([p], {(2, 1, "override", 4): "yield"}, ov, 1) == [20]
+
+
+def test_choose_yield_only_to_placement_applicable_now():
+    a = P(1, N1, N30, 9, 13, [1], pl=10, saved=_saved(28))
+    b = P(2, N1, N30, 9, 13, [1], pl=20, saved=_saved(20))
+    # уступает показу 7, которого в этот час нет: A остаётся главным, B вытеснен
+    assert choose_playlists([a, b], {(1, 1, "placement", 7): "yield"}, None, 1) == [10]
+
+
+def test_choose_yield_vertex_decides_alternate_and_replace():
+    a = P(1, N1, N30, 9, 13, [1], pl=10, saved=_saved(28))      # новейший, уступает B
+    b = P(2, N1, N30, 9, 13, [1], pl=20, saved=_saved(20))      # вершина
+    c = P(3, N1, N30, 9, 13, [1], pl=30, saved=_saved(15))
+    e = P(4, N1, N30, 9, 13, [1], pl=40, saved=_saved(10))
+    d = {(1, 1, "placement", 2): "yield",
+         (1, 1, "placement", 3): "alternate",                   # решения уступившего больше не действуют
+         (2, 1, "placement", 3): "alternate", (2, 1, "placement", 4): "replace",
+         (2, 1, "placement", 1): "alternate"}                    # A уступил B — в «по очереди» его нет
+    assert choose_playlists([e, c, a, b], d, None, 1) == [20, 30]
+
+
+def test_choose_yield_vertex_override_decisions():
+    a = P(1, N1, N30, 9, 13, [1], pl=10, saved=_saved(28))
+    b = P(2, N1, N30, 9, 13, [1], pl=20, saved=_saved(20))
+    ov = {"id": 7, "playlist_id": 70, "is_off": False}
+    # у уступившего A «по очереди» с переопределением, у вершины B решения нет — переопределение вытеснено
+    assert choose_playlists([a, b], {(1, 1, "placement", 2): "yield", (1, 1, "override", 7): "alternate"}, ov, 1) == [20]
+    # у вершины B — «по очереди» с переопределением
+    assert choose_playlists([a, b], {(1, 1, "placement", 2): "yield", (2, 1, "override", 7): "alternate"}, ov, 1) == [20, 70]
+    # вершина B сама уступает переопределению — показов в этот час нет
+    assert choose_playlists([a, b], {(1, 1, "placement", 2): "yield", (2, 1, "override", 7): "yield"}, ov, 1) == []
+    # A уступает и показу B, и переопределению: сначала идём по показам, вершина B его не уступает
+    assert choose_playlists([a, b], {(1, 1, "placement", 2): "yield", (1, 1, "override", 7): "yield"}, ov, 1) == [20]
+
+
+def test_choose_yield_chain():
+    a = P(1, N1, N30, 9, 13, [1], pl=10, saved=_saved(28))
+    b = P(2, N1, N30, 9, 13, [1], pl=20, saved=_saved(20))
+    c = P(3, N1, N30, 9, 13, [1], pl=30, saved=_saved(15))
+    d = {(1, 1, "placement", 2): "yield", (2, 1, "placement", 3): "yield"}
+    assert choose_playlists([a, b, c], d, None, 1) == [30]
+    # вершина C с «по очереди» к обоим уступившим — они всё равно не играют
+    d2 = {**d, (3, 1, "placement", 1): "alternate", (3, 1, "placement", 2): "alternate"}
+    assert choose_playlists([a, b, c], d2, None, 1) == [30]
+
+
+def test_choose_yield_to_several_picks_the_newest_of_them():
+    a = P(1, N1, N30, 9, 13, [1], pl=10, saved=_saved(28))
+    b = P(2, N1, N30, 9, 13, [1], pl=20, saved=_saved(15))
+    c = P(3, N1, N30, 9, 13, [1], pl=30, saved=_saved(20))
+    d = {(1, 1, "placement", 2): "yield", (1, 1, "placement", 3): "yield"}
+    assert choose_playlists([a, b, c], d, None, 1) == [30]                       # C сохранён позже B
+    assert choose_playlists([a, b, c], {**d, (3, 1, "placement", 2): "alternate"}, None, 1) == [30, 20]
+
+
+def test_choose_yield_cycle_is_deterministic():
+    a = P(1, N1, N30, 9, 13, [1], pl=10, saved=_saved(28))
+    b = P(2, N1, N30, 9, 13, [1], pl=20, saved=_saved(20))
+    d = {(1, 1, "placement", 2): "yield", (2, 1, "placement", 1): "yield"}
+    # A новейший → уступает B; B уступает A, но A уже пройден — остаётся B
+    assert choose_playlists([a, b], d, None, 1) == [20]
+    assert choose_playlists([b, a], d, None, 1) == [20]                          # от порядка списка не зависит
+    # B новее — наоборот, остаётся A
+    b_newer = {**b, "saved_at": _saved(29)}
+    assert choose_playlists([a, b_newer], d, None, 1) == [10]
+    # цикл из трёх: A → B → C → A; C → A пройден, остаётся C
+    c = P(3, N1, N30, 9, 13, [1], pl=30, saved=_saved(15))
+    d3 = {(1, 1, "placement", 2): "yield", (2, 1, "placement", 3): "yield", (3, 1, "placement", 1): "yield"}
+    assert choose_playlists([a, b, c], d3, None, 1) == [30]
+
+
+def test_choose_yield_of_older_placement_is_ignored():
+    # уступить может только тот, кто решает: решение yield у вытесненного (старшего) не работает
+    a = P(1, N1, N30, 9, 13, [1], pl=10, saved=_saved(20))
+    b = P(2, N1, N30, 9, 13, [1], pl=20, saved=_saved(28))
+    assert choose_playlists([a, b], {(1, 1, "placement", 2): "yield"}, None, 1) == [20]
+    assert choose_playlists([a, b], {(1, 1, "placement", 2): "yield", (2, 1, "placement", 1): "alternate"},
+                            None, 1) == [20, 10]
+
+
 # --- шаблон недели -----------------------------------------------------------
 
 def test_template_hour_beats_all_day():
@@ -395,6 +503,28 @@ def test_week_cells_names_fall_back_to_names_inside_placements_and_overrides():
     assert c[(DAYS[0], 10)]["playlists"] == ["PL10", "PL30"]                              # имена из самих показа и переопределения
 
 
+def test_week_cells_yielded_hours_show_the_other_placement():
+    month = P(1, N1, N30, 9, 15, [5], pl=10, saved=datetime(2026, 10, 28))           # месячный, правили последним
+    once = P(2, DAYS[1], DAYS[1], 11, 13, [5], pl=20, saved=datetime(2026, 10, 20))   # разовый во вторник 11–13
+    c = cells_of([month, once], {(1, 5, "placement", 2): "yield"}, names={10: "Месяц", 20: "Разовый"})
+    yielded = c[(DAYS[1], 11)]
+    assert (yielded["kind"], yielded["playlists"], yielded["playlist_ids"], yielded["placement_id"]) == \
+        ("placement", ["Разовый"], [20], 2)                                              # карточка — показа, который идёт
+    assert (c[(DAYS[1], 13)]["playlists"], c[(DAYS[1], 13)]["placement_id"]) == (["Месяц"], 1)
+    assert (c[(DAYS[0], 11)]["playlists"], c[(DAYS[0], 11)]["placement_id"]) == (["Месяц"], 1)
+
+
+def test_week_cells_yield_to_override_shows_override():
+    p = P(1, N1, N30, 9, 13, [5], pl=10)
+    c = cells_of([p], {(1, 5, "override", 9): "yield"}, [OV(9, 5, DAYS[2], pl=30)], ALL_DAY_1,
+                 {10: "Утро", 30: "Акция дня", 1: "Общий"})
+    on_day = c[(DAYS[2], 10)]
+    assert (on_day["kind"], on_day["playlists"], on_day["playlist_ids"], on_day["placement_id"]) == \
+        ("override", ["Акция дня"], [30], None)
+    assert (c[(DAYS[1], 10)]["kind"], c[(DAYS[1], 10)]["placement_id"]) == ("placement", 1)   # в другие дни показ идёт
+    assert c[(DAYS[2], 14)]["kind"] == "override" and c[(DAYS[1], 14)]["kind"] == "template"
+
+
 # --- «по очереди» в карточке показа -------------------------------------------
 
 def test_alternate_overlaps_follow_decision_of_the_newer_side():
@@ -419,6 +549,24 @@ def test_alternate_overlaps_override_stopped_other_and_same_playlist():
     out = alternate_overlaps(p, [p, stopped, twin], [ov], dec)
     assert [(a["other_kind"], a["other_id"], a["date_from"], a["hour_from"], a["hour_to"]) for a in out] == \
         [("override", 4, date(2026, 11, 9), 9, 13)]
+    assert out[0]["mode"] == "alternate"
+
+
+def test_alternate_overlaps_yield_is_shown_only_at_the_yielding_side():
+    older = P(1, N1, N30, 9, 13, [1], pl=10, saved=datetime(2026, 10, 20))
+    newer = P(2, date(2026, 11, 5), date(2026, 11, 7), 11, 15, [1], pl=20, saved=datetime(2026, 10, 28))
+    dec = {(2, 1, "placement", 1): "yield"}                          # новейший уступает старшему
+    from_newer = alternate_overlaps(newer, [older, newer], [], dec)
+    assert [(a["mode"], a["other_id"], a["other_playlist_name"], a["date_from"], a["date_to"], a["hour_from"],
+             a["hour_to"]) for a in from_newer] == [("yield", 1, "PL10", date(2026, 11, 5), date(2026, 11, 7), 11, 13)]
+    assert alternate_overlaps(older, [older, newer], [], dec) == []   # тот, кому уступили, идёт как обычно
+    # устаревшее yield у старшего не в счёт — решает новейший
+    assert alternate_overlaps(older, [older, newer], [], {(1, 1, "placement", 2): "yield"}) == []
+    # уступить переопределению
+    ov = OV(4, 1, date(2026, 11, 6), pl=30)
+    out = alternate_overlaps(newer, [older, newer], [ov], {(2, 1, "override", 4): "yield"})
+    assert [(a["mode"], a["other_kind"], a["other_id"], a["other_playlist_name"]) for a in out] == \
+        [("yield", "override", 4, "PL30")]
 
 
 # --- что из выбранного реально играть ------------------------------------------

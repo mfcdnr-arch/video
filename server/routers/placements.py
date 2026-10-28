@@ -3,24 +3,27 @@
 Показ ставит плейлист на экраны (или на все экраны сети) на диапазон дат и
 ежедневно на целые часы МСК. Пересечения с другими показами и с датовыми
 переопределениями находит placements_logic.find_conflicts; решает их админ —
-отдельно для каждого экрана («replace» / «alternate»). Сохранить показ, пока
-хоть одно пересечение не решено, нельзя (409). Правка (PUT) идёт тем же
-путём, что создание, но сам показ пересечением не считается.
+отдельно для каждого экрана («replace» / «alternate» / «yield» — «Оставить
+«X» на это время»). Сохранить показ, пока хоть одно пересечение не решено,
+нельзя (409). Правка (PUT) идёт тем же путём, что создание, но сам показ
+пересечением не считается; предпросмотр правки отдаёт сохранённые решения
+показа по нынешним пересечениям — панель подставляет их в выбор.
 
 Остановить можно только идущий показ (status "active"), отменить (удалить) —
 только запланированный; статус считает placements_logic.placement_status.
 GET /placements/week отдаёт сетку 7 дней × 24 часа для одного экрана
 (placements_logic.week_cells).
 
-Чистые функции (parse_body, parse_decisions, unresolved, summary_text,
-overflow_notes, week_start, sort_listing, listing_row, check_stoppable,
-check_deletable) проверяются в tests/test_placements_api.py. SQL живёт в
-placements_store: разбор строк (развёртывание групп и «всех экранов»,
+Чистые функции (parse_body, parse_decisions, unresolved, saved_decisions,
+summary_text, overflow_notes, week_start, sort_listing, listing_row,
+check_stoppable, check_deletable) проверяются в tests/test_placements_api.py.
+SQL живёт в placements_store: разбор строк (развёртывание групп и «всех экранов»,
 приоритет экрана над группой, наивные МСК-даты, запись saved_at и
 stopped_at) — в tests/test_placements_store.py на фейковой БД. smoke_test.sh
-на живом стенде проходит путь без пересечений: предпросмотр, создание,
-список, правка, неделя, остановка и отмена на новом экране; ветки с
-пересечениями, 409 на создание и решениями им не покрыты.
+на живом стенде проходит предпросмотр, создание, список, правку, неделю,
+остановку и отмену на новом экране, а на текущем часе — одно пересечение:
+409 без решения, «заменить», сохранённое решение в предпросмотре правки и
+правку на «уступить» с проверкой ленты экрана.
 """
 from datetime import date, datetime, timedelta
 from typing import Callable
@@ -31,7 +34,7 @@ from sqlalchemy.orm import Session
 
 from admin_panel import ad_sequence
 from deps import get_current_admin, get_db, require_write
-from placements_logic import (ALTERNATE, KIND_OVERRIDE, KIND_PLACEMENT, REPLACE, alternate_overlaps,
+from placements_logic import (ALTERNATE, KIND_OVERRIDE, KIND_PLACEMENT, REPLACE, YIELD, alternate_overlaps,
                               find_conflicts, placement_status, week_cells)
 from placements_store import (all_screen_ids, delete_placement, get_placement, load_decisions,
                               load_overrides, load_placements, load_playlist_names, load_screen_slots,
@@ -127,7 +130,7 @@ def parse_decisions(raw) -> dict:
         sid, oid = _int(d.get("screen_id")), _int(d.get("other_id"))
         kind, mode = d.get("other_kind"), d.get("mode")
         if sid is None or oid is None or kind not in (KIND_PLACEMENT, KIND_OVERRIDE) \
-                or mode not in (REPLACE, ALTERNATE):
+                or mode not in (REPLACE, ALTERNATE, YIELD):
             raise HTTPException(400, f"decisions: неверное решение {d!r}")
         out[(sid, kind, oid)] = mode
     return out
@@ -140,6 +143,24 @@ def _key(conflict: dict) -> tuple:
 def unresolved(conflicts: list[dict], decisions: dict) -> int:
     """Сколько пересечений осталось без решения."""
     return sum(1 for c in conflicts if _key(c) not in decisions)
+
+
+def saved_decisions(placement_id: int, conflicts: list[dict], decisions: dict) -> list[dict]:
+    """Сохранённые решения показа placement_id — только по пересечениям из conflicts.
+
+    decisions — из load_decisions: {(placement_id, screen_id, other_kind,
+    other_id): mode}. Решения по пересечениям, которых больше нет (экран
+    убрали, другой показ отменили или сдвинули), не отдаются. Порядок — как у
+    conflicts; [{"screen_id", "other_kind", "other_id", "mode"}].
+    """
+    out, seen = [], set()
+    for c in conflicts:
+        key = _key(c)
+        mode = decisions.get((placement_id, *key))
+        if mode is not None and key not in seen:
+            seen.add(key)
+            out.append({"screen_id": key[0], "other_kind": key[1], "other_id": key[2], "mode": mode})
+    return out
 
 
 def _hh(hour: int) -> str:
@@ -204,7 +225,8 @@ def sort_listing(rows: list[dict]) -> list[dict]:
 def listing_row(p: dict, now: datetime, screen_names: dict[int, str], alternates: list[dict]) -> dict:
     """Строка GET /placements: показ из load_placements + статус на момент now.
 
-    screen_names — {screen_id: название}; alternates — alternate_overlaps(...) для этого показа.
+    screen_names — {screen_id: название}; alternates — alternate_overlaps(...) для этого показа:
+    строки «по очереди с «X»» (mode "alternate") и «уступает «X»» (mode "yield").
     """
     def name(screen_id: int) -> str:
         return screen_names.get(screen_id) or f"Экран #{screen_id}"
@@ -216,7 +238,8 @@ def listing_row(p: dict, now: datetime, screen_names: dict[int, str], alternates
         "date_from": p["date_from"], "date_to": p["date_to"],
         "hour_from": p["hour_from"], "hour_to": p["hour_to"],
         "status": placement_status(p, now),
-        "alternates": [{"screen_name": name(a["screen_id"]), "other_playlist_name": a["other_playlist_name"],
+        "alternates": [{"screen_id": a["screen_id"], "screen_name": name(a["screen_id"]), "mode": a["mode"],
+                        "other_playlist_name": a["other_playlist_name"],
                         "date_from": a["date_from"], "date_to": a["date_to"],
                         "hour_from": a["hour_from"], "hour_to": a["hour_to"]} for a in alternates],
         "created_by": p["created_by"], "created_at": p["created_at"],
@@ -292,7 +315,9 @@ def preview_placement(body: dict = Body(...), admin: dict = Depends(require_writ
     Что будет, если сохранить показ: пересечения (их решает админ), дни, где
     экран выключен переопределением, предупреждения и итоговая фраза.
     Для правки показа — "exclude_id": сам показ пересечением не считается,
-    а прошедшую дату начала можно оставить как есть. Ничего не пишет в БД.
+    прошедшую дату начала можно оставить как есть, а "decisions" — его
+    сохранённые решения по нынешним пересечениям (панель подставляет их в
+    выбор; без exclude_id — []). Ничего не пишет в БД.
     """
     exclude_id = body.get("exclude_id") if isinstance(body, dict) else None
     if exclude_id is not None:
@@ -317,7 +342,10 @@ def preview_placement(body: dict = Body(...), admin: dict = Depends(require_writ
             cache[(playlist_id, venue)] = sum(sec for _, sec in ad_sequence(db, playlist_id, venue))
         return cache[(playlist_id, venue)]
 
-    return {"conflicts": conflicts, "off_days": off_days, "notices": notices,
+    stored = saved_decisions(exclude_id, conflicts, load_decisions(db, [exclude_id])) \
+        if exclude_id is not None else []
+
+    return {"conflicts": conflicts, "off_days": off_days, "notices": notices, "decisions": stored,
             "overflow": overflow_notes(conflicts, data["playlist_id"], ad_total),
             "summary": summary_text(data, len(data["screens"])),
             "screen_count": len(data["screens"])}
@@ -365,9 +393,10 @@ def list_placements(playlist_id: int = Query(..., description="Показы эт
     """
     Показы плейлиста: идущие, затем запланированные, затем закончившиеся и
     остановленные (внутри — дата начала по убыванию). У каждого — экраны,
-    статус (planned / active / done / stopped) и строки «по очереди»: с каким
-    плейлистом, на каком экране, в какие даты и часы (решения админа по
-    пересечениям, см. placements_logic.alternate_overlaps).
+    статус (planned / active / done / stopped) и строки «по очереди» /
+    «уступает» (mode alternate / yield): с каким плейлистом, на каком экране,
+    в какие даты и часы (решения админа по пересечениям, см.
+    placements_logic.alternate_overlaps).
     """
     now = now_msk()
     mine = load_placements(db, date.min, date.max, playlist_id)
