@@ -97,7 +97,7 @@ async function viewOta(){
         const screens = await api('/minipc');
         const screensHtml = screens.length
           ? screens.map(s=>`<label style="display:inline-flex;align-items:center;gap:5px;margin-right:12px;margin-bottom:4px;font-size:12px;">
-              <input type="checkbox" class="ota-screen-chk" value="${s.id}"> ${esc(s.name)} <span style="color:${s.status==='online'?'var(--accent)':'var(--danger)'};font-size:10px;">(${s.status==='online'?'онлайн':'офлайн'})</span>
+              <input type="checkbox" class="ota-screen-chk" value="${s.id}"> ${esc(s.name)} <span style="color:${s.online?'var(--accent)':'var(--danger)'};font-size:10px;">(${s.online?'в сети':esc(fmtOfflineFor(s.offline_for_seconds))})</span>
             </label>`).join('')
           : '<span class="muted">Экранов нет</span>';
         const el = document.getElementById('ota-screens-list');

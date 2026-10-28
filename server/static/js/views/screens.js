@@ -237,7 +237,7 @@ async function viewScreens(tab){
     let h=tabsHtml+'<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(230px,1fr));">';
 
     list.forEach(s=>{
-      const on=s.status==='online';
+      const on=!!s.online;
       const wsOn = wsConnected.has(Number(s.id));
       const wsBadge = wsOn
         ? `<span title="WebSocket активен — push-команды работают" style="font-size:10px;background:rgba(40,167,69,0.15);color:#28a745;border-radius:4px;padding:1px 6px;font-weight:600;">WS</span>`
@@ -271,7 +271,7 @@ async function viewScreens(tab){
           <span style="color:var(--muted);font-size:11px;flex-shrink:0;" title="ID экрана — для установки агента">ID ${s.id}</span>
           <span style="font-weight:500;flex:1;">${esc(s.name)}</span>${wsBadge}${dispBadge}${groupLabel}
         </div>
-        <div style="font-size:11px;color:var(--muted);margin-bottom:3px;">${esc(s.city||'')}${s.city&&s.location?' · ':''}${esc(s.location||'')} ${on?'· своб. '+(s.disk_free_gb!=null?Number(s.disk_free_gb).toFixed(0):'?')+' ГБ':'· офлайн'}</div>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:3px;">${esc(s.city||'')}${s.city&&s.location?' · ':''}${esc(s.location||'')} ${on?'· своб. '+(s.disk_free_gb!=null?Number(s.disk_free_gb).toFixed(0):'?')+' ГБ':'· '+esc(fmtOfflineFor(s.offline_for_seconds))}</div>
         ${(s.os_version||s.vlc_version)?`<div style="font-size:11px;color:var(--muted);margin-bottom:3px;">ОС: ${esc(s.os_version||'—')} · VLC: ${esc(s.vlc_version||'—')}</div>`:''}
         <div style="font-size:11px;color:var(--muted);margin-bottom:3px;">${venueLabel}${powerLabel} · ${volLabel}</div>
         ${(s.clock_drift_seconds!=null && Math.abs(s.clock_drift_seconds)>60)
@@ -324,11 +324,11 @@ async function viewGroups(view, tabsHtml){
 
     groups.forEach(g=>{
       const gs = screens.filter(s=>s.group_id===g.id);
-      const onl = gs.filter(s=>s.status==='online').length;
+      const onl = gs.filter(s=>s.online).length;
 
       const scrRows = gs.length
         ? gs.map(s=>{
-            const on=s.status==='online';
+            const on=!!s.online;
             return `<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:.5px solid var(--border);">
               <span class="dot" style="background:${on?'var(--accent)':'var(--danger)'}"></span>
               <span style="flex:1;font-size:12px;">${esc(s.name)}</span>
@@ -386,7 +386,7 @@ async function viewGroups(view, tabsHtml){
       h+='<div class="sec">Экраны без группы</div><div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr));">';
 
       ungrouped.forEach(s=>{
-        const on=s.status==='online';
+        const on=!!s.online;
         h+=`<div class="cell">
           <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
             <span class="dot" style="background:${on?'var(--accent)':'var(--danger)'}"></span>

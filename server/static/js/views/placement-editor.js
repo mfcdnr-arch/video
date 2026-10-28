@@ -116,18 +116,6 @@
 
   function keyOf(c){ return `${c.screen_id}:${c.other_kind}:${c.other_id}`; }
 
-  // «не в сети 2 ч» по last_seen (серверное время — UTC без пояса)
-  function offlineNote(s){
-    if(!s.last_seen) return 'не в сети';
-    const ts = typeof parseServerTS === 'function' ? parseServerTS(s.last_seen) : new Date(s.last_seen);
-    const min = Math.floor((Date.now() - ts.getTime()) / 60000);
-    if(isNaN(min) || min < 1) return 'не в сети';
-    if(min < 60) return `не в сети ${min} мин`;
-    const h = Math.floor(min / 60);
-    if(h < 48) return `не в сети ${h} ч`;
-    return `не в сети ${Math.floor(h / 24)} дн`;
-  }
-
   // ---- проверка формы и тело запросов ------------------------------------------
 
   // Текст «чего не хватает» или '' — тогда предпросмотр можно запрашивать.
@@ -166,7 +154,7 @@
 
   function screenSub(s){
     const parts = [s.city, s.location].filter(Boolean);
-    if(s.status !== 'online') parts.push(offlineNote(s));
+    if(!s.online) parts.push(fmtOfflineFor(s.offline_for_seconds));
     return parts.join(' · ');
   }
 
@@ -183,7 +171,7 @@
       box.innerHTML = '<div class="plc-empty">Ничего не найдено. Поиск идёт по названию и адресу экрана.</div>';
     }else{
       box.innerHTML = list.map(s => {
-        const on = s.status === 'online';
+        const on = !!s.online;
         const checked = st.picked.has(s.id);
         const sub = screenSub(s);
         return `<label class="plc-scr${checked ? ' on' : ''}">

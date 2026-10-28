@@ -3,7 +3,8 @@
 # Запускать на сервере после `install_server.sh` / обновления.
 # Проверяет: все контейнеры живы, вход, здоровье API, полный цикл
 # «экран → медиа → плейлист → расписание», показ по датам, что экран играет и
-# качает (лента и список файлов глазами агента), отчёты, биллинг, уведомления.
+# качает (лента и список файлов глазами агента), «в сети» по последнему сигналу,
+# отчёты, биллинг, уведомления.
 # Все тестовые данные создаются с префиксом SMOKE_ и удаляются в конце.
 #
 # Использование:   bash smoke_test.sh
@@ -459,6 +460,40 @@ print(h.date(), h.hour, (h + d.timedelta(hours=1)).isoformat())" 2>/dev/null)
   fi
 else
   bad "нет экрана, его токена или ролика — проверку ленты провести не на чем"
+fi
+
+# ── 4г. «В сети» по последнему сигналу ───────────────────────────────────────
+# Единое правило (этап 2, §4.5): экран в сети, если его последний сигнал не старше
+# 5 минут. Только что зарегистрированный SMOKE-экран сигнала не подавал: не в сети,
+# offline_for_seconds = null. После heartbeat (как агент: X-Token, тело как у агента) —
+# в сети: и в списке экранов, и на дашборде (счётчик, плитки «Сейчас в эфире» и «Диски»);
+# с последнего сигнала — секунды, а не часы (last_seen пишется в UTC, NOW() в БД тоже UTC).
+step "Экран: «в сети» по последнему сигналу"
+if [ -n "${SID:-}" ] && [ -n "${SCR_TOKEN:-}" ]; then
+  req GET "/minipc"
+  if [ "$HTTP" = "200" ] && body_has "any(x['id']==$SID and x['online'] is False and x['offline_for_seconds'] is None for x in r)"; then
+    ok "экран без сигнала: не в сети, offline_for_seconds = null"
+  else
+    bad "экран без сигнала: ждали online=false и offline_for_seconds=null, HTTP $HTTP"
+  fi
+  RESP=$($DC curl -s -w $'\n%{http_code}' -X POST "$API/heartbeat/$SID" -H "X-Token: $SCR_TOKEN" \
+        -H 'Content-Type: application/json' -d '{"status":"online","playing_file":null}' 2>/dev/null)
+  HTTP="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
+  [ "$HTTP" = "200" ] && ok "heartbeat экрана принят" || bad "heartbeat: HTTP $HTTP"
+  req GET "/minipc"
+  if [ "$HTTP" = "200" ] && body_has "any(x['id']==$SID and x['online'] is True and x['offline_for_seconds'] is not None and 0 <= x['offline_for_seconds'] < 60 for x in r)"; then
+    ok "после heartbeat: в сети, с последнего сигнала — секунды"
+  else
+    bad "после heartbeat: ждали online=true и offline_for_seconds < 60, HTTP $HTTP: $(echo "$BODY" | python3 -c "import sys,json;print([(x['online'], x['offline_for_seconds']) for x in json.load(sys.stdin) if x['id']==$SID])" 2>/dev/null)"
+  fi
+  req GET "/dashboard"
+  if [ "$HTTP" = "200" ] && body_has "r['screens_online']>=1 and any(x['name']=='SMOKE_scr_$STAMP' and x['online'] is True for x in r['now_playing']) and any(x['name']=='SMOKE_scr_$STAMP' and x['online'] is True for x in r['disks'])"; then
+    ok "дашборд: экран в сети (счётчик, «Сейчас в эфире», «Диски»)"
+  else
+    bad "дашборд: экран после heartbeat не в сети, HTTP $HTTP"
+  fi
+else
+  bad "нет экрана или его токена — проверку «в сети» провести не на чем"
 fi
 
 # ── 5. Отчёты / биллинг / уведомления доступны ───────────────────────────────

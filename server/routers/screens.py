@@ -21,6 +21,7 @@ from dashboard_ws import dashboard_ws_manager
 from placements_logic import active_until_for, pick_active
 from placements_store import load_playlist_names, now_msk, resolve_placement_hour
 from playlist_rules import build_shared_hour, expand_repeats, interleave
+from screen_online import offline_for_sql, online_sql
 from ws_manager import ws_manager
 
 log = logging.getLogger(__name__)
@@ -70,8 +71,15 @@ def register_minipc(
 
 @router.get("/minipc")
 def list_minipcs(admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    rows = db.execute(text("""
+    """
+    Список экранов. «В сети» — единое правило (screen_online.py): последний сигнал
+    не старше 5 минут. Отдаётся вычисленными полями online и offline_for_seconds
+    (null — экран ни разу не выходил на связь); status оставлен для совместимости.
+    """
+    rows = db.execute(text(f"""
         SELECT s.id, s.name, s.city, s.location, s.status, s.playing_file,
+               {online_sql("s")} AS online,
+               {offline_for_sql("s")} AS offline_for_seconds,
                s.last_seen, s.disk_free_gb, s.ip_address, s.agent_version,
                s.power_on_time, s.power_off_time,
                s.volume_day, s.volume_night, s.night_from, s.night_to,

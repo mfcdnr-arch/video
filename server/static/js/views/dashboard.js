@@ -54,7 +54,7 @@ async function viewDash(){
     if(d.now_playing && d.now_playing.length){
       h+='<div class="sec">Сейчас в эфире</div><div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(230px,1fr));">';
       d.now_playing.forEach(s=>{
-        const on=s.status==='online';
+        const on=!!s.online;
         const playing = on && s.playing_file;
         const label = s.media_title || s.playing_file;
         h+=`<div class="cell">
@@ -62,7 +62,7 @@ async function viewDash(){
           ${playing
             ? `<div style="font-size:13px;color:var(--txt);">▶ ${esc(label)}</div>${s.advertiser?`<div style="font-size:11px;color:var(--muted);margin-top:2px;">${esc(s.advertiser)}</div>`:''}`
             : (on ? '<div style="font-size:12px;color:var(--muted);">▷ ничего не воспроизводится</div>'
-                  : '<div style="font-size:12px;color:var(--danger);">офлайн — нет данных</div>')}
+                  : `<div style="font-size:12px;color:var(--danger);">${esc(fmtOfflineFor(s.offline_for_seconds))}</div>`)}
         </div>`;
       });
       h+='</div>';
@@ -70,7 +70,7 @@ async function viewDash(){
     // диск — с прогресс-барами
     h+='<div class="sec">Диски мини ПК</div><div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(185px,1fr));">';
     (d.disks || []).forEach(s=>{
-      const off=s.status!=='online';
+      const off=!s.online;
       const free=s.disk_free_gb!=null?Number(s.disk_free_gb):null;
       const total=s.disk_total_gb!=null?Number(s.disk_total_gb):null;
       const used=(free!=null&&total!=null)?total-free:null;
@@ -85,7 +85,7 @@ async function viewDash(){
           ${!off&&pct!=null?`<span style="font-size:11px;color:${barCol};font-weight:600;">${pct}%</span>`:''}
         </div>
         ${off
-          ? `<div style="font-size:11px;color:var(--danger);">офлайн</div>`
+          ? `<div style="font-size:11px;color:var(--danger);">${esc(fmtOfflineFor(s.offline_for_seconds))}</div>`
           : pct!=null
             ? `<div style="height:5px;background:var(--border2);border-radius:3px;overflow:hidden;margin-bottom:4px;">
                  <div style="width:${pct}%;height:100%;background:${barCol};border-radius:3px;"></div></div>

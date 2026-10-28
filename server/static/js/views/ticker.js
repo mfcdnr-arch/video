@@ -139,7 +139,7 @@ async function viewTicker(){
   if(TICK_TARGET === 'one'){
     h += '<div style="margin-bottom:11px;">';
     screens.forEach(s => {
-      const on = s.status === 'online';
+      const on = !!s.online;
       const sel = !!TICK_SCREENS[s.id];
 
       h += `<div class="cell" style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer;${sel ? 'border-color:var(--accent2);' : ''}${on ? '' : 'opacity:.5;'}"
@@ -147,7 +147,7 @@ async function viewTicker(){
         data-screen-id="${s.id}">
         <span>${sel ? '☑' : '☐'}</span>
         ${esc(s.name)}
-        ${on ? '' : '<span class="danger" style="font-size:11px;color:var(--danger);">(офлайн)</span>'}
+        ${on ? '' : `<span class="danger" style="font-size:11px;color:var(--danger);">(${esc(fmtOfflineFor(s.offline_for_seconds))})</span>`}
       </div>`;
     });
     h += '</div>';

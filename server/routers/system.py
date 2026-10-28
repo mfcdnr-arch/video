@@ -6,6 +6,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from deps import get_db, get_current_admin
+from screen_online import offline_for_sql, online_sql
 
 router = APIRouter()
 
@@ -232,14 +233,17 @@ def system_selfcheck(db: Session = Depends(get_db), current_admin=Depends(get_cu
 
 @router.get("/dashboard")
 def dashboard(db: Session = Depends(get_db), current_admin=Depends(get_current_admin)):
-    """Сводка для стартового экрана панели."""
-    summary = db.execute(text("""
+    """
+    Сводка для стартового экрана панели. «В сети» — единое правило
+    (screen_online.py): последний сигнал экрана не старше 5 минут; плитки
+    «Сейчас в эфире» и «Диски» получают его готовым полем online.
+    """
+    summary = db.execute(text(f"""
         SELECT
             COUNT(*) as total,
-            COUNT(*) FILTER (WHERE last_seen > NOW() - INTERVAL '5 minutes') as online,
-            COUNT(*) FILTER (WHERE status = 'offline' OR last_seen IS NULL
-                              OR last_seen <= NOW() - INTERVAL '5 minutes') as offline
-        FROM screens
+            COUNT(*) FILTER (WHERE {online_sql("s")}) as online,
+            COUNT(*) FILTER (WHERE NOT {online_sql("s")}) as offline
+        FROM screens s
     """)).fetchone()
 
     adv_count = db.execute(text("SELECT COUNT(*) FROM advertisers")).scalar()
@@ -265,8 +269,10 @@ def dashboard(db: Session = Depends(get_db), current_admin=Depends(get_current_a
         WHERE b.id = 1
     """)).fetchone()
 
-    now_playing = db.execute(text("""
+    now_playing = db.execute(text(f"""
         SELECT s.name, s.status, s.playing_file,
+               {online_sql("s")} AS online,
+               {offline_for_sql("s")} AS offline_for_seconds,
                m.title AS media_title, a.name AS advertiser
         FROM screens s
         LEFT JOIN media m ON m.filename = s.playing_file
@@ -274,10 +280,12 @@ def dashboard(db: Session = Depends(get_db), current_admin=Depends(get_current_a
         ORDER BY s.name
     """)).fetchall()
 
-    disks = db.execute(text("""
-        SELECT name, status, disk_free_gb, disk_total_gb
-        FROM screens
-        ORDER BY name
+    disks = db.execute(text(f"""
+        SELECT s.name, s.status, s.disk_free_gb, s.disk_total_gb,
+               {online_sql("s")} AS online,
+               {offline_for_sql("s")} AS offline_for_seconds
+        FROM screens s
+        ORDER BY s.name
     """)).fetchall()
 
     feed = db.execute(text("""
@@ -290,12 +298,12 @@ def dashboard(db: Session = Depends(get_db), current_admin=Depends(get_current_a
     # Экраны, где мини-ПК жив и играет, но монитор не подключён к видеовыходу
     # (миграция 028). Такой экран выглядит здоровым во всех остальных метриках,
     # поэтому выносим его на дашборд отдельно.
-    no_display = db.execute(text("""
-        SELECT id, name, display_outputs, display_changed_at
-        FROM screens
-        WHERE display_connected IS FALSE
-          AND last_seen > NOW() - INTERVAL '5 minutes'
-        ORDER BY name
+    no_display = db.execute(text(f"""
+        SELECT s.id, s.name, s.display_outputs, s.display_changed_at
+        FROM screens s
+        WHERE s.display_connected IS FALSE
+          AND {online_sql("s")}
+        ORDER BY s.name
     """)).fetchall()
 
     broken_media = db.execute(text("""
