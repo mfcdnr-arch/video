@@ -2,8 +2,8 @@
 # smoke_test.sh — быстрый прогон ключевых сценариев ПЕРЕД каждым релизом.
 # Запускать на сервере после `install_server.sh` / обновления.
 # Проверяет: все контейнеры живы, вход, здоровье API, полный цикл
-# «экран → медиа → плейлист → расписание», показ по датам, отчёты, биллинг,
-# уведомления.
+# «экран → медиа → плейлист → расписание», показ по датам, что экран играет и
+# качает (лента и список файлов глазами агента), отчёты, биллинг, уведомления.
 # Все тестовые данные создаются с префиксом SMOKE_ и удаляются в конце.
 #
 # Использование:   bash smoke_test.sh
@@ -67,6 +67,7 @@ STAMP=$(date +%s)
 # экран
 req POST "/minipc/register?name=SMOKE_scr_$STAMP"
 SID=$(echo "$BODY" | python3 -c "import sys,json;print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+SCR_TOKEN=$(body_get token)          # токен экрана: им smoke ходит как агент (X-Token)
 [ -n "$SID" ] && ok "экран создан (id=$SID)" || bad "экран не создан"
 # медиа (генерим тестовый ролик ffmpeg внутри контейнера)
 $DC sh -c "ffmpeg -f lavfi -i testsrc=duration=1:size=160x120:rate=5 -y /tmp/smoke.mp4 -loglevel quiet" 2>/dev/null
@@ -336,6 +337,81 @@ if [ -n "${PLC:-}" ]; then
   fi
 fi
 
+# ── 4в. Что экран играет и качает: показ на текущий час ─────────────────────
+# Глазами агента (X-Token экрана): показ на текущий час МСК на одном тестовом
+# экране → лента отдаёт его как активный источник со сроком до следующего
+# целого часа, ролик показа есть в списке закачки; после «Остановить» лента
+# к показу не возвращается, ролик из закачки уходит. Плейлист — отдельный, с
+# роликом MID3, которого нет ни в шаблоне, ни в других плейлистах экрана:
+# иначе ролик был бы в списке закачки и без показа.
+step "Экран: что играет и что качает"
+# dreq — запрос агента: только X-Token экрана, без админского токена
+dreq(){ # dreq PATH
+  RESP=$($DC curl -s -w $'\n%{http_code}' "$API$1" -H "X-Token: $SCR_TOKEN" 2>/dev/null)
+  HTTP="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
+}
+if [ -n "${SID:-}" ] && [ -n "${SCR_TOKEN:-}" ] && [ -n "${MID3:-}" ]; then
+  req GET "/media/$MID3"; NOW_FILE=$(body_get filename)
+  req POST "/playlists/full" -H 'Content-Type: application/json' \
+      -d "{\"name\": \"SMOKE_now_$STAMP\", \"items\": [{\"media_id\": $MID3}]}"
+  PIDN=$(body_get id)
+  [ -n "$PIDN" ] && ok "плейлист для показа на текущий час создан (id=$PIDN)" || bad "плейлист SMOKE_now: HTTP $HTTP"
+
+  # Часы — МСК внутри ds_api (на macOS-стенде нет `date -d`). В последние 30 с
+  # часа ждём начала следующего, чтобы показ не кончился посреди проверки.
+  # Печатает: дата, час, ожидаемый active_until (следующий целый час, наивное МСК).
+  NOWH=$($DC python3 -c "
+import datetime as d, time
+msk = d.timezone(d.timedelta(hours=3))
+n = d.datetime.now(msk)
+if n.minute == 59 and n.second >= 30:
+    time.sleep(61 - n.second); n = d.datetime.now(msk)
+h = n.replace(minute=0, second=0, microsecond=0, tzinfo=None)
+print(h.date(), h.hour, (h + d.timedelta(hours=1)).isoformat())" 2>/dev/null)
+  read -r DN HN UNTIL <<< "$NOWH"
+
+  dreq "/files/list/$SID"
+  if [ "$HTTP" = "200" ] && [ -n "$NOW_FILE" ] && ! body_has "any(f['filename']=='$NOW_FILE' for f in r)"; then
+    ok "до показа ролика SMOKE_now нет в списке закачки экрана"; else bad "список закачки до показа: HTTP $HTTP"; fi
+
+  PLCN=""
+  if [ -n "$PIDN" ] && [ -n "${HN:-}" ]; then
+    req POST "/placements" -H 'Content-Type: application/json' \
+        -d "{\"playlist_id\": $PIDN, \"all_screens\": false, \"screen_ids\": [$SID], \"date_from\": \"$DN\", \"date_to\": \"$DN\", \"hour_from\": $HN, \"hour_to\": $((HN + 1)), \"decisions\": []}"
+    PLCN=$(body_get id)
+    if [ "$HTTP" = "200" ] && [ -n "$PLCN" ]; then
+      ok "показ на текущий час ${HN}:00–$((HN + 1)):00 создан (id=$PLCN)"; else bad "показ на текущий час: HTTP $HTTP"; fi
+  fi
+
+  if [ -n "$PLCN" ]; then
+    req GET "/broadcast"
+    if body_has "r.get('is_on')"; then
+      echo "  – включён «Эфир сети»: он перекрывает показы, проверка ленты пропущена"
+    else
+      dreq "/schedule/minipc/$SID"
+      if [ "$HTTP" = "200" ] && body_has "r['active_source']=='placement' and r['active_playlist']['playlist_id']==$PIDN and r['active_until']=='$UNTIL' and any(i['filename']=='$NOW_FILE' for i in r['active_items'])"; then
+        ok "лента экрана: играет показ, active_until=$UNTIL"
+      else
+        bad "лента экрана: ждали показ #$PLCN до $UNTIL, получили HTTP $HTTP: $(echo "$BODY" | python3 -c "import sys,json;r=json.load(sys.stdin);print(r.get('active_source'), r.get('active_until'))" 2>/dev/null)"
+      fi
+    fi
+    dreq "/files/list/$SID"
+    if [ "$HTTP" = "200" ] && body_has "any(f['filename']=='$NOW_FILE' for f in r)"; then
+      ok "ролик показа в списке закачки экрана"; else bad "ролика показа нет в списке закачки: HTTP $HTTP"; fi
+
+    req POST "/placements/$PLCN/stop"
+    [ "$HTTP" = "200" ] && ok "показ на текущий час остановлен" || bad "остановка показа на текущий час: HTTP $HTTP"
+    dreq "/schedule/minipc/$SID"
+    if [ "$HTTP" = "200" ] && body_has "r['active_source']!='placement' and (r['active_playlist'] or {}).get('playlist_id')!=$PIDN"; then
+      ok "после «Остановить» лента экрана больше не отдаёт показ"; else bad "после остановки лента: HTTP $HTTP"; fi
+    dreq "/files/list/$SID"
+    if [ "$HTTP" = "200" ] && ! body_has "any(f['filename']=='$NOW_FILE' for f in r)"; then
+      ok "после «Остановить» ролика показа нет в списке закачки"; else bad "после остановки ролик в списке закачки: HTTP $HTTP"; fi
+  fi
+else
+  bad "нет экрана, его токена или ролика — проверку ленты провести не на чем"
+fi
+
 # ── 5. Отчёты / биллинг / уведомления доступны ───────────────────────────────
 step "Модули доступны"
 req GET "/dashboard";              [ "$HTTP" = "200" ] && ok "дашборд" || bad "дашборд: HTTP $HTTP"
@@ -364,6 +440,11 @@ if [ -n "${PLC:-}" ]; then
 fi
 [ -n "${PID:-}" ] && req DELETE "/playlists/$PID" && ok "плейлист удалён"
 [ -n "${PID2:-}" ] && req DELETE "/playlists/$PID2" && ok "плейлист «одним запросом» удалён"
+# плейлист показа на текущий час — вместе с его (остановленным) показом
+if [ -n "${PIDN:-}" ]; then
+  req DELETE "/playlists/$PIDN"
+  [ "$HTTP" = "200" ] && ok "плейлист показа на текущий час удалён" || bad "удаление плейлиста SMOKE_now: HTTP $HTTP"
+fi
 [ -n "${MID:-}" ] && req DELETE "/media/$MID"      && ok "медиа удалено"
 [ -n "${MID2:-}" ] && req DELETE "/media/$MID2"    && ok "ролик на модерации удалён"
 [ -n "${MID3:-}" ] && req DELETE "/media/$MID3"    && ok "второй ролик удалён"
