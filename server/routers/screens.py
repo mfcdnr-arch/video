@@ -559,6 +559,11 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
                                            "filesize": fr[2], "md5_hash": fr[3]})
                         seen.add(fr[0])
         except Exception:
+            # Без rollback сессия остаётся в прерванной транзакции, и следующие
+            # запросы ленты (фолбэк, длительности картинок, питание) падают —
+            # вся лента экрана уходит в 500 вместо «без часовой последовательности».
+            log.exception("screen %s: часовая последовательность не собрана, играем без неё", screen_id)
+            db.rollback()
             hourly_sequence = []
 
     # Фолбэк: если по расписанию ничего не выпало (дыра между слотами),

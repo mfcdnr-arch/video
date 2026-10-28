@@ -194,6 +194,55 @@ def test_edit_placement_bumps_saved_at_keeps_stopped_at_all_screens_has_no_rows(
     assert db.params("INSERT INTO audit_log")[0]["t"] == "Показ: изменён"
 
 
+# --- решения по пересечениям в журнале (§4.7) ----------------------------------
+
+def DEC(screen_id, kind, other_id, mode):
+    return {"screen_id": screen_id, "other_kind": kind, "other_id": other_id, "mode": mode}
+
+
+def test_decisions_text_names_screen_mode_and_the_other_source():
+    text = store.decisions_text(
+        [DEC(2, "override", 30, "alternate"), DEC(1, "placement", 7, "replace")],
+        {1: "Холл", 2: "Касса"},
+        {("placement", 7): ("Утро", None), ("override", 30): ("Осень", D1)})
+    # по названию экрана: «Касса» раньше «Холл»
+    assert text == ("экран «Касса»: по очереди с переопределением 01.11 «Осень»; "
+                    "экран «Холл»: заменяет показ #7 «Утро»")
+
+
+def test_decisions_text_without_names_falls_back_to_numbers():
+    text = store.decisions_text([DEC(5, "placement", 7, "alternate"), DEC(5, "override", 9, "replace")], {}, {})
+    assert text == "экран «#5»: заменяет переопределение #9; экран «#5»: по очереди с показом #7"
+
+
+def test_decisions_text_is_cut_with_and_more():
+    decisions = [DEC(i, "placement", 7, "replace") for i in range(1, 9)]
+    text = store.decisions_text(decisions, {i: f"Э{i}" for i in range(1, 9)}, {("placement", 7): ("Утро", None)},
+                                shown=3)
+    assert text.count("заменяет показ #7 «Утро»") == 3 and text.endswith("; и ещё 5")
+    assert store.decisions_text(decisions[:3], {}, {}, shown=3).count("и ещё") == 0
+
+
+def test_save_writes_readable_decisions_into_audit():
+    db = RoutedDB([("INSERT INTO placements", [42]), ("SELECT name FROM playlists", ["PL5"]),
+                   ("SELECT id, name FROM screens", [Row(id=1, name="Холл"), Row(id=3, name="Касса")]),
+                   ("FROM placements pl JOIN playlists", [Row(id=7, name="Утро")]),
+                   ("FROM schedule_overrides", [Row(id=30, on_date=D2, name="Осень")])])
+    store.save_placement(db, DATA, [DEC(1, "placement", 7, "replace"), DEC(3, "override", 30, "alternate")],
+                         "admin")
+    (audit,) = db.params("INSERT INTO audit_log")
+    assert audit["d"].endswith("; решения по пересечениям (2): экран «Касса»: по очереди с переопределением "
+                               "02.11 «Осень»; экран «Холл»: заменяет показ #7 «Утро»")
+    assert db.params("SELECT id, name FROM screens") == [{"ids": [1, 3]}]
+
+
+def test_save_without_decisions_queries_no_names():
+    db = RoutedDB([("INSERT INTO placements", [42]), ("SELECT name FROM playlists", ["PL5"])])
+    store.save_placement(db, DATA, [], "admin")
+    assert "решени" not in db.params("INSERT INTO audit_log")[0]["d"]
+    assert db.params("FROM screens") == [] and db.params("FROM schedule_overrides") == []
+
+
 # --- чтение одного показа, слоты шаблона, названия -----------------------------
 
 def test_get_placement_and_missing():

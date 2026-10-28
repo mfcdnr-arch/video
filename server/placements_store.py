@@ -226,6 +226,67 @@ def _audit(db, title: str, detail: str, actor: str) -> None:
     """), {"t": title, "d": detail, "a": actor})
 
 
+# Сколько решений по пересечениям расписывать в журнале поимённо; остальные — «и ещё N».
+AUDIT_DECISIONS_SHOWN = 5
+
+# Как назвать «другое» в решении: (винительный — «заменяет …», творительный — «по очереди с …»)
+_OTHER_NOUNS = {"placement": ("показ", "показом"), "override": ("переопределение", "переопределением")}
+
+
+def decisions_text(decisions: list[dict], screen_names: dict[int, str], others: dict,
+                   shown: int = AUDIT_DECISIONS_SHOWN) -> str:
+    """Решения по пересечениям человеческим текстом для журнала операций.
+
+    «экран «Холл»: заменяет показ #7 «Утро»; экран «Касса»: по очереди с
+    переопределением 01.11 «Осень»; и ещё 2». others — {(other_kind,
+    other_id): (плейлист | None, дата переопределения | None)}; чего нет —
+    пишем только номер. Порядок — по экрану, затем по «другому».
+    """
+    def screen(sid):
+        return screen_names.get(sid) or f"#{sid}"
+
+    def other(kind, oid, case):
+        noun = _OTHER_NOUNS.get(kind, ("источник", "источником"))[case]
+        name, on_date = others.get((kind, oid), (None, None))
+        label = f"{noun} {on_date:%d.%m}" if kind == "override" and on_date else f"{noun} #{oid}"
+        return f"{label} «{name}»" if name else label
+
+    rows = sorted(decisions, key=lambda d: (screen(d["screen_id"]).lower(), d["screen_id"],
+                                            d["other_kind"], d["other_id"]))
+    parts = []
+    for d in rows[:shown]:
+        what = (f"по очереди с {other(d['other_kind'], d['other_id'], 1)}" if d["mode"] == "alternate"
+                else f"заменяет {other(d['other_kind'], d['other_id'], 0)}")
+        parts.append(f"экран «{screen(d['screen_id'])}»: {what}")
+    if len(rows) > shown:
+        parts.append(f"и ещё {len(rows) - shown}")
+    return "; ".join(parts)
+
+
+def _decision_names(db, decisions: list[dict]) -> tuple[dict[int, str], dict]:
+    """Названия для decisions_text: экраны и плейлисты «других» показов и переопределений."""
+    sids = sorted({d["screen_id"] for d in decisions})
+    screens = {r.id: r.name for r in db.execute(text(
+        "SELECT id, name FROM screens WHERE id = ANY(:ids)"), {"ids": sids}).fetchall()}
+    others: dict = {}
+    pids = sorted({d["other_id"] for d in decisions if d["other_kind"] == "placement"})
+    if pids:
+        for r in db.execute(text("""
+            SELECT pl.id, p.name FROM placements pl JOIN playlists p ON p.id = pl.playlist_id
+            WHERE pl.id = ANY(:ids)
+        """), {"ids": pids}).fetchall():
+            others[("placement", r.id)] = (r.name, None)
+    oids = sorted({d["other_id"] for d in decisions if d["other_kind"] == "override"})
+    if oids:
+        for r in db.execute(text("""
+            SELECT so.id, so.on_date, p.name FROM schedule_overrides so
+            LEFT JOIN playlists p ON p.id = so.playlist_id
+            WHERE so.id = ANY(:ids)
+        """), {"ids": oids}).fetchall():
+            others[("override", r.id)] = (r.name, r.on_date)
+    return screens, others
+
+
 def _describe(p: dict) -> str:
     return (f"#{p['id']} «{p['playlist_name']}», "
             f"{_period(p['date_from'], p['date_to'], p['hour_from'], p['hour_to'])}")
@@ -307,6 +368,8 @@ def save_placement(db, data: dict, decisions: list[dict], actor: str,
     detail = (f"#{placement_id} «{name}» {where}, "
               f"{_period(data['date_from'], data['date_to'], data['hour_from'], data['hour_to'])}")
     if decisions:
-        detail += f", решений по пересечениям: {len(decisions)}"
+        # Решения — часть показа (§4.7): в журнале видно, кто что кем заменил
+        detail += f"; решения по пересечениям ({len(decisions)}): " \
+                  + decisions_text(decisions, *_decision_names(db, decisions))
     _audit(db, title, detail, actor)
     return placement_id
