@@ -73,6 +73,8 @@ async function doLogin(){
 function logout(){
   TOKEN = null;
   localStorage.removeItem('ds_token');
+  // окна прошлой сессии не должны остаться поверх формы входа
+  if(typeof closeAllModals === 'function') closeAllModals();
   renderLogin();
 }
 

@@ -21,7 +21,13 @@ async function api(path, opts={}){
     headers['Content-Type'] = 'application/json';
   }
   const res = await fetch(API + path, {...opts, headers});
-  if(res.status === 401){ TOKEN=null; localStorage.removeItem('ds_token'); renderLogin(); throw new Error('unauthorized'); }
+  if(res.status === 401){
+    TOKEN=null; localStorage.removeItem('ds_token');
+    // Открытое окно осталось бы поверх формы входа и забирало бы фокус (ловушка Tab в modal.js)
+    if(typeof closeAllModals === 'function') closeAllModals();
+    renderLogin();
+    throw new Error('unauthorized');
+  }
   if(!res.ok){ const t = await res.text(); throw new Error(t || ('HTTP '+res.status)); }
   const ct = res.headers.get('content-type')||'';
   return ct.includes('json') ? res.json() : res.text();
