@@ -82,7 +82,7 @@ log = logging.getLogger("ds_agent")
 # ── Импортируем модули ────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
 from ds_downloader import Downloader
-from ds_player    import VLCPlayer, build_playable, active_expired, repoll_after_expiry
+from ds_player    import VLCPlayer, build_playable, active_expired, repoll_after_expiry, is_new_play
 from ds_sync      import SyncHandler
 from ds_heartbeat import Heartbeat, AGENT_VERSION
 from ds_cleanup   import Cleanup
@@ -331,7 +331,7 @@ def main():
     schedule           = None
     current_playing    = None    # что реально играет mpv (для heartbeat и play_log)
     current_list       = []      # плейлист, загруженный в mpv в данный момент
-    last_time_pos      = None    # для детекции повтора одного и того же файла
+    last_play_state    = None    # прошлый замер mpv для учёта показов (is_new_play)
     display_on         = True    # текущее состояние монитора (DPMS)
     current_volume     = None    # применённая громкость
     broken_files       = set()   # файлы, которые не удалось воспроизвести
@@ -407,6 +407,7 @@ def main():
                 player.stop()
                 current_list = []
                 current_playing = None
+                last_play_state = None
 
         # ── Воспроизведение по расписанию ──
         if player.user_stopped:
@@ -417,6 +418,7 @@ def main():
                 player.stop()
                 current_list = []
                 current_playing = None
+                last_play_state = None
         elif schedule and display_on:
             files = current_playlist_files(schedule)
             # Предупреждаем о файлах, которых нет локально (build_playable не логирует)
@@ -435,6 +437,9 @@ def main():
                     if player.load_playlist(playable,
                                             image_durations=schedule.get("image_durations")):
                         current_list = playable
+                        # плейлист запущен с первой записи — это новый показ,
+                        # даже если там тот же файл на той же позиции
+                        last_play_state = None
                     else:
                         current_list = []
                         if len(set(playable)) == 1:
@@ -449,24 +454,20 @@ def main():
                     player.stop()
                     current_list = []
                     current_playing = None
+                    last_play_state = None
 
             # ── Лог показов: фиксируем каждый реальный старт ролика ──
-            # mpv сам листает плейлист (--loop-playlist), поэтому следим за
-            # сменой имени файла; повтор одного и того же файла ловим по
-            # «отмотке» time-pos назад (новый круг цикла).
-            playing_now = player.get_current_filename()
-            if playing_now:
-                tp = player.get_time_pos()
-                if playing_now != current_playing:
-                    current_playing = playing_now
-                    last_time_pos = tp
-                    report_play(sess, screen_id, playing_now)
-                elif (tp is not None and last_time_pos is not None
-                      and tp < last_time_pos - 2):
-                    last_time_pos = tp
-                    report_play(sess, screen_id, playing_now)   # новый круг
-                elif tp is not None:
-                    last_time_pos = tp
+            # mpv сам листает плейлист (--loop-playlist). Новый показ — смена
+            # записи плейлиста (playlist-pos), в т. ч. новый круг и повторы ×N
+            # одной картинки; у плейлиста из одной записи — отмотка time-pos
+            # (см. ds_player.is_new_play). Замер без имени файла (mpv между
+            # роликами) пропускаем, не затирая прошлый.
+            play_state = player.get_play_state()
+            if play_state.get("filename"):
+                if is_new_play(last_play_state, play_state):
+                    report_play(sess, screen_id, play_state["filename"])
+                current_playing = play_state["filename"]
+                last_play_state = play_state
 
             # ── Громкость (день/ночь, МСК) ──
             vol = target_volume(schedule, now_msk)

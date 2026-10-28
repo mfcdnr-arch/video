@@ -59,6 +59,52 @@ def build_playable(files: list[str], broken: set[str],
     return [f for f in files if f not in broken and exists(f)]
 
 
+# Отмотка time-pos назад больше чем на столько секунд — новый круг
+# плейлиста из одной записи (mpv перезапустил тот же файл).
+REWIND_SECONDS = 2
+
+
+def is_new_play(prev: dict | None, cur: dict) -> bool:
+    """Начался ли новый показ между двумя замерами состояния mpv.
+
+    prev, cur — {"pos", "count", "filename", "time_pos"} из
+    VLCPlayer.get_play_state(): playlist-pos, playlist-count, имя файла записи
+    pos и позиция в секундах; любое поле может быть None (mpv не ответил).
+    prev=None — прошлого замера нет (старт агента, только что загружен
+    плейлист, показ возобновлён): играющий файл — новый показ.
+
+    Новый показ, если:
+    - mpv перешёл на другую запись плейлиста (playlist-pos сменился — и
+      следующий ролик, и новый круг N-1 → 0). Так считаются картинки и
+      короткие ролики, повторённые ×N: у картинки time-pos стоит около нуля,
+      по отмотке времени их повторы не отличить;
+    - на той же позиции другой файл или плейлист другой длины (его подменили);
+    - плейлист из одной записи: mpv крутит её по кругу, новый круг виден только
+      по отмотке time-pos назад. Только здесь: в длинном плейлисте отмотка
+      совпадает со сменой записи, и при опросе свойств по очереди один старт
+      мог посчитаться дважды.
+    Без playlist-pos (старый mpv, сбой IPC) — как раньше: смена имени файла
+    или отмотка time-pos.
+    """
+    if not cur or not cur.get("filename"):
+        return False
+    if not prev or not prev.get("filename"):
+        return True
+    pos, prev_pos = cur.get("pos"), prev.get("pos")
+    if pos is not None and prev_pos is not None:
+        if pos != prev_pos or cur["filename"] != prev["filename"]:
+            return True
+        count, prev_count = cur.get("count"), prev.get("count")
+        if count is not None and prev_count is not None and count != prev_count:
+            return True
+        if count != 1:
+            return False
+    elif cur["filename"] != prev["filename"]:
+        return True
+    tp, prev_tp = cur.get("time_pos"), prev.get("time_pos")
+    return tp is not None and prev_tp is not None and tp < prev_tp - REWIND_SECONDS
+
+
 class VLCPlayer:
     """Обёртка над mpv с тем же API что был у VLC."""
 
@@ -93,8 +139,13 @@ class VLCPlayer:
             time.sleep(0.1)
             raw = s.recv(4096).decode(errors='replace')
             s.close()
-            first = raw.strip().split('\n')[0]
-            return json.loads(first) if first else {}
+            # mpv шлёт события ({"event": ...}) всем клиентам; на стыке роликов
+            # событие может прийти раньше ответа — берём первую строку-ответ.
+            for line in raw.strip().split('\n'):
+                msg = json.loads(line) if line.strip() else {}
+                if msg and "event" not in msg:
+                    return msg
+            return {}
         except Exception as e:
             log.debug(f"mpv IPC: {e}")
             return {}
@@ -191,7 +242,11 @@ class VLCPlayer:
         """Перезапустить mpv если упал."""
         if not self.is_vlc_running():
             log.warning("mpv не запущен — перезапускаем")
-            Path(MPV_SOCKET).unlink(missing_ok=True)
+            # Path.unlink(missing_ok=...) — только с Python 3.8, на Astra 3.7
+            try:
+                Path(MPV_SOCKET).unlink()
+            except FileNotFoundError:
+                pass
             self.start_vlc()
             time.sleep(3)
             if current_file and self.is_vlc_running():
@@ -279,6 +334,35 @@ class VLCPlayer:
         if r.get("error") == "success":
             return r.get("data")
         return None
+
+    def _get_int_property(self, name):
+        r = self._mpv_cmd(["get_property", name])
+        data = r.get("data") if r.get("error") == "success" else None
+        return data if isinstance(data, int) and not isinstance(data, bool) else None
+
+    def get_play_state(self):
+        """Замер для учёта показов (см. is_new_play): {"pos", "count",
+        "filename", "time_pos"}, недоступное — None.
+
+        Имя файла берём из записи playlist/<pos>/filename, а не из свойства
+        filename: свойства читаются по очереди, и на стыке роликов «старая
+        позиция + новое имя» посчитали бы один старт дважды. Запись по
+        позиции всегда согласована с самой позицией. Нет позиции (старый mpv,
+        простой) — прежнее свойство filename. time-pos нужен только плейлисту
+        из одной записи (или без позиции) — в остальных случаях не спрашиваем.
+        """
+        pos = self._get_int_property("playlist-pos")
+        if pos is not None and pos < 0:
+            return {"pos": None, "count": None, "filename": None, "time_pos": None}
+        count = self._get_int_property("playlist-count") if pos is not None else None
+        if pos is not None:
+            r = self._mpv_cmd(["get_property", "playlist/{}/filename".format(pos)])
+            path = r.get("data") if r.get("error") == "success" else None
+            filename = os.path.basename(path) if isinstance(path, str) and path else None
+        else:
+            filename = self.get_current_filename()
+        time_pos = self.get_time_pos() if (pos is None or count == 1) and filename else None
+        return {"pos": pos, "count": count, "filename": filename, "time_pos": time_pos}
 
     def set_volume(self, volume: int):
         """Громкость 0-100."""
