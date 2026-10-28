@@ -150,25 +150,24 @@ def _recency(p: dict) -> tuple[datetime, int]:
     return (p.get("saved_at") or datetime.min, p["id"])
 
 
-def _top(ordered: list[dict], decisions: dict, screen_id: int) -> tuple[dict, set[int]]:
-    """Вершина часа и id показов, пройденных по пути к ней (уступивших и её самой).
+def _top(ordered: list[dict], decisions: dict, screen_id: int) -> int:
+    """Индекс вершины часа в ordered.
 
     ordered — применимые показы от новейшего к старшему (_recency), не пуст.
-    Начинаем с новейшего. Если у вершины есть решение "yield" против другого
-    показа из ordered, вершиной становится тот (из нескольких — новейший), и
-    так дальше. Пройденные показы второй раз не берутся: цикл (A уступает B,
-    B уступает A) останавливается на последней непосещённой вершине —
-    детерминированно и без зависания.
+    Начинаем с новейшего. Если у вершины есть решение "yield" против показа
+    СТАРШЕ неё (дальше по ordered), вершиной становится тот (из нескольких —
+    новейший), и так дальше. Решения вершины о показах новее неё устарели:
+    их сохраняли раньше, чем те показы решили о ней, — поэтому они не
+    действуют. Путь идёт только к старшим, циклов не бывает.
     """
-    top = ordered[0]
-    visited = {top["id"]}
+    i = 0
     while True:
-        nxt = next((p for p in ordered if p["id"] not in visited
-                    and decisions.get((top["id"], screen_id, KIND_PLACEMENT, p["id"])) == YIELD), None)
+        top_id = ordered[i]["id"]
+        nxt = next((j for j in range(i + 1, len(ordered))
+                    if decisions.get((top_id, screen_id, KIND_PLACEMENT, ordered[j]["id"])) == YIELD), None)
         if nxt is None:
-            return top, visited
-        top = nxt
-        visited.add(top["id"])
+            return i
+        i = nxt
 
 
 def _choose(applicable: list[dict], decisions: dict, override: dict | None,
@@ -177,7 +176,8 @@ def _choose(applicable: list[dict], decisions: dict, override: dict | None,
     if not applicable:
         return [], None
     ordered = sorted(applicable, key=_recency, reverse=True)   # новейший первым
-    top, visited = _top(ordered, decisions, screen_id)
+    i = _top(ordered, decisions, screen_id)
+    top = ordered[i]
 
     def decided(kind: str, other_id: int) -> str | None:
         return decisions.get((top["id"], screen_id, kind, other_id))
@@ -187,9 +187,9 @@ def _choose(applicable: list[dict], decisions: dict, override: dict | None,
         return [], None
 
     chosen = [top["playlist_id"]]
-    for other in ordered:
-        if other["id"] not in visited and decided(KIND_PLACEMENT, other["id"]) == ALTERNATE:
-            chosen.append(other["playlist_id"])
+    for older in ordered[i + 1:]:                 # только показы старше вершины, от новых к старым
+        if decided(KIND_PLACEMENT, older["id"]) == ALTERNATE:
+            chosen.append(older["playlist_id"])
     if has_override and decided(KIND_OVERRIDE, override["id"]) == ALTERNATE:
         chosen.append(override["playlist_id"])
 
@@ -206,21 +206,61 @@ def choose_playlists(applicable: list[dict], decisions: dict, override: dict | N
     Правка старого показа делает его новейшим, а решения при сохранении
     записываются под его id — значит, они лежат именно у новейшего.
     Без saved_at (или при равных) порядок по id: больший id новее.
+    Из пары показов действует решение того, кто сохранён позже.
 
     «Вершина» — новейший, если он никому не уступил. Решение "yield"
-    новейшего против другого показа из applicable отдаёт вершину тому (см.
-    _top: цепочки и циклы). Уступившие показы в результат не попадают, даже
-    если у вершины на них стоит "alternate". Если вершина уступает
-    переопределению с плейлистом (не is_off) — [] : показов в этот час нет,
-    лента берёт следующий шаг (переопределение с плейлистом, спека §4.7).
+    вершины против показа старше неё отдаёт вершину тому (см. _top: из
+    нескольких — новейший, путь только к старшим). Показы новее вершины
+    (уступившие по пути и прочие) в результат не попадают: их решения о
+    вершине новее её решений о них. Если вершина уступает переопределению с
+    плейлистом (не is_off) — [] : показов в этот час нет, лента берёт
+    следующий шаг (переопределение с плейлистом, спека §4.7).
 
-    Вершина идёт первой. Остальные показы (от новых к старым) и
+    Вершина идёт первой. Показы старше неё (от новых к старым) и
     переопределение с плейлистом добавляются только если у вершины на них
     стоит решение "alternate" — по очереди после неё. Без решения или при
     "replace" они вытеснены. Без повторов playlist_id. Пусто, если
     applicable пуст.
     """
     return _choose(applicable, decisions, override, screen_id)[0]
+
+
+# Решение другой стороны пары, увиденное со стороны правленого показа:
+# он «заменяет» нас → мы «уступаем» ему, и наоборот; «по очереди» — взаимно.
+_REVERSE = {REPLACE: YIELD, YIELD: REPLACE, ALTERNATE: ALTERNATE}
+
+
+def prefill_decisions(p: dict, conflicts: list[dict], others: list[dict], decisions: dict) -> list[dict]:
+    """Решения, которые подставить в окно правки показа `p` по его нынешним пересечениям.
+
+    p          — правленый показ как он сохранён (id, saved_at до правки);
+    conflicts  — find_conflicts для новых значений показа;
+    others     — показы, с которыми он может пересекаться (нужны saved_at);
+    decisions  — решения p и этих показов (load_decisions).
+
+    Подставляется то, что действует сейчас (choose_playlists: из пары решает
+    сохранённый позже). Другой показ новее p — его решение о p, перевёрнутое
+    на сторону p: «заменить» → "yield", "yield" → «заменить», «по очереди» →
+    «по очереди»; о p он не решал — ничего (админ решит заново). Показ старше
+    p и переопределение — собственное сохранённое решение p. Только по
+    conflicts, без повторов; [{"screen_id", "other_kind", "other_id", "mode"}]
+    в порядке conflicts.
+    """
+    by_id = {o["id"]: o for o in others}
+    out, seen = [], set()
+    for c in conflicts:
+        key = (c["screen_id"], c["other_kind"], c["other_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        other = by_id.get(c["other_id"]) if c["other_kind"] == KIND_PLACEMENT else None
+        if other is not None and _recency(other) > _recency(p):
+            mode = _REVERSE.get(decisions.get((other["id"], c["screen_id"], KIND_PLACEMENT, p["id"])))
+        else:
+            mode = decisions.get((p["id"], *key))
+        if mode is not None:
+            out.append({"screen_id": key[0], "other_kind": key[1], "other_id": key[2], "mode": mode})
+    return out
 
 
 def pick_active(playlist_ids: list[int], playable: dict[int, list]) -> list[int]:

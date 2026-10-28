@@ -6,17 +6,19 @@
 отдельно для каждого экрана («replace» / «alternate» / «yield» — «Оставить
 «X» на это время»). Сохранить показ, пока хоть одно пересечение не решено,
 нельзя (409). Правка (PUT) идёт тем же путём, что создание, но сам показ
-пересечением не считается; предпросмотр правки отдаёт сохранённые решения
-показа по нынешним пересечениям — панель подставляет их в выбор.
+пересечением не считается; предпросмотр правки отдаёт действующие решения по
+нынешним пересечениям (свои или перевёрнутые решения более новых показов) —
+панель подставляет их в выбор.
 
 Остановить можно только идущий показ (status "active"), отменить (удалить) —
 только запланированный; статус считает placements_logic.placement_status.
 GET /placements/week отдаёт сетку 7 дней × 24 часа для одного экрана
 (placements_logic.week_cells).
 
-Чистые функции (parse_body, parse_decisions, unresolved, saved_decisions,
-summary_text, overflow_notes, week_start, sort_listing, listing_row,
-check_stoppable, check_deletable) проверяются в tests/test_placements_api.py.
+Чистые функции (parse_body, parse_decisions, unresolved, summary_text,
+overflow_notes, week_start, sort_listing, listing_row, check_stoppable,
+check_deletable) проверяются в tests/test_placements_api.py; какие решения
+подставить при правке — placements_logic.prefill_decisions.
 SQL живёт в placements_store: разбор строк (развёртывание групп и «всех экранов»,
 приоритет экрана над группой, наивные МСК-даты, запись saved_at и
 stopped_at) — в tests/test_placements_store.py на фейковой БД. smoke_test.sh
@@ -35,7 +37,7 @@ from sqlalchemy.orm import Session
 from admin_panel import ad_sequence
 from deps import get_current_admin, get_db, require_write
 from placements_logic import (ALTERNATE, KIND_OVERRIDE, KIND_PLACEMENT, REPLACE, YIELD, alternate_overlaps,
-                              find_conflicts, placement_status, week_cells)
+                              find_conflicts, placement_status, prefill_decisions, week_cells)
 from placements_store import (all_screen_ids, delete_placement, get_placement, load_decisions,
                               load_overrides, load_placements, load_playlist_names, load_screen_slots,
                               now_msk, save_placement, stop_placement)
@@ -145,24 +147,6 @@ def unresolved(conflicts: list[dict], decisions: dict) -> int:
     return sum(1 for c in conflicts if _key(c) not in decisions)
 
 
-def saved_decisions(placement_id: int, conflicts: list[dict], decisions: dict) -> list[dict]:
-    """Сохранённые решения показа placement_id — только по пересечениям из conflicts.
-
-    decisions — из load_decisions: {(placement_id, screen_id, other_kind,
-    other_id): mode}. Решения по пересечениям, которых больше нет (экран
-    убрали, другой показ отменили или сдвинули), не отдаются. Порядок — как у
-    conflicts; [{"screen_id", "other_kind", "other_id", "mode"}].
-    """
-    out, seen = [], set()
-    for c in conflicts:
-        key = _key(c)
-        mode = decisions.get((placement_id, *key))
-        if mode is not None and key not in seen:
-            seen.add(key)
-            out.append({"screen_id": key[0], "other_kind": key[1], "other_id": key[2], "mode": mode})
-    return out
-
-
 def _hh(hour: int) -> str:
     return f"{hour:02d}:00"
 
@@ -260,20 +244,22 @@ def check_deletable(status: str) -> None:
 
 # --- общая часть предпросмотра и создания -------------------------------------
 
-def _prepare(db: Session, body: dict, exclude_id: int | None = None) -> tuple[dict, list, list]:
+def _prepare(db: Session, body: dict, exclude_id: int | None = None) -> tuple[dict, list, list, list]:
     """Разобрать тело, проверить плейлист и экраны, найти пересечения.
 
-    Возвращает (данные показа с развёрнутыми screens и id, пересечения,
-    выключенные дни).
+    Возвращает (данные показа с развёрнутыми screens, id и saved_at,
+    пересечения, выключенные дни, показы в его датах). saved_at — как показ
+    сохранён сейчас, до правки (None для нового): по нему старшинство при
+    подстановке решений (placements_logic.prefill_decisions).
     """
-    existing_date_from = None
+    existing = None
     if exclude_id is not None:
-        existing_date_from = db.execute(text("SELECT date_from FROM placements WHERE id = :id"),
-                                        {"id": exclude_id}).scalar()
-        if existing_date_from is None:
+        existing = db.execute(text("SELECT date_from, saved_at FROM placements WHERE id = :id"),
+                              {"id": exclude_id}).first()
+        if existing is None:
             raise HTTPException(404, "Показ не найден")
 
-    data = parse_body(body, now_msk().date(), existing_date_from)
+    data = parse_body(body, now_msk().date(), existing.date_from if existing else None)
 
     if not db.execute(text("SELECT 1 FROM playlists WHERE id = :p"), {"p": data["playlist_id"]}).first():
         raise HTTPException(404, "Плейлист не найден")
@@ -288,11 +274,11 @@ def _prepare(db: Session, body: dict, exclude_id: int | None = None) -> tuple[di
         if missing:
             raise HTTPException(400, "Экран не найден: " + ", ".join(f"#{s}" for s in missing))
 
-    new = {**data, "id": exclude_id}
+    new = {**data, "id": exclude_id, "saved_at": existing.saved_at if existing else None}
     others = load_placements(db, data["date_from"], data["date_to"])
     overrides = load_overrides(db, data["date_from"], data["date_to"])
     conflicts, off_days = find_conflicts(new, others, overrides)
-    return new, conflicts, off_days
+    return new, conflicts, off_days, others
 
 
 def _screens_info(db: Session, ids: set[int]) -> dict:
@@ -315,16 +301,18 @@ def preview_placement(body: dict = Body(...), admin: dict = Depends(require_writ
     Что будет, если сохранить показ: пересечения (их решает админ), дни, где
     экран выключен переопределением, предупреждения и итоговая фраза.
     Для правки показа — "exclude_id": сам показ пересечением не считается,
-    прошедшую дату начала можно оставить как есть, а "decisions" — его
-    сохранённые решения по нынешним пересечениям (панель подставляет их в
-    выбор; без exclude_id — []). Ничего не пишет в БД.
+    прошедшую дату начала можно оставить как есть, а "decisions" — решения,
+    которые действуют сейчас по нынешним пересечениям: его собственные или,
+    если другой показ сохранён позже, перевёрнутое решение того показа
+    (placements_logic.prefill_decisions). Панель подставляет их в выбор; без
+    exclude_id — []. Ничего не пишет в БД.
     """
     exclude_id = body.get("exclude_id") if isinstance(body, dict) else None
     if exclude_id is not None:
         exclude_id = _int(exclude_id)
         if exclude_id is None:
             raise HTTPException(400, "exclude_id: ожидается id показа")
-    data, conflicts, off_days = _prepare(db, body, exclude_id)
+    data, conflicts, off_days, others = _prepare(db, body, exclude_id)
 
     info = _screens_info(db, {c["screen_id"] for c in conflicts} | {d["screen_id"] for d in off_days})
     for item in conflicts + off_days:
@@ -342,8 +330,10 @@ def preview_placement(body: dict = Body(...), admin: dict = Depends(require_writ
             cache[(playlist_id, venue)] = sum(sec for _, sec in ad_sequence(db, playlist_id, venue))
         return cache[(playlist_id, venue)]
 
-    stored = saved_decisions(exclude_id, conflicts, load_decisions(db, [exclude_id])) \
-        if exclude_id is not None else []
+    stored = []
+    if exclude_id is not None:
+        ids = {exclude_id} | {c["other_id"] for c in conflicts if c["other_kind"] == KIND_PLACEMENT}
+        stored = prefill_decisions(data, conflicts, others, load_decisions(db, sorted(ids)))
 
     return {"conflicts": conflicts, "off_days": off_days, "notices": notices, "decisions": stored,
             "overflow": overflow_notes(conflicts, data["playlist_id"], ad_total),
@@ -358,7 +348,7 @@ def _save(db: Session, body: dict, actor: str, placement_id: int | None = None) 
     сам показ не в счёт), убедиться, что решены все, сохранить и закоммитить.
     """
     decisions = parse_decisions(body.get("decisions") if isinstance(body, dict) else None)
-    data, conflicts, _ = _prepare(db, body, placement_id)
+    data, conflicts, _, _ = _prepare(db, body, placement_id)
     left = unresolved(conflicts, decisions)
     if left:
         raise HTTPException(409, f"Не решено пересечений: {left}")

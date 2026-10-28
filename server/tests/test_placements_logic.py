@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta
 from placements_logic import (dates_overlap, hours_overlap, applies_at, placement_status,
                               find_conflicts, choose_playlists, template_playlist,
                               week_cells, alternate_overlaps, pick_active, playlists_for_screen,
-                              active_until_for)
+                              active_until_for, prefill_decisions)
 
 
 def P(id, d1, d2, h1, h2, screens, pl=10, stopped=None, saved=None):
@@ -375,6 +375,84 @@ def test_choose_yield_of_older_placement_is_ignored():
     assert choose_playlists([a, b], {(1, 1, "placement", 2): "yield"}, None, 1) == [20]
     assert choose_playlists([a, b], {(1, 1, "placement", 2): "yield", (2, 1, "placement", 1): "alternate"},
                             None, 1) == [20, 10]
+
+
+def test_choose_vertex_ignores_its_outdated_decisions_about_newer_placements():
+    # O сохранён первым (его «по очереди с Q» устарело), Q вторым («заменить» O),
+    # P последним («уступить» O, «заменить» Q). Последние решения о Q (у Q и у P) Q
+    # исключают: в часе идёт только O.
+    o = P(1, N1, N30, 9, 13, [1], pl=10, saved=_saved(10))
+    q = P(2, N1, N30, 9, 13, [1], pl=20, saved=_saved(20))
+    p = P(3, N1, N30, 9, 13, [1], pl=30, saved=_saved(28))
+    d = {(1, 1, "placement", 2): "alternate",
+         (2, 1, "placement", 1): "replace",
+         (3, 1, "placement", 1): "yield", (3, 1, "placement", 2): "replace"}
+    assert choose_playlists([o, q, p], d, None, 1) == [10]
+    # и устаревшее «уступить» вершины более новому показу не уводит вершину назад, к новым
+    d2 = {(3, 1, "placement", 1): "yield", (1, 1, "placement", 2): "yield"}
+    assert choose_playlists([o, q, p], d2, None, 1) == [10]
+
+
+# --- подстановка решений при правке (prefill_decisions) -------------------------
+
+def _conf(screen_id, kind, other_id):
+    return {"screen_id": screen_id, "other_kind": kind, "other_id": other_id}
+
+
+def test_prefill_reverses_decision_of_newer_placement():
+    edited = P(1, N1, N30, 9, 13, [3], pl=10, saved=_saved(10))
+    newer = P(5, N1, N30, 9, 13, [3], pl=50, saved=_saved(20))
+    conflicts = [_conf(3, "placement", 5)]
+    own_stale = {(1, 3, "placement", 5): "replace"}           # своё старое решение больше не действует
+    def pre(newer_mode):
+        dec = dict(own_stale)
+        if newer_mode:
+            dec[(5, 3, "placement", 1)] = newer_mode
+        return prefill_decisions(edited, conflicts, [edited, newer], dec)
+    assert pre("replace") == [{"screen_id": 3, "other_kind": "placement", "other_id": 5, "mode": "yield"}]
+    assert pre("yield") == [{"screen_id": 3, "other_kind": "placement", "other_id": 5, "mode": "replace"}]
+    assert pre("alternate") == [{"screen_id": 3, "other_kind": "placement", "other_id": 5, "mode": "alternate"}]
+    assert pre(None) == []                                     # новейший о нас не решал — решать заново
+
+
+def test_prefill_own_decisions_for_older_placements_and_overrides_only_current_conflicts():
+    edited = P(7, N1, N30, 9, 13, [3, 4], pl=70, saved=_saved(28))
+    older = P(5, N1, N30, 9, 13, [3, 4], pl=50, saved=_saved(20))
+    conflicts = [_conf(3, "placement", 5), _conf(4, "placement", 5), _conf(3, "override", 9)]
+    stored = {(7, 3, "placement", 5): "yield",           # пересечение есть — подставляем
+              (7, 3, "override", 9): "alternate",
+              (7, 6, "placement", 5): "replace",          # экрана 6 в показе больше нет — пересечения нет
+              (7, 3, "placement", 8): "replace",          # показа 8 в этих датах больше нет
+              (5, 4, "placement", 7): "replace",          # устаревшее решение старшего — не в счёт
+              (8, 4, "placement", 5): "replace"}          # чужое решение
+    assert prefill_decisions(edited, conflicts, [older, edited], stored) == [
+        {"screen_id": 3, "other_kind": "placement", "other_id": 5, "mode": "yield"},
+        {"screen_id": 3, "other_kind": "override", "other_id": 9, "mode": "alternate"}]
+    assert prefill_decisions(edited, [], [older], stored) == []
+    assert prefill_decisions(edited, conflicts, [older], {}) == []
+    # saved_at равны — старшинство по id (как в choose_playlists): показ 5 старше показа 7
+    assert prefill_decisions(edited, conflicts[:1], [{**older, "saved_at": edited["saved_at"]}], stored) == \
+        [{"screen_id": 3, "other_kind": "placement", "other_id": 5, "mode": "yield"}]
+
+
+def test_customer_scenario_edit_keeps_newer_replace_in_force():
+    # A сохранён с «заменить» B; позже B правили с «заменить» A — главный B.
+    # Правка A: подставляется «оставить B», и после сохранения A в общий час идёт B.
+    a = P(1, N1, N30, 9, 15, [3], pl=10, saved=_saved(10))
+    b = P(2, N1, date(2026, 11, 5), 10, 12, [3], pl=20, saved=_saved(20))
+    dec = {(1, 3, "placement", 2): "replace", (2, 3, "placement", 1): "replace"}
+    assert choose_playlists([a, b], dec, None, 3) == [20]                       # до правки идёт B
+
+    conflicts, _ = find_conflicts({**a}, [a, b], [])
+    pre = prefill_decisions(a, conflicts, [a, b], dec)
+    assert pre == [{"screen_id": 3, "other_kind": "placement", "other_id": 2, "mode": "yield"}]
+
+    # «сохранить» A с подставленным: свои решения A перезаписаны, A стал новейшим
+    saved = {k: v for k, v in dec.items() if k[0] != 1}
+    saved.update({(1, d["screen_id"], d["other_kind"], d["other_id"]): d["mode"] for d in pre})
+    a2 = {**a, "saved_at": _saved(28)}
+    assert choose_playlists([a2, b], saved, None, 3) == [20]                     # B по-прежнему главный
+    assert choose_playlists([a2], saved, None, 3) == [10]                        # вне пересечения — A
 
 
 # --- шаблон недели -----------------------------------------------------------

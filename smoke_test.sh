@@ -346,8 +346,9 @@ fi
 # иначе ролик был бы в списке закачки и без показа.
 # Пересечение на том же часе и экране: второй показ (плейлист PID) без
 # решения → 409, с «Заменить» — в ленте он; предпросмотр правки подставляет
-# сохранённое решение; после правки на «Оставить «…» на это время» (yield)
-# лента снова отдаёт первый показ.
+# сохранённое решение, а у первого (старшего) — перевёрнутое решение второго
+# («оставить»); после правки на «Оставить «…» на это время» (yield) лента
+# снова отдаёт первый показ.
 step "Экран: что играет и что качает"
 # dreq — запрос агента: только X-Token экрана, без админского токена
 dreq(){ # dreq PATH
@@ -420,6 +421,11 @@ print(h.date(), h.hour, (h + d.timedelta(hours=1)).isoformat())" 2>/dev/null)
       req POST "/placements/preview" -H 'Content-Type: application/json' -d "{$YJ, \"exclude_id\": $PLCY}"
       if [ "$HTTP" = "200" ] && body_has "r['decisions']==[{'screen_id': $SID, 'other_kind': 'placement', 'other_id': $PLCN, 'mode': 'replace'}]"; then
         ok "предпросмотр правки отдаёт сохранённое решение «заменить»"; else bad "предпросмотр правки без сохранённого решения: HTTP $HTTP"; fi
+      # правка первого (старшего) показа: действует «заменить» второго — подставляется «оставить»
+      req POST "/placements/preview" -H 'Content-Type: application/json' \
+          -d "{\"playlist_id\": $PIDN, \"all_screens\": false, \"screen_ids\": [$SID], \"date_from\": \"$DN\", \"date_to\": \"$DN\", \"hour_from\": $HN, \"hour_to\": $((HN + 1)), \"exclude_id\": $PLCN}"
+      if [ "$HTTP" = "200" ] && body_has "r['decisions']==[{'screen_id': $SID, 'other_kind': 'placement', 'other_id': $PLCY, 'mode': 'yield'}]"; then
+        ok "предпросмотр правки первого показа: подставлено «оставить» (решение второго перевёрнуто)"; else bad "перевёрнутое решение в предпросмотре: HTTP $HTTP"; fi
       if [ -z "$BC_ON" ]; then
         dreq "/schedule/minipc/$SID"
         if [ "$HTTP" = "200" ] && body_has "r['active_source']=='placement' and r['active_playlist']['playlist_id']==$PID"; then

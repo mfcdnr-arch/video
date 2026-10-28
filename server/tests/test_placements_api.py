@@ -8,8 +8,7 @@ from datetime import date, datetime
 import pytest
 from fastapi import HTTPException
 from routers.placements import (parse_body, parse_decisions, unresolved, summary_text, overflow_notes,
-                                week_start, sort_listing, listing_row, check_stoppable, check_deletable,
-                                saved_decisions)
+                                week_start, sort_listing, listing_row, check_stoppable, check_deletable)
 
 T = date(2026, 10, 26)
 B = {"playlist_id": 1, "all_screens": False, "screen_ids": [3], "date_from": "2026-11-01",
@@ -65,21 +64,6 @@ def test_parse_decisions_accepts_all_three_modes():
            {"screen_id": 5, "other_kind": "placement", "other_id": 5, "mode": "alternate"}]
     assert parse_decisions(raw) == {(3, "placement", 5): "yield", (3, "override", 9): "yield",
                                     (4, "placement", 5): "replace", (5, "placement", 5): "alternate"}
-
-def test_saved_decisions_only_for_current_conflicts_of_this_placement():
-    conflicts = [{**C, "screen_id": 3, "other_kind": "placement", "other_id": 5},
-                 {**C, "screen_id": 4, "other_kind": "placement", "other_id": 5},
-                 {**C, "screen_id": 3, "other_kind": "override", "other_id": 9}]
-    stored = {(7, 3, "placement", 5): "yield",           # пересечение есть — подставляем
-              (7, 3, "override", 9): "alternate",
-              (7, 6, "placement", 5): "replace",          # экрана 6 в показе больше нет — пересечения нет
-              (7, 3, "placement", 8): "replace",          # показа 8 в этих датах больше нет
-              (8, 4, "placement", 5): "replace"}          # чужое решение (другого показа)
-    assert saved_decisions(7, conflicts, stored) == [
-        {"screen_id": 3, "other_kind": "placement", "other_id": 5, "mode": "yield"},
-        {"screen_id": 3, "other_kind": "override", "other_id": 9, "mode": "alternate"}]
-    assert saved_decisions(7, [], stored) == []
-    assert saved_decisions(7, conflicts, {}) == []
 
 def test_unresolved_counts_conflicts_without_decision():
     other = {**C, "screen_id": 4}
