@@ -9,6 +9,8 @@
 #
 # Использование:   bash smoke_test.sh
 # Переменные:      ADMIN_USER (по умолч. admin), ADMIN_PASS (admin123)
+#                  SMOKE_ALLOW_BROADCAST=1 — шаг «Общий эфир»: он включает эфир на ВСЕ
+#                  экраны сети (прежнее состояние возвращается), поэтому только на стенде
 #
 # Код возврата 0 — все проверки прошли; иначе число упавших проверок.
 set -uo pipefail
@@ -501,6 +503,114 @@ if [ -n "${SID:-}" ] && [ -n "${SCR_TOKEN:-}" ]; then
   fi
 else
   bad "нет экрана или его токена — проверку «в сети» провести не на чем"
+fi
+
+# ── 4д. Общий эфир: срок «до ЧЧ:00» ──────────────────────────────────────────
+# Общий эфир сети идёт на ВСЕ экраны сразу, поэтому шаг выполняется только на стенде
+# (SMOKE_ALLOW_BROADCAST=1); на боевом сервере его не включают. Что проверяем:
+# включение до следующего целого часа (час и ожидаемый срок считаем в ds_api по МСК,
+# при 23 час окончания = 24), срок в GET /broadcast и в ленте дашборда; час окончания
+# не позже текущего → 400, неизвестный плейлист → 404, старый вызов без тела
+# (?playlist_id=N) = «до отмены»; выключение. Что было до проверки — запоминаем
+# и возвращаем в конце (и при обрыве скрипта), плейлист проверки удаляем.
+# Само истечение по времени (Celery раз в минуту) здесь не ждём: час целый,
+# оно покрыто pytest, а на стенде проверяется сдвигом until_at в БД.
+step "Общий эфир: срок «до ЧЧ:00»"
+BC_DIRTY=0; BC_PID_TMP=""
+bc_finish(){ # вернуть прежнее состояние эфира, затем удалить плейлист проверки
+  if [ "$BC_DIRTY" = "1" ]; then
+    BC_DIRTY=0
+    if [ "$BC0_ON" = "1" ]; then
+      req POST "/broadcast/on" -H 'Content-Type: application/json' \
+          -d "{\"playlist_id\": $BC0_PID, \"until_hour\": ${BC0_HOUR:-null}}"
+      if [ "$HTTP" = "200" ]; then ok "прежний общий эфир возвращён (плейлист #$BC0_PID, ${BC0_UNTIL:-до отмены})"
+      else bad "не удалось вернуть прежний общий эфир: HTTP $HTTP $BODY"; fi
+    else
+      req POST "/broadcast/off"
+      if [ "$HTTP" = "200" ]; then ok "общий эфир выключен, как и было"
+      else bad "не удалось выключить общий эфир после проверки: HTTP $HTTP"; fi
+    fi
+  fi
+  if [ -n "$BC_PID_TMP" ]; then
+    req DELETE "/playlists/$BC_PID_TMP"
+    [ "$HTTP" = "200" ] && ok "плейлист проверки эфира удалён" || bad "удаление плейлиста проверки эфира: HTTP $HTTP"
+    BC_PID_TMP=""
+  fi
+}
+if [ "${SMOKE_ALLOW_BROADCAST:-}" != "1" ]; then
+  echo "  – эфир на все экраны — пропущено (задайте SMOKE_ALLOW_BROADCAST=1 на стенде)"
+else
+  # что было до проверки
+  req GET "/broadcast"
+  BC0_ON=""; BC0_PID=""; BC0_UNTIL=""; BC0_HOUR=""
+  if [ "$HTTP" = "200" ]; then
+    body_has "r.get('is_on') is True" && BC0_ON=1
+    if [ -n "$BC0_ON" ]; then
+      BC0_PID=$(body_get playlist_id); BC0_UNTIL=$(body_get until_at)
+      [ "$BC0_UNTIL" = "None" ] && BC0_UNTIL=""
+      [ -n "$BC0_UNTIL" ] && BC0_HOUR=$($DC python3 -c "from datetime import datetime; u=datetime.fromisoformat('$BC0_UNTIL'); print(24 if (u.hour==0 and u.minute==0) else u.hour + (1 if (u.minute or u.second) else 0))" 2>/dev/null)
+      echo "  – эфир уже включён (плейлист #$BC0_PID, ${BC0_UNTIL:-до отмены}) — вернём после проверки"
+    fi
+    trap bc_finish EXIT
+    req POST "/playlists?name=SMOKE_bc_$STAMP"
+    BC_PID_TMP=$(body_get id)
+    [ -n "$BC_PID_TMP" ] && ok "плейлист для проверки эфира создан (id=$BC_PID_TMP)" || bad "плейлист для проверки эфира не создан: HTTP $HTTP"
+  else
+    bad "общий эфир: GET /broadcast вернул HTTP $HTTP — проверку провести не на чем"
+  fi
+
+  if [ -n "$BC_PID_TMP" ]; then
+    # час и срок считаем в ds_api по МСК: хост может быть macOS или в другом поясе
+    read -r BC_H BC_EXP BC_TXT <<< "$($DC python3 -c "from datetime import datetime,timezone,timedelta as td; n=datetime.now(timezone(td(hours=3))).replace(tzinfo=None); u=datetime(n.year,n.month,n.day)+td(hours=n.hour+1); print(n.hour, u.isoformat(), '24:00' if n.hour==23 else '%02d:00' % (n.hour+1))" 2>/dev/null)"
+    if [ -z "${BC_H:-}" ]; then
+      bad "общий эфир: не удалось вычислить час в ds_api"
+    else
+      BC_DIRTY=1
+      req POST "/broadcast/on" -H 'Content-Type: application/json' \
+          -d "{\"playlist_id\": $BC_PID_TMP, \"until_hour\": $((BC_H + 1))}"
+      if [ "$HTTP" = "200" ] && body_has "r['is_on'] is True and r['playlist_id']==$BC_PID_TMP and r['until_at']=='$BC_EXP'"; then
+        ok "общий эфир включён до $BC_TXT МСК (until_at=$BC_EXP)"
+      else
+        bad "включение эфира до $BC_TXT: HTTP $HTTP $BODY"
+      fi
+      req GET "/broadcast"
+      if [ "$HTTP" = "200" ] && body_has "r['is_on'] is True and r['playlist_name']=='SMOKE_bc_$STAMP' and r['until_at']=='$BC_EXP'"; then
+        ok "GET /broadcast: идёт, срок $BC_EXP"; else bad "GET /broadcast после включения: HTTP $HTTP $BODY"; fi
+      req GET "/dashboard"
+      if [ "$HTTP" = "200" ] && body_has "any(x['title'] in ('Общий эфир включён','Общий эфир сменён') and 'SMOKE_bc_$STAMP' in (x['detail'] or '') and 'до $BC_TXT' in x['detail'] for x in r['feed'])"; then
+        ok "в журнале: «Общий эфир включён/сменён … до $BC_TXT»"; else bad "в журнале нет записи о включении до $BC_TXT"; fi
+
+      # час не позже текущего и мусор — 400, состояние не меняется
+      req POST "/broadcast/on" -H 'Content-Type: application/json' \
+          -d "{\"playlist_id\": $BC_PID_TMP, \"until_hour\": $BC_H}"
+      [ "$HTTP" = "400" ] && ok "час окончания = текущему часу ($BC_H) → 400" || bad "до текущего часа: HTTP $HTTP (ждали 400)"
+      req POST "/broadcast/on" -H 'Content-Type: application/json' \
+          -d "{\"playlist_id\": $BC_PID_TMP, \"until_hour\": 25}"
+      [ "$HTTP" = "400" ] && ok "час окончания 25 → 400" || bad "до 25 часов: HTTP $HTTP (ждали 400)"
+      req POST "/broadcast/on" -H 'Content-Type: application/json' \
+          -d '{"playlist_id": 2147483647, "until_hour": null}'
+      [ "$HTTP" = "404" ] && ok "неизвестный плейлист → 404" || bad "неизвестный плейлист: HTTP $HTTP (ждали 404)"
+      req GET "/broadcast"
+      if [ "$HTTP" = "200" ] && body_has "r['is_on'] is True and r['until_at']=='$BC_EXP'"; then
+        ok "после отказов эфир прежний (срок $BC_EXP)"; else bad "отказы изменили эфир: HTTP $HTTP $BODY"; fi
+
+      # старый вызов без тела — «до отмены»
+      req POST "/broadcast/on?playlist_id=$BC_PID_TMP"
+      if [ "$HTTP" = "200" ] && body_has "r['is_on'] is True and r['until_at'] is None"; then
+        ok "POST /broadcast/on?playlist_id=N без тела → до отмены"; else bad "старый вызов без тела: HTTP $HTTP $BODY"; fi
+      req GET "/dashboard"
+      if [ "$HTTP" = "200" ] && body_has "any(x['title']=='Общий эфир сменён' and 'SMOKE_bc_$STAMP' in (x['detail'] or '') and 'до отмены' in x['detail'] for x in r['feed'])"; then
+        ok "в журнале: «Общий эфир сменён … до отмены»"; else bad "в журнале нет записи о смене эфира"; fi
+
+      req POST "/broadcast/off"
+      [ "$HTTP" = "200" ] && ok "общий эфир выключен" || bad "выключение эфира: HTTP $HTTP"
+      req GET "/broadcast"
+      if [ "$HTTP" = "200" ] && body_has "r['is_on'] is False and r['playlist_id'] is None and r['until_at'] is None"; then
+        ok "GET /broadcast: эфир выключен, срока нет"; else bad "GET /broadcast после выключения: HTTP $HTTP $BODY"; fi
+    fi
+  fi
+  bc_finish
+  trap - EXIT
 fi
 
 # ── 5. Отчёты / биллинг / уведомления доступны ───────────────────────────────

@@ -63,7 +63,8 @@ up(){
     done
     if curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1; then
         echo "✅ Стенд работает: http://localhost:$PORT  (вход: admin, пароль — в .dev_admin_pass)"
-        echo "   Smoke: ADMIN_PASS=\$(cat .dev_admin_pass) bash smoke_test.sh"
+        echo "   Smoke: SMOKE_ALLOW_BROADCAST=1 ADMIN_PASS=\$(cat .dev_admin_pass) bash smoke_test.sh"
+        echo "          (SMOKE_ALLOW_BROADCAST=1 включает шаг «Общий эфир» — он идёт на ВСЕ экраны, только на стенде)"
     else
         die "панель не отвечает на localhost:$PORT/health (docker compose -p dsdev logs api nginx)"
     fi

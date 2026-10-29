@@ -50,6 +50,10 @@ celery_app.conf.update(
             "task": "close_billing_periods",
             "schedule": crontab(hour=6, minute=10),   # 06:10 МСК ежедневно
         },
+        "expire-broadcast": {
+            "task": "expire_broadcast",
+            "schedule": 60.0,   # каждую минуту: общий эфир «до ЧЧ:00» заканчивается сам
+        },
     },
 )
 
@@ -200,6 +204,44 @@ def check_notifications():
     except Exception as e:
         log.error(f"[notify] Ошибка проверки уведомлений: {e}")
         return {"error": str(e)}
+
+
+@celery_app.task(name="expire_broadcast")
+def expire_broadcast():
+    """
+    Раз в минуту: выключить общий эфир, у которого вышел срок («до ЧЧ:00»).
+
+    Экраны возвращаются к расписанию, в журнал операций пишется «Общий эфир
+    завершён по времени». Сам по себе эфир перестаёт действовать ровно в
+    момент срока (broadcast_rules.effective_on) — задача лишь приводит строку
+    network_broadcast в порядок и оставляет след в журнале. Срок и момент
+    сравнения — наивное МСК, как хранится в БД.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session as OrmSession
+
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        log.error("[broadcast] DATABASE_URL не задан")
+        return "error: DATABASE_URL is not set"
+
+    from broadcast_store import expire_due
+    from placements_store import now_msk
+
+    engine = create_engine(database_url, pool_pre_ping=True)
+    try:
+        with OrmSession(engine) as db:
+            expired = expire_due(db, now_msk())
+            db.commit()
+    except Exception as e:
+        log.error(f"[broadcast] Не удалось проверить срок общего эфира: {e}")
+        return {"error": str(e)}
+    finally:
+        engine.dispose()
+
+    if expired:
+        log.info("[broadcast] Общий эфир завершён по времени")
+    return {"expired": expired}
 
 
 @celery_app.task(name="archive_play_log")
