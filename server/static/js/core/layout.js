@@ -59,6 +59,8 @@ function renderApp(){
 
 function nav(v){
   CUR = v;
+  // «Эфир сети» обновляется сама раз в 30 с — при уходе из раздела останавливаем таймер
+  if(v !== 'broadcast' && Signage.stopNetworkLive) Signage.stopNetworkLive();
   document.querySelectorAll('.nav').forEach(n => n.classList.toggle('on', n.dataset.v === v));
 
   const t = {
@@ -86,7 +88,7 @@ function nav(v){
   // (Расписание → «Открыть плейлист»), ждёт отрисовки раздела, а не гонится с ним
   const shown = ({
     dash:viewDash,
-    broadcast:viewBroadcast,
+    broadcast:Signage.viewNetworkLive,
     ticker:viewTicker,
     screens:viewScreens,
     media:viewMedia,

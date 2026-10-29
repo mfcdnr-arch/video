@@ -1,12 +1,14 @@
 //=============================================================================
 // ОКНО «ПЛЕЙЛИСТ»: новый и правка (шаг 1 «Ролики»)
 //
-//   Signage.openPlaylistEditor({playlistId?, name?, onSaved?})
+//   Signage.openPlaylistEditor({playlistId?, name?, onSaved?, notice?})
 //     без playlistId — новый плейлист (POST /playlists/full);
 //     с playlistId   — правка: окно открывается с уже отмеченными роликами в их
 //                      порядке и с повторами, сохранение — PUT /playlists/{id}/items;
 //     name      — название плейлиста (для правки; нет — берётся из /playlists);
-//     onSaved   — вызывается после сохранения: ({id, name, created}).
+//     onSaved   — вызывается после сохранения: ({id, name, created});
+//     notice    — текст-подсказка серой строкой над плитками (например, «Плейлист
+//                 сейчас идёт на 2 экранах — …» из «Эфира сети»); нет — строки нет.
 //
 // Слева папки (Signage.buildMediaGroups из playlists.js), сверху поиск по названию
 // по ВСЕМ папкам сразу («ё» = «е», регистр не важен), в центре плитки роликов.
@@ -351,6 +353,7 @@
       sel: [], warnings: [], checkSeq: 0, checkTimer: 0, searchTimer: 0,
       query: '', folderKey: 'all', initial: '',
     };
+    const notice = opts.notice ? String(opts.notice) : '';
 
     const modal = openModal({
       title: playlistId ? 'Изменить плейлист' : 'Новый плейлист',
@@ -430,6 +433,7 @@
         <input class="inp" id="pled-name" maxlength="${MAX_NAME}" autocomplete="off"
           placeholder="Например: Утро будни — ТЦ «Галерея»">
       </div>
+      ${notice ? `<div class="pled-info" role="note"><span aria-hidden="true">ℹ</span> ${esc(notice)}</div>` : ''}
       <div class="pled-main">
         <div class="pled-side" id="pled-side"></div>
         <div class="pled-right">
