@@ -14,7 +14,7 @@ from datetime import datetime
 
 from sqlalchemy import text
 
-from broadcast_rules import effective_on
+from broadcast_rules import effective_on, until_text
 from placements_store import now_msk
 
 AUDIT_TYPE = "broadcast"
@@ -49,15 +49,6 @@ def _audit(db, title: str, detail: str | None, actor: str) -> None:
         INSERT INTO audit_log (event_type, title, detail, actor)
         VALUES (:type, :t, :d, :a)
     """), {"type": AUDIT_TYPE, "t": title, "d": detail, "a": actor})
-
-
-def _until_text(until_at: datetime | None) -> str:
-    """«до 16:00» / «до 24:00» (полночь следующих суток) / «до отмены»."""
-    if until_at is None:
-        return "до отмены"
-    if until_at.hour == 0 and until_at.minute == 0:
-        return "до 24:00"
-    return f"до {until_at:%H:%M}"
 
 
 def get_broadcast(db, now: datetime) -> dict:
@@ -96,14 +87,15 @@ def enable(db, playlist_id: int, until_at: datetime | None, actor: str,
             enabled_by = EXCLUDED.enabled_by, enabled_at = EXCLUDED.enabled_at
     """), {"pid": playlist_id, "until": until_at, "who": actor, "now": now})
     _audit(db, TITLE_CHANGED if running else TITLE_ON,
-           f"Плейлист: «{pl.name}» · {_until_text(until_at)}", actor)
+           f"Плейлист: «{pl.name}» · {until_text(until_at)}", actor)
 
 
 def disable(db, actor: str, title: str = TITLE_OFF) -> None:
     """Выключить общий эфир (is_on = FALSE, плейлист и срок сброшены) и записать в журнал.
 
-    В детали журнала — плейлист, который шёл. is_on остаётся FALSE: старые
-    читатели таблицы напрямую (лента экрана, симулятор) продолжают работать.
+    В детали журнала — плейлист, который шёл. Все читатели (лента экрана,
+    список закачки, симулятор, дашборд, предпросмотр показа) смотрят состояние
+    через get_broadcast, напрямую таблицу никто не читает.
     """
     row = _load(db)
     detail = f"Плейлист: «{row['playlist_name']}»" if row and row["is_on"] and row["playlist_name"] else None

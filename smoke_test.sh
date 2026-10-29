@@ -509,9 +509,12 @@ fi
 # Общий эфир сети идёт на ВСЕ экраны сразу, поэтому шаг выполняется только на стенде
 # (SMOKE_ALLOW_BROADCAST=1); на боевом сервере его не включают. Что проверяем:
 # включение до следующего целого часа (час и ожидаемый срок считаем в ds_api по МСК,
-# при 23 час окончания = 24), срок в GET /broadcast и в ленте дашборда; час окончания
-# не позже текущего → 400, неизвестный плейлист → 404, старый вызов без тела
-# (?playlist_id=N) = «до отмены»; выключение. Что было до проверки — запоминаем
+# при 23 час окончания = 24), срок в GET /broadcast, в журнале и на дашборде; глазами
+# SMOKE-экрана — пустому плейлисту эфира нечего играть (эфир на экране не идёт), с
+# роликом лента отдаёт эфир с active_until = срок, ролик эфира в списке закачки,
+# симулятор пишет срок; час окончания не позже текущего → 400, неизвестный плейлист
+# → 404, старый вызов без тела (?playlist_id=N) = «до отмены» (active_until = null);
+# выключение — лента не отдаёт эфир, ролика нет в закачке. Что было до проверки — запоминаем
 # и возвращаем в конце (и при обрыве скрипта), плейлист проверки удаляем.
 # Само истечение по времени (Celery раз в минуту) здесь не ждём: час целый,
 # оно покрыто pytest, а на стенде проверяется сдвигом until_at в БД.
@@ -560,8 +563,23 @@ else
   fi
 
   if [ -n "$BC_PID_TMP" ]; then
-    # час и срок считаем в ds_api по МСК: хост может быть macOS или в другом поясе
-    read -r BC_H BC_EXP BC_TXT <<< "$($DC python3 -c "from datetime import datetime,timezone,timedelta as td; n=datetime.now(timezone(td(hours=3))).replace(tzinfo=None); u=datetime(n.year,n.month,n.day)+td(hours=n.hour+1); print(n.hour, u.isoformat(), '24:00' if n.hour==23 else '%02d:00' % (n.hour+1))" 2>/dev/null)"
+    # час и срок считаем в ds_api по МСК: хост может быть macOS или в другом поясе.
+    # В последние 30 с часа ждём следующего, чтобы эфир не кончился посреди проверки.
+    # Печатает: текущий час, ожидаемый until_at, «ЧЧ:00» срока, сегодняшняя дата.
+    read -r BC_H BC_EXP BC_TXT BC_D <<< "$($DC python3 -c "
+import time
+from datetime import datetime, timezone, timedelta as td
+msk = timezone(td(hours=3))
+n = datetime.now(msk)
+if n.minute == 59 and n.second >= 30:
+    time.sleep(61 - n.second); n = datetime.now(msk)
+n = n.replace(tzinfo=None)
+u = datetime(n.year, n.month, n.day) + td(hours=n.hour + 1)
+print(n.hour, u.isoformat(), '24:00' if n.hour == 23 else '%02d:00' % (n.hour + 1), n.date())" 2>/dev/null)"
+    # лента экрана глазами агента: источник и срок — для сообщений о провале
+    feed_brief(){ echo "$BODY" | python3 -c "import sys,json;r=json.load(sys.stdin);print(r.get('active_source'), (r.get('active_playlist') or {}).get('playlist_id'), r.get('active_until'))" 2>/dev/null; }
+    BC_FEED=""   # проверять ленту и закачку есть на чем: SMOKE-экран, его токен и ролик MID3
+    [ -n "${SID:-}" ] && [ -n "${SCR_TOKEN:-}" ] && [ -n "${MID3:-}" ] && [ -n "${NOW_FILE:-}" ] && BC_FEED=1
     if [ -z "${BC_H:-}" ]; then
       bad "общий эфир: не удалось вычислить час в ds_api"
     else
@@ -579,6 +597,32 @@ else
       req GET "/dashboard"
       if [ "$HTTP" = "200" ] && body_has "any(x['title'] in ('Общий эфир включён','Общий эфир сменён') and 'SMOKE_bc_$STAMP' in (x['detail'] or '') and 'до $BC_TXT' in x['detail'] for x in r['feed'])"; then
         ok "в журнале: «Общий эфир включён/сменён … до $BC_TXT»"; else bad "в журнале нет записи о включении до $BC_TXT"; fi
+      if [ "$HTTP" = "200" ] && body_has "r['broadcast_on'] is True and r['broadcast_playlist']=='SMOKE_bc_$STAMP' and r['broadcast_until']=='$BC_EXP'"; then
+        ok "дашборд: общий эфир идёт, срок $BC_EXP"; else bad "дашборд при эфире: HTTP $HTTP"; fi
+
+      # Глазами SMOKE-экрана (X-Token): плейлист эфира пока пуст — экрану нечего
+      # играть, эфир на нём не идёт (не чёрный экран); с роликом MID3 — лента
+      # отдаёт эфир со сроком, ролик эфира в списке закачки.
+      if [ -n "$BC_FEED" ]; then
+        dreq "/schedule/minipc/$SID"
+        if [ "$HTTP" = "200" ] && body_has "r['active_source']!='broadcast'"; then
+          ok "лента экрана: пустому плейлисту эфира нечего играть — эфир здесь не идёт"
+        else bad "лента при пустом плейлисте эфира: HTTP $HTTP $(feed_brief)"; fi
+        req POST "/playlists/$BC_PID_TMP/items?media_id=$MID3"
+        [ "$HTTP" = "200" ] && ok "ролик SMOKE_now добавлен в плейлист эфира" || bad "ролик в плейлист эфира: HTTP $HTTP"
+        dreq "/schedule/minipc/$SID"
+        if [ "$HTTP" = "200" ] && body_has "r['active_source']=='broadcast' and r['active_playlist']['playlist_id']==$BC_PID_TMP and r['active_until']=='$BC_EXP' and any(i['filename']=='$NOW_FILE' for i in r['active_items'])"; then
+          ok "лента экрана: идёт общий эфир, active_until=$BC_EXP"
+        else bad "лента экрана при эфире: ждали эфир #$BC_PID_TMP до $BC_EXP, получили HTTP $HTTP $(feed_brief)"; fi
+        dreq "/files/list/$SID"
+        if [ "$HTTP" = "200" ] && body_has "any(f['filename']=='$NOW_FILE' for f in r)"; then
+          ok "ролик эфира в списке закачки экрана"; else bad "ролика эфира нет в списке закачки: HTTP $HTTP"; fi
+        req GET "/schedule/simulate?screen_id=$SID&on_date=$BC_D&hour=$BC_H"
+        if [ "$HTTP" = "200" ] && body_has "any('общий эфир «SMOKE_bc_$STAMP» до $BC_TXT' in n for n in r['notes'])"; then
+          ok "симулятор: пометка об эфире до $BC_TXT"; else bad "симулятор без пометки об эфире до $BC_TXT: HTTP $HTTP"; fi
+      else
+        bad "нет экрана, его токена или ролика — ленту и закачку при эфире проверить не на чем"
+      fi
 
       # час не позже текущего и мусор — 400, состояние не меняется
       req POST "/broadcast/on" -H 'Content-Type: application/json' \
@@ -601,12 +645,31 @@ else
       req GET "/dashboard"
       if [ "$HTTP" = "200" ] && body_has "any(x['title']=='Общий эфир сменён' and 'SMOKE_bc_$STAMP' in (x['detail'] or '') and 'до отмены' in x['detail'] for x in r['feed'])"; then
         ok "в журнале: «Общий эфир сменён … до отмены»"; else bad "в журнале нет записи о смене эфира"; fi
+      if [ "$HTTP" = "200" ] && body_has "r['broadcast_on'] is True and r['broadcast_until'] is None"; then
+        ok "дашборд: эфир до отмены — срока нет"; else bad "дашборд при эфире до отмены: HTTP $HTTP"; fi
+      if [ -n "$BC_FEED" ]; then
+        dreq "/schedule/minipc/$SID"
+        if [ "$HTTP" = "200" ] && body_has "r['active_source']=='broadcast' and r['active_until'] is None"; then
+          ok "лента экрана: эфир до отмены — active_until=null"
+        else bad "лента экрана при эфире до отмены: HTTP $HTTP $(feed_brief)"; fi
+      fi
 
       req POST "/broadcast/off"
       [ "$HTTP" = "200" ] && ok "общий эфир выключен" || bad "выключение эфира: HTTP $HTTP"
       req GET "/broadcast"
       if [ "$HTTP" = "200" ] && body_has "r['is_on'] is False and r['playlist_id'] is None and r['until_at'] is None"; then
         ok "GET /broadcast: эфир выключен, срока нет"; else bad "GET /broadcast после выключения: HTTP $HTTP $BODY"; fi
+      req GET "/dashboard"
+      if [ "$HTTP" = "200" ] && body_has "r['broadcast_on'] is False and r['broadcast_playlist'] is None and r['broadcast_until'] is None"; then
+        ok "дашборд: эфир выключен"; else bad "дашборд после выключения эфира: HTTP $HTTP"; fi
+      if [ -n "$BC_FEED" ]; then
+        dreq "/schedule/minipc/$SID"
+        if [ "$HTTP" = "200" ] && body_has "r['active_source']!='broadcast'"; then
+          ok "после выключения лента экрана не отдаёт эфир"; else bad "лента после выключения эфира: HTTP $HTTP $(feed_brief)"; fi
+        dreq "/files/list/$SID"
+        if [ "$HTTP" = "200" ] && ! body_has "any(f['filename']=='$NOW_FILE' for f in r)"; then
+          ok "после выключения ролика эфира нет в списке закачки"; else bad "после выключения ролик эфира в списке закачки: HTTP $HTTP"; fi
+      fi
     fi
   fi
   bc_finish

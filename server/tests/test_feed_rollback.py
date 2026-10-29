@@ -7,7 +7,17 @@
 ответ экрану в 500. AbortingDB повторяет это поведение Postgres: после
 исключения каждый execute падает до вызова rollback().
 """
+from types import SimpleNamespace
+
 from routers.screens import schedule_for_minipc
+
+
+class _Clip(SimpleNamespace):
+    """Ролик плейлиста: лента берёт его как dict(r._mapping)."""
+
+    @property
+    def _mapping(self):
+        return vars(self)
 
 
 class _Result:
@@ -54,9 +64,14 @@ class AbortingDB:
 
 
 def test_hourly_sequence_db_error_is_rolled_back_and_feed_still_answers():
-    # эфир сети включён — у ленты есть активный плейлист, и сервер собирает
-    # для него часовую последовательность; её первый запрос падает
-    db = AbortingDB([("FROM network_broadcast b", [(5, "Эфир")])],
+    # общий эфир «до отмены» включён и ему есть что играть — у ленты есть
+    # активный плейлист, и сервер собирает для него часовую последовательность;
+    # её первый запрос падает
+    state = SimpleNamespace(is_on=True, playlist_id=5, playlist_name="Эфир", until_at=None,
+                            enabled_by="admin", enabled_at=None)
+    clip = _Clip(media_id=1, filename="a.mp4", filesize=1, md5_hash="x", repeat_count=1, position=1)
+    db = AbortingDB([("FROM network_broadcast b", [state]),
+                     ("FROM playlist_items pi JOIN media m", [clip])],
                     fail_on="SELECT fill_to_hour")
     feed = schedule_for_minipc(1, db=db, _screen=None)
     assert db.rollbacks == 1

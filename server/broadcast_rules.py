@@ -30,6 +30,15 @@ def parse_until_hour(value, now: datetime) -> datetime | None:
     return datetime.combine(now.date(), time(value, 0))
 
 
+def until_text(until_at: datetime | None) -> str:
+    """Срок эфира словами: «до 16:00» / «до 24:00» (полночь следующих суток) / «до отмены»."""
+    if until_at is None:
+        return "до отмены"
+    if until_at.hour == 0 and until_at.minute == 0:
+        return "до 24:00"
+    return f"до {until_at:%H:%M}"
+
+
 def effective_on(row: dict | None, now: datetime) -> bool:
     """Идёт ли общий эфир в момент `now`.
 

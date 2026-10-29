@@ -35,6 +35,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from admin_panel import ad_sequence
+from broadcast_store import get_broadcast
 from deps import get_current_admin, get_db, require_write
 from placements_logic import (ALTERNATE, KIND_OVERRIDE, KIND_PLACEMENT, REPLACE, YIELD, alternate_overlaps,
                               find_conflicts, placement_status, prefill_decisions, week_cells)
@@ -319,7 +320,7 @@ def preview_placement(body: dict = Body(...), admin: dict = Depends(require_writ
         item["screen_name"] = info.get(item["screen_id"], (f"Экран #{item['screen_id']}", "other"))[0]
 
     notices = []
-    if db.execute(text("SELECT is_on FROM network_broadcast WHERE id = 1")).scalar():
+    if get_broadcast(db, now_msk())["is_on"]:    # действующий: истёкший срок — уже не эфир
         notices.append(BROADCAST_NOTICE)
 
     cache: dict[tuple[int, str], float] = {}

@@ -5,7 +5,9 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from broadcast_store import get_broadcast
 from deps import get_db, get_current_admin
+from placements_store import now_msk
 from screen_online import offline_for_sql, online_sql
 
 router = APIRouter()
@@ -262,12 +264,8 @@ def dashboard(db: Session = Depends(get_db), current_admin=Depends(get_current_a
         ORDER BY m.valid_until
     """)).fetchall()
 
-    bc = db.execute(text("""
-        SELECT b.is_on, p.name AS playlist_name
-        FROM network_broadcast b
-        LEFT JOIN playlists p ON p.id = b.playlist_id
-        WHERE b.id = 1
-    """)).fetchone()
+    # действующий общий эфир: строка с вышедшим сроком — уже «выключен»
+    bc = get_broadcast(db, now_msk())
 
     now_playing = db.execute(text(f"""
         SELECT s.name, s.status, s.playing_file,
@@ -320,8 +318,10 @@ def dashboard(db: Session = Depends(get_db), current_admin=Depends(get_current_a
         "screens_offline": summary.offline,
         "advertisers": adv_count,
         "media_count": media_count,
-        "broadcast_on": bool(bc.is_on) if bc else False,
-        "broadcast_playlist": bc.playlist_name if bc else None,
+        "broadcast_on": bc["is_on"],
+        "broadcast_playlist": bc["playlist_name"],
+        # срок эфира (наивное МСК, ISO); null — «до отмены» или эфир выключен
+        "broadcast_until": bc["until_at"].isoformat() if bc["until_at"] else None,
         "now_playing": [dict(r._mapping) for r in now_playing],
         "disks": [dict(r._mapping) for r in disks],
         "feed": [dict(r._mapping) for r in feed],

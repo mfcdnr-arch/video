@@ -5,6 +5,9 @@
   broadcast_store  — SQL на фейк-БД RoutedDB (строки по подстроке SQL, а не по
                      порядку вызовов), commit внутри не делается;
   routers.broadcast — разбор тела POST /broadcast/on и вид ответа.
+Плюс читатели эфира — лента экрана, список закачки, симулятор, дашборд: все
+берут действующий эфир (get_broadcast), а лента пропускает эфир, которому на
+этом экране нечего играть.
 SQL против живой схемы гоняет smoke_test.sh на стенде (шаг «Общий эфир»).
 
 Все моменты — наивное МСК: 15:00 МСК — это 12:00 UTC, а контейнер Postgres в UTC.
@@ -16,7 +19,11 @@ import pytest
 from fastapi import HTTPException
 
 import broadcast_store as store
-from broadcast_rules import effective_on, parse_until_hour
+import routers.media as media_router
+import routers.schedule as schedule_router
+import routers.screens as screens_router
+import routers.system as system_router
+from broadcast_rules import effective_on, parse_until_hour, until_text
 from routers.broadcast import broadcast_json, parse_on_request
 
 N = datetime(2026, 10, 28, 14, 30)
@@ -107,28 +114,41 @@ class _Result:
     def fetchall(self):
         return self._rows
 
+    def scalar(self):
+        return self._rows[0] if self._rows else None
+
 
 class RoutedDB:
     """Мок сессии: строки по подстроке SQL (пробелы схлопнуты), без совпадения — пусто.
 
-    Все вызовы копятся в calls; commit() считается: хранилище коммитить не должно.
+    Строки маршрута — список или функция от параметров запроса (ролики «по
+    плейлисту»). Запрос с подстрокой fail_on падает, как запрос к Postgres.
+    Все вызовы копятся в calls; commit() и rollback() считаются: хранилище
+    коммитить не должно.
     """
 
-    def __init__(self, routes):
+    def __init__(self, routes, fail_on=None):
         self.routes = routes
+        self.fail_on = fail_on
         self.calls: list[tuple[str, dict]] = []
         self.commits = 0
+        self.rollbacks = 0
 
     def execute(self, query, params=None):
         sql = " ".join(str(query).split())
         self.calls.append((sql, params or {}))
+        if self.fail_on and self.fail_on in sql:
+            raise RuntimeError('column b.until_at does not exist')
         for needle, rows in self.routes:
             if needle in sql:
-                return _Result(rows)
+                return _Result(rows(params or {}) if callable(rows) else rows)
         return _Result([])
 
     def commit(self):
         self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
 
     def params(self, needle):
         return [p for sql, p in self.calls if needle in sql]
@@ -339,3 +359,202 @@ def test_broadcast_json_off_keeps_nulls():
     out = broadcast_json({"is_on": False, "playlist_id": None, "playlist_name": None, "until_at": None,
                           "enabled_by": None, "enabled_at": None})
     assert out["is_on"] is False and out["until_at"] is None and out["enabled_at"] is None
+
+
+def test_until_text():
+    assert until_text(None) == "до отмены"
+    assert until_text(datetime(2026, 10, 28, 16, 0)) == "до 16:00"
+    assert until_text(datetime(2026, 10, 29, 0, 0)) == "до 24:00"
+
+
+# --- читатели эфира: лента экрана -----------------------------------------------
+# Лента (GET /schedule/minipc/{id}) на фейк-БД: эфир и проигрываемые ролики
+# плейлистов по id; показ по датам на этот час подменяется (resolve_placement_hour).
+
+class MRow(Row):
+    """Строка с _mapping: лента берёт ролики как dict(r._mapping)."""
+
+    @property
+    def _mapping(self):
+        return vars(self)
+
+
+def CLIP(media_id, repeat=1):
+    return MRow(media_id=media_id, filename=f"c{media_id}.mp4", filesize=100, md5_hash="x",
+                repeat_count=repeat, position=media_id)
+
+
+def feed_db(state, clips, fail_on=None):
+    """Фейк-БД: состояние эфира (None — строки нет) и ролики {playlist_id: [CLIP]}."""
+    return RoutedDB([("FROM network_broadcast", [] if state is None else [state]),
+                     ("FROM playlist_items pi JOIN media m", lambda p: clips.get(p.get("p"), []))],
+                    fail_on=fail_on)
+
+
+@pytest.fixture
+def feed(monkeypatch):
+    """Лента экрана 1 в момент N (14:30 МСК); placement — плейлисты показа на этот час."""
+    def run(db, placement=()):
+        monkeypatch.setattr(screens_router, "now_msk", lambda: N)
+        monkeypatch.setattr(screens_router, "resolve_placement_hour", lambda db_, sid, now: list(placement))
+        monkeypatch.setattr(screens_router, "load_playlist_names", lambda db_, ids: {i: f"PL{i}" for i in ids})
+        return screens_router.schedule_for_minipc(1, db=db, _screen=None)
+    return run
+
+
+def test_feed_broadcast_plays_until_its_end(feed):
+    out = feed(feed_db(STATE(), {5: [CLIP(1, repeat=2)]}))
+    assert out["active_source"] == "broadcast"
+    assert out["active_playlist"] == {"playlist_id": 5, "playlist_name": "Акция"}
+    assert out["active_until"] == "2026-10-28T16:00:00"      # агент сам прекратит эфир в срок
+    assert [i["media_id"] for i in out["active_items"]] == [1, 1]
+
+
+def test_feed_broadcast_until_cancel_has_no_active_until(feed):
+    out = feed(feed_db(STATE(until_at=None), {5: [CLIP(1)]}))
+    assert out["active_source"] == "broadcast" and out["active_until"] is None
+
+
+def test_feed_broadcast_with_nothing_playable_falls_through_to_placement(feed):
+    """Плейлисту эфира на этой площадке нечего играть — здесь эфир не идёт, экран не чёрный."""
+    out = feed(feed_db(STATE(), {5: [], 20: [CLIP(2)]}), placement=[20])
+    assert out["active_source"] == "placement"
+    assert out["active_playlist"]["playlist_id"] == 20
+    assert [i["media_id"] for i in out["active_items"]] == [2]
+    assert out["active_until"] == "2026-10-28T15:00:00"
+
+
+def test_feed_broadcast_with_nothing_playable_falls_through_to_template(feed):
+    out = feed(feed_db(STATE(), {}))
+    assert out["active_source"] == "template"
+    assert out["active_playlist"] is None and out["active_items"] == [] and out["active_until"] is None
+
+
+def test_feed_expired_broadcast_row_is_not_played(feed):
+    """Срок вышел (до 14:00, сейчас 14:30), Celery строку ещё не сбросил — эфира уже нет."""
+    out = feed(feed_db(STATE(until_at=datetime(2026, 10, 28, 14, 0)), {5: [CLIP(1)], 20: [CLIP(2)]}),
+               placement=[20])
+    assert out["active_source"] == "placement" and out["active_playlist"]["playlist_id"] == 20
+
+
+def test_feed_survives_broadcast_read_error(feed):
+    """Сбой чтения эфира (например, не применена миграция 032) не роняет ленту в 500."""
+    db = feed_db(STATE(), {5: [CLIP(1)], 20: [CLIP(2)]}, fail_on="FROM network_broadcast")
+    out = feed(db, placement=[20])
+    assert db.rollbacks == 1
+    assert out["active_source"] == "placement" and out["active_playlist"]["playlist_id"] == 20
+
+
+# --- читатели эфира: список закачки ----------------------------------------------
+# GET /files/list/{id} — единственный источник закачки агента: ролики плейлиста
+# действующего эфира должны в нём быть (и у экрана, подключившегося позже).
+
+@pytest.fixture
+def files_list(monkeypatch):
+    """Плейлисты, ролики которых попали в выборку закачки экрана 1 (сверх шаблона и заглушек)."""
+    def run(db, dated=()):
+        monkeypatch.setattr(media_router, "now_msk", lambda: N)
+        monkeypatch.setattr(media_router, "load_placements", lambda db_, a, b: [])
+        monkeypatch.setattr(media_router, "load_overrides", lambda db_, a, b: [])
+        monkeypatch.setattr(media_router, "playlists_for_screen", lambda *a: set(dated))
+        media_router.files_for_screen(1, db=db, _screen=None)
+        (params,) = db.params("SELECT DISTINCT m.id")
+        return set(params["pids"])
+    return run
+
+
+def test_files_list_has_broadcast_playlist_while_it_is_on(files_list):
+    assert files_list(feed_db(STATE(), {})) == {5}
+    assert files_list(feed_db(STATE(until_at=None), {}), dated=[20]) == {5, 20}
+
+
+@pytest.mark.parametrize("state", [None, STATE(is_on=False, playlist_id=None, name=None, until_at=None),
+                                   STATE(until_at=datetime(2026, 10, 28, 14, 0))])
+def test_files_list_has_no_broadcast_playlist_when_off_or_expired(files_list, state):
+    assert files_list(feed_db(state, {}), dated=[20]) == {20}
+
+
+def test_files_list_survives_broadcast_read_error(files_list):
+    """Ответ с ошибкой агент читает как пустой список — ночная очистка стёрла бы всё."""
+    db = feed_db(STATE(), {}, fail_on="FROM network_broadcast")
+    assert files_list(db, dated=[20]) == {20}
+    assert db.rollbacks == 1
+
+
+# --- читатели эфира: симулятор -----------------------------------------------------
+
+SCREEN = Row(id=1, name="Экран 1", group_id=None, venue_type="other")
+SIM_CLIP = Row(filename="c1.mp4", title="Ролик", repeat_count=1)
+
+
+def sim_db(state, clips=(SIM_CLIP,)):
+    return RoutedDB([("FROM screens s WHERE s.id", [SCREEN]),
+                     ("FROM network_broadcast", [] if state is None else [state]),
+                     ("FROM playlist_items pi JOIN media m", list(clips))])
+
+
+@pytest.fixture
+def simulate(monkeypatch):
+    """Пометки симулятора для экрана 1 (показов и слотов нет); «сейчас» — N, 14:30 МСК."""
+    def run(db, on_date="2026-10-28", hour=15):
+        monkeypatch.setattr(schedule_router, "now_msk", lambda: N)
+        monkeypatch.setattr(schedule_router, "resolve_placement_hour", lambda db_, sid, at: [])
+        return schedule_router.simulate_schedule(screen_id=1, on_date=on_date, hour=hour, admin={}, db=db)["notes"]
+    return run
+
+
+def test_simulator_note_names_broadcast_end(simulate):
+    note = simulate(sim_db(STATE()), hour=15)[0]
+    assert note.startswith("Сейчас включён общий эфир «Акция» до 16:00")
+    assert "перекрывает всё расписание" in note
+
+
+def test_simulator_note_hour_after_broadcast_end(simulate):
+    for on_date, hour in (("2026-10-28", 16), ("2026-10-29", 9)):
+        note = simulate(sim_db(STATE()), on_date=on_date, hour=hour)[0]
+        assert "до 16:00" in note and "закончится" in note and "перекрывает" not in note
+
+
+def test_simulator_note_until_cancel(simulate):
+    note = simulate(sim_db(STATE(until_at=None)), on_date="2026-11-02", hour=9)[0]
+    assert "«Акция» до отмены" in note and "перекрывает всё расписание" in note
+
+
+def test_simulator_note_until_midnight(simulate):
+    note = simulate(sim_db(STATE(until_at=datetime(2026, 10, 29, 0, 0))), hour=23)[0]
+    assert "до 24:00" in note and "перекрывает" in note
+
+
+def test_simulator_note_nothing_playable_on_this_screen(simulate):
+    note = simulate(sim_db(STATE(), clips=()), hour=15)[0]
+    assert "нечего играть" in note and "перекрывает" not in note
+
+
+@pytest.mark.parametrize("state", [None, STATE(is_on=False, playlist_id=None, name=None, until_at=None),
+                                   STATE(until_at=datetime(2026, 10, 28, 14, 0))])
+def test_simulator_no_broadcast_note_when_off_or_expired(simulate, state):
+    assert not any("общий эфир" in n for n in simulate(sim_db(state)))
+
+
+# --- читатели эфира: дашборд ---------------------------------------------------------
+
+def dashboard(monkeypatch, state):
+    monkeypatch.setattr(system_router, "now_msk", lambda: N)
+    db = RoutedDB([("as total", [Row(total=1, online=1, offline=0)]),
+                   ("FROM network_broadcast", [] if state is None else [state])])
+    return system_router.dashboard(db=db, current_admin={})
+
+
+def test_dashboard_broadcast_is_effective_state_with_until(monkeypatch):
+    out = dashboard(monkeypatch, STATE())
+    assert out["broadcast_on"] is True and out["broadcast_playlist"] == "Акция"
+    assert out["broadcast_until"] == "2026-10-28T16:00:00"
+    out = dashboard(monkeypatch, STATE(until_at=None))
+    assert out["broadcast_on"] is True and out["broadcast_until"] is None
+
+
+@pytest.mark.parametrize("state", [None, STATE(until_at=datetime(2026, 10, 28, 14, 0))])
+def test_dashboard_expired_or_missing_broadcast_is_off(monkeypatch, state):
+    out = dashboard(monkeypatch, state)
+    assert out["broadcast_on"] is False
+    assert out["broadcast_playlist"] is None and out["broadcast_until"] is None

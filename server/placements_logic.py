@@ -293,18 +293,21 @@ def playlists_for_screen(placements: list[dict], overrides: list[dict], screen_i
     return out
 
 
-def active_until_for(source: str, now: datetime) -> str | None:
+def active_until_for(source: str, now: datetime, broadcast_until: datetime | None = None) -> str | None:
     """До какого момента действует активный источник ленты экрана (наивное МСК, ISO).
 
     Показ выбирается на час — до начала следующего часа; переопределение
-    даты (в т. ч. «выключен») — до ближайшей полуночи. Эфир сети и шаблон —
-    None: эфир живёт, пока его не выключат, шаблон агент считает сам.
+    даты (в т. ч. «выключен») — до ближайшей полуночи; общий эфир — до своего
+    срока `broadcast_until` («до ЧЧ:00»), а «до отмены» (None) — без срока:
+    живёт, пока его не выключат. Шаблон — None: его агент считает сам.
     Агент без связи по истечении не доигрывает устаревший источник.
     """
     if source == "placement":
         end = now.replace(minute=0, second=0, microsecond=0) + _HOUR
     elif source == "override":
         end = datetime.combine(now.date() + timedelta(days=1), time(0))
+    elif source == "broadcast" and broadcast_until is not None:
+        end = broadcast_until
     else:
         return None
     return end.isoformat()

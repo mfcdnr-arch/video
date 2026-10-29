@@ -16,6 +16,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from admin_panel import ad_sequence, build_hourly_sequence, filler_list
+from broadcast_store import get_broadcast
 from deps import get_db, get_current_admin, require_write, verify_device_token
 from dashboard_ws import dashboard_ws_manager
 from placements_logic import active_until_for, pick_active
@@ -369,7 +370,9 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
     """
     Расписание для мини ПК + список нужных файлов.
     Приоритет источника плейлиста на текущий час (МСК):
-      1) Общий эфир сети (network_broadcast.is_on) — перекрывает всё;
+      1) Общий эфир сети — действующий (broadcast_store.get_broadcast)
+         перекрывает всё, если на этом экране ему есть что играть, иначе
+         пропускается; active_until — его срок (null — «до отмены»);
       2) Датовое переопределение на сегодня «показ выключен» (экран или его
          группа) — экран молчит;
       3) Показ по датам (placements) на этот час: один плейлист — как
@@ -409,18 +412,27 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
             ORDER BY pi.position
         """), {"p": pid, "venue": venue}).fetchall()]
 
-    # 1) Общий эфир
-    bc = db.execute(text("""
-        SELECT b.playlist_id, p.name FROM network_broadcast b
-        LEFT JOIN playlists p ON p.id = b.playlist_id
-        WHERE b.id = 1 AND b.is_on = TRUE AND b.playlist_id IS NOT NULL
-    """)).fetchone()
-    if bc:
-        active_playlist = {"playlist_id": bc[0], "playlist_name": bc[1]}
-        active_source = "broadcast"
+    # 1) Общий эфир — действующий (срок не вышел, плейлист не удалён: строка
+    # с вышедшим сроком, которую Celery ещё не сбросил, эфиром уже не считается)
+    # и только там, где ему есть что играть: плейлист без проигрываемых на этой
+    # площадке роликов (модерация, срок, алкоголь) экран не гасит — идём дальше
+    # по приоритетам, как с пустым показом (pick_active). Ошибка чтения эфира
+    # ленту не роняет: откатываем (были только SELECT) и играем без эфира.
+    broadcast_until = None
+    try:
+        bc = get_broadcast(db, now)
+        bc_rows = playlist_rows(bc["playlist_id"]) if bc["is_on"] else []
+        if bc_rows:
+            active_playlist = {"playlist_id": bc["playlist_id"], "playlist_name": bc["playlist_name"]}
+            active_items = expand_repeats(bc_rows)
+            active_source = "broadcast"
+            broadcast_until = bc["until_at"]
+    except Exception:
+        log.exception("screen %s: общий эфир не прочитан, играем по остальным правилам", screen_id)
+        db.rollback()
 
-    # Датовое переопределение на сегодня (экран или его группа), если эфир
-    # выключен. «Выключен» (2) бьёт показы, переопределение с плейлистом (4)
+    # Датовое переопределение на сегодня (экран или его группа), если эфира
+    # нет. «Выключен» (2) бьёт показы, переопределение с плейлистом (4)
     # уступает им.
     ov = None
     if active_playlist is None:
@@ -468,8 +480,8 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
         active_playlist = {"playlist_id": ov[0], "playlist_name": ov[1]}
         active_source = "override"
 
-    # Файлы активного плейлиста эфира/переопределения (у показа уже собраны)
-    if active_source != "placement" and active_playlist and active_playlist.get("playlist_id"):
+    # Ролики переопределения с плейлистом (у эфира и показа уже собраны)
+    if active_source == "override" and active_playlist.get("playlist_id"):
         active_items = expand_repeats(playlist_rows(active_playlist["playlist_id"]))
 
     # Трёхуровневая резолюция недельного шаблона: на каждый (день, час)
@@ -651,8 +663,9 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
         "active_playlist": active_playlist,   # что играть прямо сейчас (приоритет)
         "active_source": active_source,       # broadcast | override | placement | template
         # до какого момента (наивное МСК, ISO) действуют active_* и
-        # hourly_sequence; потом агент без свежей ленты идёт к шаблону
-        "active_until": active_until_for(active_source, now),
+        # hourly_sequence; потом агент без свежей ленты идёт к шаблону.
+        # Эфир «до ЧЧ:00» — его срок, «до отмены» — null
+        "active_until": active_until_for(active_source, now, broadcast_until),
         "active_items": active_items,         # повторы ×N развёрнуты
         "hourly_sequence": hourly_sequence,   # реклама + заглушки на час (по порядку)
         "schedule": [{**dict(r._mapping), "items": expand_repeats(r.items or [])} for r in slots],

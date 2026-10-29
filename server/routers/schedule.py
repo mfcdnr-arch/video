@@ -6,12 +6,32 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from broadcast_rules import until_text
+from broadcast_store import get_broadcast
 from deps import get_db, get_current_admin, require_write
 from placements_logic import pick_active
-from placements_store import load_playlist_names, resolve_placement_hour
+from placements_store import load_playlist_names, now_msk, resolve_placement_hour
 from playlist_rules import expand_repeats, interleave
 
 router = APIRouter()
+
+
+def broadcast_note(bc: dict, at: datetime, playable: bool) -> str:
+    """Пометка симулятора про общий эфир, который идёт сейчас (bc — get_broadcast).
+
+    Со сроком: «до 16:00» / «до 24:00» / «до отмены». Если к часу `at` срок
+    уже выйдет или плейлисту эфира на этом экране нечего играть (`playable`
+    False: модерация, площадка, срок ролика), эфир этот час не перекрывает —
+    экран идёт по расписанию, как и лента экрана.
+    """
+    head = f"Сейчас включён общий эфир «{bc['playlist_name'] or 'плейлист'}» {until_text(bc['until_at'])}"
+    if bc["until_at"] is not None and at >= bc["until_at"]:
+        return head + " — к этому часу он закончится, экран вернётся к расписанию"
+    if not playable:
+        return head + " — но на этом экране ему нечего играть (модерация/площадка/срок), здесь идёт расписание"
+    if bc["until_at"] is None:
+        return head + " — пока он включён, он перекрывает всё расписание экрана"
+    return head + " — до этого времени он перекрывает всё расписание экрана"
 
 
 def _slot_target(screen_id, group_id, network):
@@ -365,8 +385,8 @@ def simulate_schedule(
     показ по датам → переопределение даты с плейлистом → недельные слоты
     экран/группа/сеть → заглушки) и всех фильтров (модерация, тип площадки,
     срок действия ролика). Повторы ×N развёрнуты — как играет экран.
-    «Эфир сети» — ручной рубильник текущего момента, для будущих дат он не
-    предсказуем; если он включён СЕЙЧАС, отмечаем.
+    Общий эфир — ручной рубильник текущего момента, для будущих дат он не
+    предсказуем; если он идёт СЕЙЧАС, отмечаем — со сроком (broadcast_note).
     """
     try:
         sim_date = date.fromisoformat(on_date)
@@ -402,14 +422,11 @@ def simulate_schedule(
                                 for r in rows])
         return [{"filename": i["filename"], "title": i["title"]} for i in items]
 
-    # эфир сети (только пометка — он живёт «сейчас», а не по датам)
-    bc = db.execute(text("""
-        SELECT b.is_on, p.name FROM network_broadcast b
-        LEFT JOIN playlists p ON p.id = b.playlist_id WHERE b.id = 1
-    """)).fetchone()
-    if bc and bc.is_on:
-        notes.append(f"Сейчас включён «Эфир сети» ({bc.name or 'плейлист'}) — пока он включён, "
-                     "он перекрывает всё расписание на всех экранах")
+    # общий эфир (только пометка — он живёт «сейчас», а не по датам)
+    bc = get_broadcast(db, now_msk())
+    if bc["is_on"]:
+        notes.append(broadcast_note(bc, datetime.combine(sim_date, time(hour)),
+                                    bool(playlist_items(bc["playlist_id"]))))
 
     # 1) переопределение даты (экран приоритетнее группы)
     ov = db.execute(text("""

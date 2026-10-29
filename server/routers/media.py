@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from broadcast_store import get_broadcast
 from deps import engine, get_db, get_current_admin, require_write, require_moderator, verify_device_token, MEDIA_PATH
 from placements_logic import playlists_for_screen
 from placements_store import load_overrides, load_placements, now_msk
@@ -812,22 +813,33 @@ def files_for_screen(screen_id: int, db: Session = Depends(get_db),
       • плейлисты показов по датам (не остановленных, в т. ч. «на все
         экраны») и датовых переопределений экрана и его группы на сегодня и
         PRELOAD_DAYS дней вперёд (МСК) — ролики лежат на диске до начала часа;
+      • плейлист действующего общего эфира (broadcast_store.get_broadcast) —
+        пока эфир идёт, в т. ч. для экрана, подключившегося позже;
       • все заглушки — их играют часовые блоки, «общий час» и фолбэк.
     Только готовые и одобренные; алкоголь — только для площадок «магазин с
     алколицензией» (38-ФЗ ст. 21). Каждый файл — один раз.
     """
     venue = db.execute(text("SELECT COALESCE(venue_type,'other') FROM screens WHERE id = :sid"),
                        {"sid": screen_id}).scalar() or "other"
-    dated: set[int] = set()
+    now = now_msk()
+    pids: set[int] = set()       # плейлисты сверх шаблона: показы, переопределения, эфир
+    # Ответ с ошибкой агент читает как пустой список, и ночная очистка стёрла
+    # бы с экрана все ролики. Поэтому каждая часть — отдельно: сбой одной не
+    # убирает другие, а шаблон и заглушки отдаются в любом случае.
     try:
-        d_from = now_msk().date()
+        d_from = now.date()
         d_to = d_from + timedelta(days=PRELOAD_DAYS)
-        dated = playlists_for_screen(load_placements(db, d_from, d_to), load_overrides(db, d_from, d_to),
-                                     screen_id, d_from, d_to)
+        pids = playlists_for_screen(load_placements(db, d_from, d_to), load_overrides(db, d_from, d_to),
+                                    screen_id, d_from, d_to)
     except Exception:
-        # Ответ с ошибкой агент читает как пустой список, и ночная очистка
-        # стёрла бы с экрана все ролики. Отдаём хотя бы шаблон и заглушки.
         log.exception("screen %s: плейлисты показов и переопределений для загрузки не получены", screen_id)
+        db.rollback()
+    try:
+        bc = get_broadcast(db, now)
+        if bc["is_on"]:
+            pids.add(bc["playlist_id"])
+    except Exception:
+        log.exception("screen %s: плейлист общего эфира для загрузки не получен", screen_id)
         db.rollback()
     rows = db.execute(text("""
         SELECT DISTINCT m.id, m.filename, m.filesize, m.md5_hash
@@ -837,7 +849,7 @@ def files_for_screen(screen_id: int, db: Session = Depends(get_db),
           AND (m.is_filler = TRUE
                OR m.id IN (
                    SELECT pi.media_id FROM playlist_items pi
-                   WHERE pi.playlist_id = ANY(:dated)
+                   WHERE pi.playlist_id = ANY(:pids)
                       OR pi.playlist_id IN (
                           SELECT playlist_id FROM schedule_slots
                           WHERE playlist_id IS NOT NULL
@@ -846,7 +858,7 @@ def files_for_screen(screen_id: int, db: Session = Depends(get_db),
                                      AND group_id = (SELECT group_id FROM screens WHERE id = :sid))
                                  OR (screen_id IS NULL AND group_id IS NULL)))))
         ORDER BY m.id
-    """), {"sid": screen_id, "venue": venue, "dated": sorted(dated)}).fetchall()
+    """), {"sid": screen_id, "venue": venue, "pids": sorted(pids)}).fetchall()
     return [{"media_id": r.id, "filename": r.filename,
              "filesize": r.filesize, "md5_hash": r.md5_hash,
              "download_url": f"/files/download/{r.id}"} for r in rows]

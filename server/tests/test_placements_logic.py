@@ -703,3 +703,17 @@ def test_active_until_override_is_next_midnight_others_none():
     assert active_until_for("override", datetime(2026, 10, 31, 0, 0)) == "2026-11-01T00:00:00"
     assert active_until_for("broadcast", datetime(2026, 10, 27, 7, 37)) is None
     assert active_until_for("template", datetime(2026, 10, 27, 7, 37)) is None
+
+
+def test_active_until_broadcast_uses_until():
+    assert active_until_for("broadcast", datetime(2026, 10, 28, 14, 30), datetime(2026, 10, 28, 16, 0)) == "2026-10-28T16:00:00"
+    assert active_until_for("broadcast", datetime(2026, 10, 28, 14, 30), None) is None
+
+
+def test_active_until_broadcast_until_midnight_and_ignored_by_other_sources():
+    """«До 24:00» — полночь следующих суток; срок эфира другим источникам не передаётся."""
+    until = datetime(2026, 10, 29, 0, 0)
+    assert active_until_for("broadcast", datetime(2026, 10, 28, 23, 10), until) == "2026-10-29T00:00:00"
+    assert active_until_for("placement", datetime(2026, 10, 28, 14, 30), until) == "2026-10-28T15:00:00"
+    assert active_until_for("override", datetime(2026, 10, 28, 14, 30), until) == "2026-10-29T00:00:00"
+    assert active_until_for("template", datetime(2026, 10, 28, 14, 30), until) is None
