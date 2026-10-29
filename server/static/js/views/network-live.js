@@ -460,7 +460,6 @@
     if(!st || !alive(st) || !pid) return;
     const same = st.pid === pid;
     st.pid = pid;
-    st.opener = opener || st.opener;
     if(!same){
       st.detail = null;
       st.pname = ((st.data && st.data.playlists[String(pid)]) || {}).name
@@ -578,7 +577,7 @@
     const view = $('view');
     const st = S = {
       data: null, error: null, query: '', shown: null,
-      pid: null, pname: '', detail: null, detailSeq: 0, opener: null,
+      pid: null, pname: '', detail: null, detailSeq: 0,
       loading: null, again: false, timer: 0, at: 0, html: {},
     };
     view.innerHTML = `<div id="nl-root" class="nl">
