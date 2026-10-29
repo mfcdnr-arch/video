@@ -19,9 +19,17 @@
 // «До ЧЧ:00 сегодня», час — #bc-until-hour, от следующего часа по МСК до 24),
 // жёлтое предупреждение с числами N (всего экранов) и K (не в сети), кнопки
 // «Отмена» (bc-cancel) и «Включить на N экранах» / «Сменить плейлист» (bc-submit).
+// Если у выбранного плейлиста нет роликов, которые могут идти без алколицензии
+// (GET /playlists → playable_unlicensed = false, реклама алкоголя), окно считает
+// экраны не на площадке store_alcohol (venue_type из /network/live) и ещё ДО
+// включения пишет «На K экранах нечего играть — там идёт обычное расписание»;
+// число обновляется при смене плейлиста.
 // POST /broadcast/on {playlist_id, until_hour}; ошибка сервера — внутри окна.
 // Пока идёт запрос, кнопки отключены, форма заморожена, а Esc / ✕ / клик по фону
 // окно не закрывают. После успеха окно закрывается, страница перечитывается.
+// Час «до» собран от часа МСК на момент открытия: если к отправке час (или сутки)
+// сменился, запрос не уходит — список пересобирается, окно просит проверить час
+// (иначе «24:00», выбранное в 23:xx, после полуночи дало бы эфир на сутки).
 //
 // Время от сервера — наивное МСК («2026-10-29T16:00:00»): ЧЧ:ММ берётся срезом
 // строки, через new Date() его пропускать нельзя. Единственное исключение —
@@ -262,22 +270,41 @@
     el.innerHTML = p ? `Выбран: <b>«${esc(p.name)}»</b>` : 'Плейлист не выбран';
   }
 
-  // Предупреждение: число экранов N и не в сети K; при смене — и где текущему плейлисту нечего играть
+  // Что эфир с выбранным плейлистом сделает с экранами: на скольких он пойдёт, на скольких играть
+  // нечего (нет роликов без алколицензии, а площадка не store_alcohol) и сколько из «пойдёт» не в сети.
+  // Плейлист не выбран или флаг не пришёл — предупреждать не о чем: нечего играть = 0.
+  function coverage(st){
+    const pl = st.playlists.find(p => p.id === st.picked);
+    const needLicense = !!pl && pl.unlicensedOk === false;
+    let skip = 0, offline = 0;
+    st.screens.forEach(sc => {
+      if(needLicense && !sc.licensed) skip++;
+      else if(!sc.online) offline++;
+    });
+    return {total: st.screens.length, play: st.screens.length - skip, skip, offline};
+  }
+
+  // Предупреждение: на скольких экранах пойдёт эфир (N), где нечего играть, сколько не в сети (K)
   function renderWarn(st){
     const el = $('bc-warn');
     if(!el) return;
-    const n = st.n, k = st.k;
+    const c = coverage(st);
     const lines = [];
-    if(n > 0){
-      lines.push(`${onAll(n).replace(/^на/, 'На')} будет идти только этот плейлист. Показы по датам, расписание и замены на это время перекрываются.`);
-      if(k > 0){
-        lines.push(`${screensWord(k)} сейчас не в сети — ${isOne(k) ? 'получит' : 'получат'} эфир при подключении.`);
+    if(st.n > 0){
+      const nothing = c.skip > 0 ? `${onScreens(c.skip).replace(/^на/, 'На')} нечего играть — там идёт обычное расписание.` : '';
+      if(c.skip === 0){
+        lines.push(`${onAll(st.n).replace(/^на/, 'На')} будет идти только этот плейлист. Показы по датам, расписание и замены на это время перекрываются.`);
+      }else if(c.play > 0){
+        lines.push(`${onScreens(c.play).replace(/^на/, 'На')} (из ${st.n}) будет идти только этот плейлист. Показы по датам, расписание и замены на это время на них перекрываются.`);
+        lines.push(nothing);
+      }else{
+        lines.push('Эфир ничего не перекроет. ' + nothing);
+      }
+      if(c.offline > 0){
+        lines.push(`${screensWord(c.offline)} сейчас не в сети — ${isOne(c.offline) ? 'получит' : 'получат'} эфир при подключении.`);
       }
     }else{
       lines.push('Экранов пока нет — эфир заработает на новых экранах, как только они появятся.');
-    }
-    if(st.mode === 'change' && st.unplayable > 0 && st.picked === st.currentPid){
-      lines.push(`${onScreens(st.unplayable).replace(/^на/, 'На')} этому плейлисту нечего играть — там идёт обычное расписание.`);
     }
     el.innerHTML = '<span aria-hidden="true">⚠</span> ' + lines.map(esc).join(' ');
   }
@@ -335,10 +362,13 @@
     if(r) r.checked = true;
   }
 
-  // Список часов пересобирается от текущего часа по МСК (при открытии окна и после отказа сервера)
+  // Список часов пересобирается от текущего часа по МСК (при открытии окна, после отказа сервера и
+  // если к отправке час сменился). Наступили новые сутки (час стал меньше прежнего) — выбранный час
+  // сбрасывается на ближайший: прежнее «24:00» теперь означало бы эфир на сутки вперёд.
   function rebuildHours(st){
+    const prev = st.nowHour;
     st.nowHour = mskHour(barData && barData.generated_at);
-    if(!(st.hour > st.nowHour && st.hour <= 24)) st.hour = st.nowHour + 1;
+    if(st.nowHour < prev || !(st.hour > st.nowHour && st.hour <= 24)) st.hour = st.nowHour + 1;
     const sel = $('bc-until-hour');
     if(sel) sel.innerHTML = hoursHtml(st.nowHour, st.hour);
   }
@@ -350,6 +380,13 @@
     if(!st || st.busy || !st.loaded || st.picked == null) return;
     const pl = st.playlists.find(p => p.id === st.picked);
     if(!pl || !pl.playable) return;
+    if(st.dur === 'until' && mskHour(barData && barData.generated_at) !== st.nowHour){
+      rebuildHours(st);                        // час сменился, пока окно было открыто: ничего не шлём
+      showErr('Время изменилось — проверьте час окончания');
+      const sel = $('bc-until-hour');
+      if(sel) sel.focus({preventScroll: true});
+      return;
+    }
     setBusy(st, true);                         // сразу, до await: второй клик ничего не сделает
     showErr('');
     let r;
@@ -384,7 +421,7 @@
     const st = W = {
       mode, loaded: false, closed: false, busy: false,
       playlists: [], picked: null, query: '', dur: 'until', hour: 0, nowHour: 0,
-      n: 0, k: 0, unplayable: 0, currentPid: null, modal: null,
+      n: 0, screens: [], currentPid: null, modal: null,
     };
     const modal = openModal({
       title: mode === 'change' ? 'Сменить плейлист общего эфира' : 'Включить общий эфир на все экраны',
@@ -428,9 +465,11 @@
     const b = (data && data.broadcast) || {};
     const screens = (data && data.screens) || [];
     st.n = Number(b.screens_total != null ? b.screens_total : screens.length) || 0;
-    st.k = screens.filter(s => !s.online && !s.broadcast_skipped).length;
-    st.unplayable = Number(b.unplayable_screens) || 0;
-    st.playlists = (list || []).map(p => ({id: Number(p.id), name: String(p.name == null ? '' : p.name), playable: p.playable !== false}))
+    st.screens = screens.map(sc => ({online: !!sc.online, licensed: (sc.venue_type || 'other') === 'store_alcohol'}));
+    st.playlists = (list || []).map(p => ({
+      id: Number(p.id), name: String(p.name == null ? '' : p.name), playable: p.playable !== false,
+      unlicensedOk: p.playable_unlicensed !== false,   // false — только реклама алкоголя: без алколицензии играть нечего
+    }))
       .sort((x, y) => (y.playable - x.playable)
         || x.name.localeCompare(y.name, 'ru', {numeric: true, sensitivity: 'base'}) || x.id - y.id);
 

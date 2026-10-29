@@ -369,30 +369,38 @@ def test_replace_db_failure_rolls_back_and_reraises():
 # --- GET /playlists: флаг playable ---------------------------------------------
 
 class _ListDB:
-    """Сессия для GET /playlists: список плейлистов и id плейлистов с проигрываемыми роликами."""
+    """Сессия для GET /playlists: список плейлистов и id проигрываемых плейлистов по площадкам."""
 
-    def __init__(self, playlists, playable_ids):
-        self.playlists, self.playable_ids, self.calls = playlists, playable_ids, []
+    def __init__(self, playlists, playable_by_venue):
+        self.playlists, self.playable_by_venue, self.calls = playlists, playable_by_venue, []
 
     def execute(self, query, params=None):
         sql = " ".join(str(query).split())
         self.calls.append((sql, params))
         if "FROM playlist_items" in sql:
-            return _Result([db_row(playlist_id=i) for i in self.playable_ids])
+            return _Result([db_row(playlist_id=i) for i in self.playable_by_venue.get(params["venue"], [])])
         return _Result([db_row(_mapping={"id": i, "name": n}, id=i) for i, n in self.playlists])
 
 
 def test_list_playlists_marks_playlists_with_nothing_to_play():
-    db = _ListDB([(1, "Акции"), (2, "Пустой"), (3, "Всё на модерации")], playable_ids=[1])
+    db = _ListDB([(1, "Акции"), (2, "Пустой"), (3, "Всё на модерации")],
+                 {"store_alcohol": [1], "other": [1]})
     assert list_playlists({}, db) == [
-        {"id": 1, "name": "Акции", "playable": True},
-        {"id": 2, "name": "Пустой", "playable": False},
-        {"id": 3, "name": "Всё на модерации", "playable": False}]
+        {"id": 1, "name": "Акции", "playable": True, "playable_unlicensed": True},
+        {"id": 2, "name": "Пустой", "playable": False, "playable_unlicensed": False},
+        {"id": 3, "name": "Всё на модерации", "playable": False, "playable_unlicensed": False}]
 
 
-def test_list_playlists_asks_playable_once_for_the_most_permissive_venue():
-    """Одним запросом, для площадки с алколицензией: реклама алкоголя тоже «может идти»."""
-    db = _ListDB([(1, "А"), (2, "Б")], playable_ids=[1, 2])
+def test_list_playlists_alcohol_only_playlist_is_playable_only_on_licensed_venue():
+    """Плейлист только с рекламой алкоголя: на площадке с алколицензией есть что играть, без неё — нет."""
+    db = _ListDB([(1, "Пиво"), (2, "Акции")], {"store_alcohol": [1, 2], "other": [2]})
+    assert [(p["name"], p["playable"], p["playable_unlicensed"]) for p in list_playlists({}, db)] == [
+        ("Пиво", True, False), ("Акции", True, True)]
+
+
+def test_list_playlists_asks_playable_once_per_venue_not_per_playlist():
+    """Один запрос на площадку с алколицензией и один — на остальные, сколько бы ни было плейлистов."""
+    db = _ListDB([(1, "А"), (2, "Б"), (3, "В")], {"store_alcohol": [1, 2], "other": [1]})
     list_playlists({}, db)
-    playable_calls = [p for s, p in db.calls if "FROM playlist_items" in s]
-    assert playable_calls == [{"venue": "store_alcohol"}]
+    playable_calls = sorted(p["venue"] for s, p in db.calls if "FROM playlist_items" in s)
+    assert playable_calls == ["other", "store_alcohol"]

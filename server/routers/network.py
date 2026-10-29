@@ -100,7 +100,8 @@ def build_live(screens: list[dict], cells_by_screen: dict, now: datetime, broadc
     """Ответ GET /network/live из готовых данных (без SQL).
 
     screens — [{"id", "name", "city", "location", "venue_type", "online",
-    "offline_for_seconds", "playing"}]; cells_by_screen — {screen_id: клетки
+    "offline_for_seconds", "playing"}] (venue_type уходит и в строки ответа: окно включения
+    эфира по нему считает экраны без алколицензии); cells_by_screen — {screen_id: клетки
     week_cells на сегодня и завтра}; now — наивное МСК; broadcast — состояние эфира
     (broadcast_store.get_broadcast); playable_by_venue — {venue_type: set id
     плейлистов с проигрываемыми роликами}. Эфир «проигрываем» на экране, если id его
@@ -126,7 +127,8 @@ def build_live(screens: list[dict], cells_by_screen: dict, now: datetime, broadc
             for pid, name in zip(view["playlist_ids"], view["playlists"]) if view else ():
                 playlists.setdefault(str(pid), {"name": name})
         rows.append({"id": s["id"], "name": s["name"], "city": s.get("city"), "location": s.get("location"),
-                     "online": bool(s["online"]), "offline_for_seconds": s.get("offline_for_seconds"),
+                     "venue_type": venue, "online": bool(s["online"]),
+                     "offline_for_seconds": s.get("offline_for_seconds"),
                      "playing": s.get("playing"), **live})
 
     online = sum(1 for r in rows if r["online"])

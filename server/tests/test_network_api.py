@@ -94,13 +94,21 @@ def test_screen_row_shape():
     playing = {"media_id": 5, "title": "Ролик", "filename": "r.mp4"}
     s = scr(7, "Касса", online=False, offline_for=4000, playing=playing, city="Тверь", location="Вход")
     row = live([s])["screens"][0]
-    assert set(row) == {"id", "name", "city", "location", "online", "offline_for_seconds", "playing",
-                        "now", "next", "after_broadcast", "broadcast_skipped"}
+    assert set(row) == {"id", "name", "city", "location", "venue_type", "online", "offline_for_seconds",
+                        "playing", "now", "next", "after_broadcast", "broadcast_skipped"}
+    assert row["venue_type"] == "other"
     assert (row["id"], row["name"], row["city"], row["location"]) == (7, "Касса", "Тверь", "Вход")
     assert row["online"] is False and row["offline_for_seconds"] == 4000
     assert row["playing"] == playing
     assert row["now"] == {"kind": "template", "playlist_ids": [1], "playlists": ["PL1"], "until": None}
     assert row["next"] is None and row["after_broadcast"] is None and row["broadcast_skipped"] is False
+
+
+def test_row_carries_venue_type_and_defaults_to_other():
+    """Окно включения эфира считает по venue_type экраны без алколицензии; нет типа — «other», как в БД."""
+    rows = {r["id"]: r for r in live([scr(1, "А", venue="store_alcohol"), scr(2, "Б", venue="mall"),
+                                      scr(3, "В", venue=None), scr(4, "Г", venue="")])["screens"]}
+    assert [rows[i]["venue_type"] for i in (1, 2, 3, 4)] == ["store_alcohol", "mall", "other", "other"]
 
 
 def test_never_seen_screen_has_null_offline_for():

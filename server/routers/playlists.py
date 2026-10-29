@@ -26,6 +26,8 @@ router = APIRouter()
 
 MAX_REPEAT = 99          # повторов одного ролика в плейлисте
 MAX_NAME = 128           # playlists.name VARCHAR(128)
+LICENSED_VENUE = "store_alcohol"      # площадка с алколицензией: ей разрешена реклама алкоголя
+UNLICENSED_VENUE = "other"            # любая другая площадка (store / mall / office / other) — без неё
 _MAX_INT4 = 2 ** 31 - 1  # media.id — SERIAL
 _INT = re.compile(r"-?[0-9]{1,12}")
 
@@ -149,14 +151,17 @@ def create_playlist(name: str = Query(...), admin: dict = Depends(require_write)
 
 @router.get("/playlists")
 def list_playlists(admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
-    """Все плейлисты по названию. К полям таблицы добавлено `playable` — есть ли в плейлисте
-    хоть один ролик, который может идти на экране (готов, одобрен, срок не вышел; реклама
-    алкоголя считается: она идёт на площадке с алколицензией). Окно «Эфир сети» по нему
-    показывает серыми плейлисты, которым нечего играть. Фильтры роликов — те же, что у
-    «проигрываемых плейлистов» обзора сети (routers.network.load_playable_by_venue)."""
+    """Все плейлисты по названию. К полям таблицы добавлены два флага (фильтры роликов те же,
+    что у «проигрываемых плейлистов» обзора сети — routers.network.load_playable_by_venue):
+    `playable` — есть ли хоть один ролик, который может идти на экране (готов, одобрен, срок
+    не вышел; реклама алкоголя считается: она идёт на площадке с алколицензией) — окно «Эфир
+    сети» по нему показывает серыми плейлисты, которым нечего играть; `playable_unlicensed` —
+    то же для площадки без алколицензии (плейлист только с рекламой алкоголя там играть нечего:
+    окно считает такие экраны и предупреждает до включения эфира)."""
     rows = db.execute(text("SELECT * FROM playlists ORDER BY name")).fetchall()
-    playable = load_playable_by_venue(db, {"store_alcohol"})["store_alcohol"]
-    return [{**dict(r._mapping), "playable": r.id in playable} for r in rows]
+    by_venue = load_playable_by_venue(db, {LICENSED_VENUE, UNLICENSED_VENUE})
+    return [{**dict(r._mapping), "playable": r.id in by_venue[LICENSED_VENUE],
+             "playable_unlicensed": r.id in by_venue[UNLICENSED_VENUE]} for r in rows]
 
 
 @router.post("/playlists/check")
