@@ -19,7 +19,17 @@
  *      карточке, режим «По датам» в Расписании, отмена показа и удаление
  *      плейлиста.
  *      Плюс просмотр ролика в Медиатеке.
- *   5. Копит ошибки консоли, необработанные исключения и ответы HTTP ≥400.
+ *   5. «Эфир сети»: правило «в сети» (в «Экранах» и на дашборде экран без
+ *      сигнала — «ни разу не выходил на связь», после heartbeat — в сети),
+ *      таблица страницы со своим тестовым экраном, поиск, панель «О плейлисте»
+ *      (ролики, «Где и когда идёт», просмотр ролика), «✎ Изменить плейлист» и
+ *      «📤 Отправить на экраны» поверх страницы (закрываются Esc без сохранения),
+ *      полоса общего эфира и окно включения (отмена ничего не отправляет).
+ *      Само ВКЛЮЧЕНИЕ эфира идёт на все экраны сети и выполняется только при
+ *      E2E_ALLOW_BROADCAST=1 (на стенде): до следующего часа → жёлтая полоса →
+ *      «Сменить плейлист» (окно) → «Выключить»; прежнее состояние эфира
+ *      возвращается в конце, даже если проверка упала.
+ *   6. Копит ошибки консоли, необработанные исключения и ответы HTTP ≥400.
  *
  * Любая ошибка консоли/JS и любой ответ ≥400 — это провал прогона: именно
  * так выглядели дефекты, которые ловили руками.
@@ -33,7 +43,9 @@
  * сети»: даже при жёстком обрыве прогона настоящие экраны его не получат.
  *
  * Запуск — через ui_test.sh (поднимает контейнер с Chromium).
- * Переменные: DS_URL (по умолч. http://nginx), ADMIN_USER, ADMIN_PASS.
+ * Переменные: DS_URL (по умолч. http://nginx), ADMIN_USER, ADMIN_PASS,
+ * E2E_ALLOW_BROADCAST=1 — шаг с включением общего эфира (он идёт на ВСЕ экраны,
+ * только на стенде; без переменной шаг пропускается с пометкой).
  */
 const puppeteer = require('puppeteer');
 
@@ -47,6 +59,8 @@ const CLIP_TITLE = `E2E_ролик_${STAMP}`;
 const CLIP_QUERY = `ролик_${STAMP}`;        // часть названия: проверяем и поиск по подстроке
 const FIXTURE_SCREEN = `E2E_стенд_${STAMP}`;
 const DUP_TITLE = `E2E_дубль_${STAMP}`;
+const NL_PLAYLIST = `E2E_эфир_${STAMP}`;      // плейлист для страницы «Эфир сети» (свой, отдельно от цикла «плейлист»)
+const BC_ALLOWED = process.env.E2E_ALLOW_BROADCAST === '1';
 
 // Разделы левого меню: [data-nav, заголовок в шапке].
 const SECTIONS = [
@@ -90,6 +104,7 @@ const SAFE_ACTIONS = new Set([
   'settings-close-edit-user-modal',
   'ticker-target-all', 'ticker-target-one', 'ticker-pick-color', 'ticker-toggle-screen',
   'dashboard-open-broadcast',
+  'nl-open-playlist', 'nl-close-drawer',
   'adv-open', 'adv-back', 'adv-tab', 'adv-apply-period',
 ]);
 
@@ -242,6 +257,59 @@ function addDays(iso, n) {
   return d.toISOString().slice(0, 10);
 }
 
+const hh = n => String(n).padStart(2, '0');
+
+/** Сигнал тестового экрана «как у агента»: X-Token, статус online, играет ролик file.
+ *  Возвращает HTTP-код. Экран после него «в сети» (последний сигнал не старше 5 минут). */
+async function heartbeat(page, id, token, file) {
+  return page.evaluate(async (id, token, file) => {
+    const r = await fetch('/api/heartbeat/' + id, {
+      method: 'POST',
+      headers: { 'X-Token': token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'online', playing_file: file || null }),
+    });
+    return r.status;
+  }, id, token, file);
+}
+
+/** «Сейчас» глазами сервера (наивное МСК из GET /network/live): дата, час, минута, секунда. */
+async function serverNow(page) {
+  const r = await apiCall(page, 'GET', '/network/live');
+  const g = String((r.data || {}).generated_at || '');        // «2026-10-29T13:56:05»
+  return { date: g.slice(0, 10), hour: parseInt(g.slice(11, 13), 10),
+           minute: parseInt(g.slice(14, 16), 10), second: parseInt(g.slice(17, 19), 10) };
+}
+
+/** Час «до» для POST /broadcast/on по сроку эфира из GET /broadcast: до 24:00 = 24, null — «до отмены». */
+function untilHourOf(untilAt) {
+  if (!untilAt) return null;
+  const h = parseInt(untilAt.slice(11, 13), 10), m = parseInt(untilAt.slice(14, 16), 10),
+        s = parseInt(untilAt.slice(17, 19), 10);
+  return (h === 0 && m === 0 && s === 0) ? 24 : h + ((m || s) ? 1 : 0);
+}
+
+/** Вернуть общий эфир в состояние до прогона (если шаг его трогал). Лишних записей в
+ *  журнале не плодит: состояние уже прежнее — ничего не шлёт. */
+async function restoreBroadcast(page, fx) {
+  if (!fx.bc || !fx.bc.dirty) return;
+  fx.bc.dirty = false;
+  const prev = fx.bc.prev || {};
+  const cur = (await apiCall(page, 'GET', '/broadcast')).data || {};
+  if (!prev.is_on) {
+    if (!cur.is_on) { ok('общий эфир выключен, как и было'); return; }
+    const r = await apiCall(page, 'POST', '/broadcast/off');
+    r.status === 200 ? ok('общий эфир выключен, как и было') : bad(`не удалось выключить общий эфир (HTTP ${r.status})`);
+    return;
+  }
+  if (cur.is_on && cur.playlist_id === prev.playlist_id && cur.until_at === prev.until_at) {
+    ok('прежний общий эфир на месте'); return;
+  }
+  const r = await apiCall(page, 'POST', '/broadcast/on',
+    { json: { playlist_id: prev.playlist_id, until_hour: untilHourOf(prev.until_at) } });
+  r.status === 200 ? ok(`прежний общий эфир возвращён (плейлист #${prev.playlist_id})`)
+                   : bad(`не удалось вернуть прежний общий эфир (HTTP ${r.status})`);
+}
+
 (async () => {
   console.log('════════════════════════════════════════════');
   console.log(' UI/E2E ТЕСТ ПАНЕЛИ — ' + new Date().toLocaleString('ru-RU'));
@@ -271,7 +339,8 @@ function addDays(iso, n) {
   });
 
   // Что прогон создал сам и должен убрать (даже если проверка упала).
-  const fx = { screenId: null, mediaId: null };
+  // token/clipFile — для сигналов тестового экрана; bc — состояние общего эфира до шага «Эфир сети».
+  const fx = { screenId: null, mediaId: null, token: null, clipFile: null, bc: null };
 
   try {
     // ── 1. Вход ────────────────────────────────────────────────────────────
@@ -308,6 +377,7 @@ function addDays(iso, n) {
       `/minipc/register?name=${encodeURIComponent(FIXTURE_SCREEN)}&city=E2E`);
     if (scr.status === 200 && scr.data && scr.data.id) {
       fx.screenId = scr.data.id;
+      fx.token = scr.data.token;
       ok(`тестовый экран заведён (id ${fx.screenId})`);
     } else {
       bad(`тестовый экран не заведён (HTTP ${scr.status})`);
@@ -318,6 +388,7 @@ function addDays(iso, n) {
       { file: { b64: makePng(STAMP).toString('base64'), type: 'image/png', name: `e2e_${STAMP}.png` } });
     if (clip.status === 200 && clip.data && clip.data.id && clip.data.review_status === 'approved') {
       fx.mediaId = clip.data.id;
+      fx.clipFile = clip.data.filename;
       ok(`тестовый ролик загружен и одобрен (id ${fx.mediaId})`);
     } else {
       if (clip.data && clip.data.id) fx.mediaId = clip.data.id;       // чтобы уборка его нашла
@@ -719,6 +790,351 @@ function addDays(iso, n) {
       await closeModals(page).catch(() => {});
     }
 
+    // ── 6а. Правило «в сети» и страница «Эфир сети» ────────────────────────
+    // Своё: плейлист «E2E_эфир_…» с тестовым роликом и показ на ТЕКУЩИЙ час только на
+    // собственный экран прогона — чтобы в таблице у него «сейчас идёт» была плашка.
+    // Плейлист уходит в уборку (показ — вместе с ним). Общий эфир включается ТОЛЬКО
+    // при E2E_ALLOW_BROADCAST=1: он идёт на все экраны сети; прежнее состояние
+    // возвращается всегда (в конце шага и страховкой в общей уборке).
+    head('Правило «в сети» и страница «Эфир сети»');
+    const nl = { plId: null };
+    try {
+      if (!fx.screenId || !fx.mediaId || !fx.token) throw new Error('нет тестового экрана или ролика — проверять не на чем');
+      dialogMode = 'dismiss';
+      const bcPrev = (await apiCall(page, 'GET', '/broadcast')).data || {};
+      const bcOn = !!bcPrev.is_on;       // эфир уже включён до прогона: таблица показывает его, а не расписание
+      if (bcOn && BC_ALLOWED) {
+        // стенд в состоянии «эфир идёт»: выключаем на время прогона, в конце вернём как было
+        fx.bc = { prev: bcPrev, dirty: true };
+        const off = await apiCall(page, 'POST', '/broadcast/off');
+        if (off.status !== 200) throw new Error(`не удалось выключить прежний эфир (HTTP ${off.status})`);
+        console.log('    на стенде уже шёл общий эфир — выключен на время прогона, вернём в конце');
+      } else if (bcOn) {
+        console.log('    на стенде идёт общий эфир: проверки «источника» и окна включения пропускаются (E2E_ALLOW_BROADCAST не задан)');
+      }
+      const noBc = !bcOn || BC_ALLOWED;   // общий эфир сейчас не мешает проверкам «сейчас идёт»
+
+      // ── «в сети»: одно правило в «Экранах» и на дашборде ──
+      step = 'в сети: экран без сигнала';
+      const cellsOf = async (nav) => {
+        await gotoSection(page, nav);
+        return page.evaluate(n => [...document.querySelectorAll('#view .cell')]
+          .filter(el => el.innerText.includes(n)).map(el => el.innerText.replace(/\s+/g, ' ')), FIXTURE_SCREEN);
+      };
+      const NAVS = [['screens', 'Экраны'], ['dash', 'Дашборд']];
+      for (const [nav, title] of NAVS) {
+        const t = await cellsOf(nav);
+        if (!t.length) bad(`${title}: тестового экрана нет в разделе`);
+        else if (t.every(x => /ни разу не выходил на связь/.test(x))) ok(`${title}: экран без сигнала — «ни разу не выходил на связь»`);
+        else bad(`${title}: экран без сигнала показан не так: «${t[0].slice(0, 100)}»`);
+      }
+      step = 'в сети: сигнал получен';
+      const hb = await heartbeat(page, fx.screenId, fx.token, fx.clipFile);
+      hb === 200 ? ok('сигнал тестового экрана принят (X-Token, как у агента)') : bad(`сигнал тестового экрана: HTTP ${hb}`);
+      for (const [nav, title] of NAVS) {
+        const t = await cellsOf(nav);
+        if (!t.length) bad(`${title}: тестового экрана нет в разделе`);
+        else if (t.every(x => !/ни разу не выходил|не в сети/.test(x))) ok(`${title}: после сигнала экран в сети`);
+        else bad(`${title}: после сигнала экран всё ещё не в сети: «${t[0].slice(0, 100)}»`);
+      }
+
+      // ── свой плейлист и показ на текущий час ──
+      step = 'эфир сети: плейлист и показ';
+      const mk = await apiCall(page, 'POST', '/playlists/full',
+        { json: { name: NL_PLAYLIST, items: [{ media_id: fx.mediaId }] } });
+      if (mk.status !== 200 || !mk.data || !mk.data.id) throw new Error(`плейлист для «Эфира сети» не создан (HTTP ${mk.status})`);
+      nl.plId = mk.data.id;
+      const now0 = await serverNow(page);
+      const hFrom = now0.hour, hTo = Math.min(hFrom + 2, 24);      // два часа — запас на стык часов
+      const plcBody = { playlist_id: nl.plId, screen_ids: [fx.screenId],
+                        date_from: now0.date, date_to: now0.date, hour_from: hFrom, hour_to: hTo };
+      const pv = await apiCall(page, 'POST', '/placements/preview', { json: plcBody });
+      const decisions = ((pv.data || {}).conflicts || []).map(c => (
+        { screen_id: c.screen_id, other_kind: c.other_kind, other_id: c.other_id, mode: 'replace' }));
+      const plc = await apiCall(page, 'POST', '/placements', { json: { ...plcBody, decisions } });
+      if (plc.status !== 200) throw new Error(`показ на текущий час не создан (HTTP ${plc.status})`);
+      ok(`плейлист «${NL_PLAYLIST}» и показ на ${hh(hFrom)}:00 – ${hh(hTo)}:00 только на свой экран созданы`);
+
+      // ── таблица ──
+      step = 'эфир сети: таблица';
+      await heartbeat(page, fx.screenId, fx.token, fx.clipFile);
+      await gotoSection(page, 'broadcast');
+      const rowSel = `#nl-main tr[data-screen-id="${fx.screenId}"]`;
+      await page.waitForSelector(rowSel, { timeout: 15000 });
+      ok('страница «Эфир сети» открылась, в таблице есть тестовый экран');
+      const stat = await page.$eval('#nl-stat', el => el.innerText.replace(/\s+/g, ' '));
+      (/\d+ экран/.test(stat) && /\d+ в сети/.test(stat) && /\d+ не в сети/.test(stat) && /обновлено \d\d:\d\d:\d\d/.test(stat))
+        ? ok(`шапка: «${stat}»`) : bad(`шапка страницы не та: «${stat}»`);
+      const heads = await page.$$eval('#nl-main thead th', els => els.map(e => e.textContent.trim()));
+      const lastHead = noBc ? 'Дальше' : 'После эфира';     // «После эфира» — только пока идёт общий эфир
+      (heads.join('|') === `Экран|Сейчас идёт|Играет ролик|${lastHead}`)
+        ? ok(`колонки таблицы: ${heads.join(' · ')}`) : bad(`колонки таблицы: ${heads.join(' · ')}`);
+      const row = await page.evaluate(sel => {
+        const tr = document.querySelector(sel);
+        return {
+          text: tr.innerText.replace(/\s+/g, ' '),
+          dot: (tr.querySelector('.nl-dot') || document.body).getAttribute('aria-label') || '',
+          plaques: [...tr.querySelectorAll('[data-action="nl-open-playlist"]')]
+            .map(b => ({ id: Number(b.dataset.playlistId), name: b.dataset.playlistName })),
+          clip: (tr.querySelector('[data-action="nl-preview-clip"]') || {}).innerText || '',
+        };
+      }, rowSel);
+      (row.text.includes(FIXTURE_SCREEN) && row.dot === 'в сети')
+        ? ok('в строке экрана: название, точка «в сети»') : bad(`строка экрана не та: «${row.text.slice(0, 100)}», точка «${row.dot}»`);
+      row.plaques.some(p => p.id === nl.plId && p.name === NL_PLAYLIST)
+        ? ok('у экрана плашка его плейлиста') : bad(`в строке нет плашки плейлиста «${NL_PLAYLIST}»`);
+      row.clip.includes(CLIP_TITLE) ? ok('«Играет ролик»: название ролика, который сообщил экран')
+                                    : bad(`«Играет ролик» не показал ролик «${CLIP_TITLE}»: «${row.clip}»`);
+      if (noBc) {
+        /📅 показ/.test(row.text) ? ok('источник: «📅 показ»') : bad(`источник строки не «📅 показ»: «${row.text.slice(0, 140)}»`);
+      }
+
+      // ── поиск ──
+      step = 'эфир сети: поиск';
+      const setSearch = async (v) => {
+        await page.$eval('#nl-search', (el, val) => {
+          el.value = val; el.dispatchEvent(new Event('input', { bubbles: true }));
+        }, v);
+        await sleep(200);
+      };
+      const rowCount = () => page.$$eval('#nl-main tbody tr', els => els.length);
+      await setSearch(FIXTURE_SCREEN);
+      const byName = await page.$$eval('#nl-main tbody tr', els => els.map(e => Number(e.dataset.screenId)));
+      const foundTxt = await page.$eval('#nl-stat', el => el.innerText.replace(/\s+/g, ' '));
+      (byName.length === 1 && byName[0] === fx.screenId && /найдено 1/.test(foundTxt))
+        ? ok('поиск по названию экрана оставил одну строку, в шапке «найдено 1»')
+        : bad(`поиск по названию: строк ${byName.length}, шапка «${foundTxt}»`);
+      await setSearch(NL_PLAYLIST.toUpperCase());
+      const byPl = await page.$$eval('#nl-main tbody tr', els => els.map(e => Number(e.dataset.screenId)));
+      byPl.includes(fx.screenId) ? ok('поиск по названию плейлиста (без учёта регистра) находит экран')
+                                 : bad('поиск по названию плейлиста не нашёл экран');
+      await setSearch('нет_такого_' + STAMP);
+      const none = await page.$eval('#nl-main', el => el.innerText);
+      /Ничего не найдено по запросу/.test(none) ? ok('пустой поиск: «Ничего не найдено по запросу…»')
+                                                : bad(`пустой поиск без подсказки: «${none.slice(0, 80)}»`);
+      await setSearch('');
+      (await rowCount()) >= 1 && (await page.$(rowSel)) ? ok('очистка поиска вернула таблицу') : bad('после очистки поиска таблица не вернулась');
+
+      // ── панель «О плейлисте» ──
+      step = 'эфир сети: панель плейлиста';
+      const plaqueSel = `${rowSel} [data-action="nl-open-playlist"][data-playlist-id="${nl.plId}"]`;
+      await page.click(plaqueSel);
+      const drawerReady = await waitUntil(page, (n) => {
+        const d = document.getElementById('nl-drawer');
+        // textContent, а не innerText: подписи разделов в панели набраны капсом (text-transform)
+        return !!d && !d.hidden && d.textContent.includes(n[0]) && /Где и когда идёт/.test(d.textContent);
+      }, [CLIP_TITLE], 12000);
+      drawerReady ? ok('клик по плашке открыл панель «О плейлисте» с роликами и показами') : bad('панель плейлиста не открылась или не загрузилась');
+      const dr = await page.evaluate(() => ({
+        title: (document.getElementById('nl-drawer-title') || {}).textContent || '',
+        sub: (document.querySelector('#nl-drawer .nl-sub') || {}).textContent || '',
+        text: document.getElementById('nl-drawer').textContent.replace(/\s+/g, ' '),
+        sel: !!document.querySelector('#nl-main .nl-pl.sel'),
+      }));
+      dr.title === NL_PLAYLIST ? ok('в панели название плейлиста') : bad(`заголовок панели «${dr.title}»`);
+      /^1 ролик · 1 показ · \d+:\d\d · (как есть|блок \d+ мин с заглушками)$/.test(dr.sub.trim())
+        ? ok(`сводка панели: «${dr.sub.trim()}»`) : bad(`сводка панели не та: «${dr.sub}»`);
+      dr.sel ? ok('плашка открытого плейлиста подсвечена') : bad('плашка открытого плейлиста не подсвечена');
+      if (noBc) {
+        /Сейчас идёт на 1 экране/.test(dr.text) && dr.text.includes(FIXTURE_SCREEN)
+          ? ok('панель: «Сейчас идёт на 1 экране» — тестовый экран') : bad(`панель не показала «Сейчас идёт на 1 экране»: «${dr.text.slice(0, 160)}»`);
+      }
+      (dr.text.includes(FIXTURE_SCREEN) && dr.text.includes(`${hh(hFrom)}–${hh(hTo)} ч`) && /идёт сейчас/.test(dr.text))
+        ? ok(`«Где и когда идёт»: показ на свой экран, ${hh(hFrom)}–${hh(hTo)} ч, «идёт сейчас»`)
+        : bad(`«Где и когда идёт» не сошлось: «${dr.text.slice(0, 200)}»`);
+
+      step = 'эфир сети: просмотр ролика из панели';
+      await page.click('#nl-drawer [data-action="nl-preview-clip"]');
+      (await waitUntil(page, () => !!document.querySelector('.modal-mprev video, .modal-mprev img'), null, 10000))
+        ? ok('клик по ролику в панели открыл просмотр') : bad('просмотр ролика из панели не открылся');
+      await page.keyboard.press('Escape');
+      (await waitUntil(page, () => !document.querySelector('.modal-backdrop'), null, 5000))
+        ? ok('Esc закрыл просмотр') : bad('просмотр не закрылся по Esc');
+      (await page.$('#nl-drawer:not([hidden])')) ? ok('панель плейлиста осталась открытой') : bad('Esc закрыл заодно и панель плейлиста');
+
+      step = 'эфир сети: правка плейлиста поверх страницы';
+      await page.click('#nl-drawer [data-action="nl-edit-playlist"]');
+      await page.waitForSelector('#pled-name', { timeout: 10000 });
+      const ed = await page.evaluate(() => ({
+        name: document.getElementById('pled-name').value,
+        sel: document.querySelectorAll('.pled-tile.sel').length,
+        info: (document.querySelector('.pled-info') || {}).innerText || '',
+      }));
+      (ed.name === NL_PLAYLIST && ed.sel === 1)
+        ? ok('«✎ Изменить плейлист» открыл окно правки с названием и роликом') : bad(`окно правки не то: название «${ed.name}», выбрано ${ed.sel}`);
+      if (noBc) {
+        /Плейлист сейчас идёт на 1 экране — изменения дойдут до него в течение минуты/.test(ed.info.replace(/\s+/g, ' '))
+          ? ok('в окне подсказка «идёт на 1 экране — изменения дойдут до него в течение минуты»') : bad(`подсказки про экраны нет: «${ed.info}»`);
+      }
+      await page.keyboard.press('Escape');
+      (await waitUntil(page, () => !document.querySelector('.modal-backdrop'), null, 5000))
+        ? ok('Esc закрыл окно правки без сохранения') : bad('окно правки не закрылось по Esc');
+      (await page.$('#nl-root')) && (await page.$('#nl-drawer:not([hidden])'))
+        ? ok('пользователь остался на «Эфире сети», панель на месте') : bad('после правки страница или панель пропали');
+
+      step = 'эфир сети: отправка на экраны из панели';
+      await page.click('#nl-drawer [data-action="nl-send-playlist"]');
+      (await waitUntil(page, () => !!document.getElementById('plc-date-from'), null, 10000))
+        ? ok('«📤 Отправить на экраны» открыла «Куда и когда»') : bad('«Отправить на экраны» не открыла окно');
+      await page.keyboard.press('Escape');
+      (await waitUntil(page, () => !document.querySelector('.modal-backdrop'), null, 5000))
+        ? ok('окно «Куда и когда» закрылось по Esc') : bad('окно «Куда и когда» не закрылось по Esc');
+
+      step = 'эфир сети: закрытие панели';
+      await page.click('#nl-drawer [data-action="nl-close-drawer"]');
+      (await waitUntil(page, () => document.getElementById('nl-drawer').hidden, null, 5000))
+        ? ok('✕ закрыл панель') : bad('✕ не закрыл панель');
+      const back = await page.evaluate(() => (document.activeElement || {}).dataset && document.activeElement.dataset.action);
+      back === 'nl-open-playlist' ? ok('фокус вернулся на плашку плейлиста') : bad(`фокус после закрытия панели на «${back}»`);
+      await page.click(plaqueSel);
+      await waitUntil(page, () => !document.getElementById('nl-drawer').hidden, null, 5000);
+      await page.keyboard.press('Escape');
+      (await waitUntil(page, () => document.getElementById('nl-drawer').hidden, null, 5000))
+        ? ok('Esc закрывает панель') : bad('Esc не закрыл панель');
+
+      // ── полоса общего эфира и окно включения ──
+      // окно: открыть кнопкой полосы, выбрать свой плейлист (серый выбрать нельзя)
+      const openWindow = async (btn) => {
+        await page.click(`#nl-broadcast [data-action="${btn}"]`);
+        await page.waitForSelector('#bc-pls .bc-pl', { timeout: 10000 });
+      };
+      const pickMine = async () => {
+        const label = await page.$(`#bc-pls .bc-pl[data-id="${nl.plId}"]`);
+        if (!label) throw new Error('в окне эфира нет тестового плейлиста');
+        const st = await page.evaluate(el => ({ dis: el.classList.contains('dis'),
+          disabled: el.querySelector('input').disabled }), label);
+        if (st.dis || st.disabled) throw new Error('тестовый плейлист в окне эфира серый (нечего играть)');
+        await label.click();
+        await waitUntil(page, n => (document.getElementById('bc-picked') || {}).innerText.includes(n), NL_PLAYLIST, 5000);
+      };
+      if (bcOn && !BC_ALLOWED) {
+        console.log('  – полоса и окно общего эфира — пропущено (на стенде уже идёт эфир, E2E_ALLOW_BROADCAST не задан)');
+      } else {
+        step = 'общий эфир: полоса и окно';
+        await gotoSection(page, 'broadcast');
+        const offBar = await waitUntil(page,
+          () => !!document.querySelector('#nl-broadcast .bc-bar.off [data-action="bc-open"]'), null, 10000);
+        offBar ? ok('полоса: «Общий эфир выключен», кнопка «Включить общий эфир…»') : bad('полосы выключенного эфира нет');
+        await openWindow('bc-open');
+        const w1 = await page.evaluate(() => ({
+          title: document.querySelector('.modal-bc .modal-title').textContent,
+          untilOn: document.querySelector('input[data-action="bc-duration"][data-mode="until"]').checked,
+          hours: [...document.querySelectorAll('#bc-until-hour option')].map(o => Number(o.value)),
+          hour: Number(document.getElementById('bc-until-hour').value),
+          submit: document.getElementById('bc-submit').disabled,
+        }));
+        w1.title === 'Включить общий эфир на все экраны' ? ok('окно «Включить общий эфир на все экраны» открылось') : bad(`заголовок окна эфира «${w1.title}»`);
+        w1.submit ? ok('пока плейлист не выбран, «Включить» недоступна') : bad('«Включить» доступна без выбранного плейлиста');
+        (w1.untilOn && w1.hours.length >= 1 && w1.hours[w1.hours.length - 1] === 24 && w1.hour === w1.hours[0] && w1.hours[0] > now0.hour)
+          ? ok(`по умолчанию «до ${hh(w1.hour)}:00» (список часов: следующий … 24)`) : bad(`часы окна: по умолчанию ${w1.hour}, список ${w1.hours.join(',')}`);
+        await pickMine();
+        const w2 = await page.evaluate(() => ({
+          warn: document.getElementById('bc-warn').innerText.replace(/\s+/g, ' '),
+          submit: document.getElementById('bc-submit').innerText.trim(),
+          off: document.getElementById('bc-submit').disabled,
+        }));
+        (/будет идти только этот плейлист/.test(w2.warn) && /Показы по датам, расписание и замены/.test(w2.warn))
+          ? ok('жёлтое предупреждение: «… будет идти только этот плейлист. Показы по датам, расписание и замены … перекрываются»')
+          : bad(`предупреждение окна не то: «${w2.warn}»`);
+        (!w2.off && /^Включить на \d+ экран/.test(w2.submit)) ? ok(`кнопка: «${w2.submit}»`) : bad(`кнопка окна после выбора: «${w2.submit}», недоступна=${w2.off}`);
+        await page.click('#bc-cancel');
+        (await waitUntil(page, () => !document.querySelector('.modal-backdrop'), null, 5000))
+          ? ok('«Отмена» закрыла окно') : bad('«Отмена» не закрыла окно');
+        const still = (await apiCall(page, 'GET', '/broadcast')).data || {};
+        (still.is_on === false) ? ok('после «Отмена» эфир не включился') : bad('после «Отмена» общий эфир включён!');
+      }
+
+      // ── включение эфира: только на стенде ──
+      if (!BC_ALLOWED) {
+        console.log('  – включение общего эфира на все экраны — пропущено (задайте E2E_ALLOW_BROADCAST=1 на стенде)');
+      } else {
+        step = 'общий эфир: включение';
+        if (!fx.bc) fx.bc = { prev: bcPrev, dirty: false };
+        // в последние секунды часа ждём следующий: эфир «до следующего часа» не должен кончиться посреди проверки
+        const n1 = await serverNow(page);
+        if (n1.minute === 59 && n1.second >= 30) {
+          console.log('    конец часа — ждём следующий, чтобы эфир не кончился посреди проверки');
+          await sleep((63 - n1.second) * 1000);
+        }
+        await gotoSection(page, 'broadcast');
+        await heartbeat(page, fx.screenId, fx.token, fx.clipFile);
+        await waitUntil(page, () => !!document.querySelector('#nl-broadcast .bc-bar.off'), null, 10000);
+        fx.bc.dirty = true;                 // дальше эфир могут включить — вернуть прежнее в любом случае
+        await openWindow('bc-open');
+        await pickMine();
+        const hourOf = () => page.$eval('#bc-until-hour', el => Number(el.value));
+        let hour = await hourOf();
+        await page.click('#bc-submit');
+        let closed = await waitUntil(page, () => !document.querySelector('.modal-backdrop'), null, 10000);
+        if (!closed) {
+          const err = await page.$eval('#bc-err', el => el.textContent.trim()).catch(() => '');
+          if (/Время изменилось/.test(err)) {      // час сменился между открытием и отправкой: окно пересобрало список
+            hour = await hourOf();
+            await page.click('#bc-submit');
+            closed = await waitUntil(page, () => !document.querySelector('.modal-backdrop'), null, 10000);
+          }
+          if (!closed) {
+            bad(`окно включения не закрылось${err ? ' — ' + err : ''}`);
+            await closeModals(page);
+          }
+        }
+        if (closed) ok(`«Включить на … экранах» отправила запрос, окно закрылось (до ${hh(hour)}:00)`);
+
+        step = 'общий эфир: жёлтая полоса';
+        const barOn = await waitUntil(page,
+          () => !!document.querySelector('#nl-broadcast .bc-bar.on [data-action="bc-off"]'), null, 15000);
+        barOn ? ok('полоса стала жёлтой (включён), есть «Сменить плейлист» и «Выключить»') : bad('жёлтой полосы нет после включения');
+        const bar = await page.$eval('#nl-broadcast', el => el.innerText.replace(/\s+/g, ' ')).catch(() => '');
+        (bar.includes(`«${NL_PLAYLIST}»`) && bar.includes(`до ${hh(hour)}:00`) && /осталось/.test(bar)
+          && bar.includes('включил ' + USER) && /расписание на это время перекрыто/.test(bar))
+          ? ok(`полоса: плейлист, «до ${hh(hour)}:00 (осталось …)», «включил ${USER}», «расписание … перекрыто»`)
+          : bad(`текст полосы не тот: «${bar}»`);
+        await waitUntil(page, () => [...document.querySelectorAll('#nl-main thead th')].some(t => t.textContent.trim() === 'После эфира'), null, 15000);
+        const rowB = await page.$eval(rowSel, el => el.innerText.replace(/\s+/g, ' ')).catch(() => '');
+        (rowB.includes(`общий эфир до ${hh(hour)}:00`))
+          ? ok(`таблица: у экрана «📡 общий эфир до ${hh(hour)}:00», последняя колонка — «После эфира»`)
+          : bad(`строка экрана при эфире не та: «${rowB.slice(0, 160)}»`);
+        const feedOn = ((await apiCall(page, 'GET', '/dashboard')).data || {}).feed || [];
+        feedOn.some(x => ['Общий эфир включён', 'Общий эфир сменён'].includes(x.title) && (x.detail || '').includes(NL_PLAYLIST)
+                         && (x.detail || '').includes(`до ${hh(hour)}:00`))
+          ? ok(`в журнале: «Общий эфир включён … до ${hh(hour)}:00»`) : bad('в журнале нет записи о включении эфира');
+
+        step = 'общий эфир: окно «Сменить плейлист»';
+        await openWindow('bc-change');
+        const wc = await page.evaluate(() => ({
+          title: document.querySelector('.modal-bc .modal-title').textContent,
+          checked: Number((document.querySelector('#bc-pls input:checked') || {}).value),
+          submit: document.getElementById('bc-submit').innerText.trim(),
+        }));
+        (wc.title === 'Сменить плейлист общего эфира' && wc.checked === nl.plId && wc.submit === 'Сменить плейлист')
+          ? ok('окно «Сменить плейлист общего эфира»: выбран текущий плейлист, кнопка «Сменить плейлист»')
+          : bad(`окно смены эфира не то: «${wc.title}», выбран #${wc.checked}, кнопка «${wc.submit}»`);
+        await page.keyboard.press('Escape');
+        (await waitUntil(page, () => !document.querySelector('.modal-backdrop'), null, 5000))
+          ? ok('Esc закрыл окно смены без изменений') : bad('окно смены не закрылось по Esc');
+
+        step = 'общий эфир: выключение';
+        dialogMode = 'accept';             // confirm() «Выключить общий эфир?»
+        await page.click('#nl-broadcast [data-action="bc-off"]');
+        const barOff2 = await waitUntil(page, () => !!document.querySelector('#nl-broadcast .bc-bar.off'), null, 15000);
+        dialogMode = 'dismiss';
+        barOff2 ? ok('«Выключить» (с подтверждением): полоса снова серая') : bad('после «Выключить» полоса не стала серой');
+        await waitUntil(page, () => [...document.querySelectorAll('#nl-main thead th')].some(t => t.textContent.trim() === 'Дальше'), null, 15000);
+        const heads2 = await page.$$eval('#nl-main thead th', els => els.map(e => e.textContent.trim()));
+        heads2[3] === 'Дальше' ? ok('последняя колонка снова «Дальше»') : bad(`колонки после выключения: ${heads2.join(' · ')}`);
+        const offState = (await apiCall(page, 'GET', '/broadcast')).data || {};
+        offState.is_on === false ? ok('GET /broadcast: эфир выключен') : bad('эфир остался включённым после «Выключить»');
+        const feedOff = ((await apiCall(page, 'GET', '/dashboard')).data || {}).feed || [];
+        feedOff.some(x => x.title === 'Общий эфир выключен') ? ok('в журнале: «Общий эфир выключен»') : bad('в журнале нет записи о выключении эфира');
+      }
+    } catch (e) {
+      bad('«Эфир сети» прерван на шаге «' + step + '»: ' + e.message.split('\n')[0]);
+    } finally {
+      dialogMode = 'dismiss';
+      await closeModals(page).catch(() => {});
+      try { await restoreBroadcast(page, fx); } catch (e) { bad('эфир не возвращён: ' + e.message.split('\n')[0]); }
+    }
+
     // ── 7. Карточка рекламодателя: все вкладки открываются ────────────────
     head('Карточка рекламодателя');
     step = 'открытие карточки';
@@ -841,6 +1257,9 @@ function addDays(iso, n) {
     bad('прогон прерван: ' + e.message.split('\n')[0]);
   } finally {
     // ── Уборка: всё, что прогон создал сам, убирается ВСЕГДА — и когда проверка выше упала ──
+    // Общий эфир — первым делом: пока он включён, он идёт на все экраны сети (страховка;
+    // в норме шаг «Эфир сети» уже вернул прежнее состояние и здесь ничего не делает).
+    try { await restoreBroadcast(page, fx); } catch (e) { bad('эфир не возвращён: ' + e.message.split('\n')[0]); }
     if (fx.screenId || fx.mediaId) {
       head('Уборка тестовых объектов');
       step = 'уборка';
@@ -849,9 +1268,9 @@ function addDays(iso, n) {
         await closeModals(page);
         // Плейлист ищем по названию: цикл мог упасть до удаления. Показы уходят вместе с ним.
         const pls = await apiCall(page, 'GET', '/playlists');
-        for (const p of (pls.data || []).filter(p => p.name === PLAYLIST_NAME)) {
+        for (const p of (pls.data || []).filter(p => p.name === PLAYLIST_NAME || p.name === NL_PLAYLIST)) {
           const r = await apiCall(page, 'DELETE', '/playlists/' + p.id);
-          r.status === 200 ? ok('недоудалённый тестовый плейлист убран (вместе с показами)')
+          r.status === 200 ? ok(`тестовый плейлист «${p.name}» убран (вместе с показами)`)
                            : bad(`тестовый плейлист не удалился (HTTP ${r.status})`);
         }
         // Копия, если шаг про дубль всё же загрузил её (в норме её нет)
