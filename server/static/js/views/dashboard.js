@@ -1,3 +1,11 @@
+// Срок общего эфира для плитки: «до 16:00» / «до 24:00» / «до отмены». Время от сервера —
+// наивное МСК, поэтому ЧЧ:ММ берётся срезом строки (new Date() сдвинул бы пояс).
+function dashBcUntil(iso){
+  if(!iso) return 'до отмены';
+  const hm = String(iso).slice(11, 16);
+  return 'до ' + (hm === '00:00' ? '24:00' : hm);
+}
+
 async function viewDash(){
   const view=document.getElementById('view');
   try{
@@ -42,7 +50,8 @@ async function viewDash(){
     if(d.broadcast_on){
       h+=`<div class="banner on"><span class="dot" style="background:var(--accent);"></span>
         <div><div style="font-size:11px;color:var(--accent);text-transform:uppercase;letter-spacing:.4px;">Общий эфир включён</div>
-        <div style="font-weight:600;">${esc(d.broadcast_playlist||'')}</div></div>
+        <div style="font-weight:600;">${esc(d.broadcast_playlist||'')}</div>
+        <div class="muted" style="font-size:12px;">${esc(dashBcUntil(d.broadcast_until))}</div></div>
         <button class="btn" style="margin-left:auto;" data-action="dashboard-open-broadcast">Управлять</button></div>`;
     } else {
       h+=`<div class="banner off"><span class="dot" style="background:var(--dim);"></span>

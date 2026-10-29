@@ -35,6 +35,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from admin_panel import ad_sequence
+from broadcast_rules import until_text
 from broadcast_store import get_broadcast
 from deps import get_current_admin, get_db, require_write
 from placements_logic import (ALTERNATE, KIND_OVERRIDE, KIND_PLACEMENT, REPLACE, YIELD, alternate_overlaps,
@@ -46,7 +47,14 @@ from playlist_rules import overflow_minutes
 
 router = APIRouter()
 
-BROADCAST_NOTICE = "Сейчас включён «Эфир сети» — пока он включён, показы на экранах не идут"
+
+def broadcast_notice(bc: dict) -> str:
+    """Предупреждение предпросмотра показа про действующий общий эфир (bc — get_broadcast).
+
+    Эфир перекрывает показы не везде, а только на экранах, где его плейлисту есть что
+    играть, поэтому фраза про «все экраны» была бы неправдой."""
+    return (f"Сейчас включён «Эфир сети» ({until_text(bc['until_at'])}) — пока он действует, "
+            "на экранах, где ему есть что играть, он перекрывает показы")
 
 
 # --- чистые функции ----------------------------------------------------------
@@ -320,8 +328,9 @@ def preview_placement(body: dict = Body(...), admin: dict = Depends(require_writ
         item["screen_name"] = info.get(item["screen_id"], (f"Экран #{item['screen_id']}", "other"))[0]
 
     notices = []
-    if get_broadcast(db, now_msk())["is_on"]:    # действующий: истёкший срок — уже не эфир
-        notices.append(BROADCAST_NOTICE)
+    bc = get_broadcast(db, now_msk())
+    if bc["is_on"]:    # действующий: истёкший срок — уже не эфир
+        notices.append(broadcast_notice(bc))
 
     cache: dict[tuple[int, str], float] = {}
 

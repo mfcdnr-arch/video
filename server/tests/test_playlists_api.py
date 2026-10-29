@@ -13,7 +13,7 @@ from fastapi import HTTPException
 
 from conftest import db_row
 from routers.playlists import (_check_media, add_to_playlist, check_playlist, create_playlist_full,
-                               normalize_items, replace_playlist_items)
+                               list_playlists, normalize_items, replace_playlist_items)
 
 
 # --- normalize_items ----------------------------------------------------------
@@ -364,3 +364,35 @@ def test_replace_db_failure_rolls_back_and_reraises():
     with pytest.raises(RuntimeError):
         replace_playlist_items(5, {"name": "Х", "items": items((1, 1))}, {}, db)
     assert db.commits == 0 and db.rollbacks == 1
+
+
+# --- GET /playlists: флаг playable ---------------------------------------------
+
+class _ListDB:
+    """Сессия для GET /playlists: список плейлистов и id плейлистов с проигрываемыми роликами."""
+
+    def __init__(self, playlists, playable_ids):
+        self.playlists, self.playable_ids, self.calls = playlists, playable_ids, []
+
+    def execute(self, query, params=None):
+        sql = " ".join(str(query).split())
+        self.calls.append((sql, params))
+        if "FROM playlist_items" in sql:
+            return _Result([db_row(playlist_id=i) for i in self.playable_ids])
+        return _Result([db_row(_mapping={"id": i, "name": n}, id=i) for i, n in self.playlists])
+
+
+def test_list_playlists_marks_playlists_with_nothing_to_play():
+    db = _ListDB([(1, "Акции"), (2, "Пустой"), (3, "Всё на модерации")], playable_ids=[1])
+    assert list_playlists({}, db) == [
+        {"id": 1, "name": "Акции", "playable": True},
+        {"id": 2, "name": "Пустой", "playable": False},
+        {"id": 3, "name": "Всё на модерации", "playable": False}]
+
+
+def test_list_playlists_asks_playable_once_for_the_most_permissive_venue():
+    """Одним запросом, для площадки с алколицензией: реклама алкоголя тоже «может идти»."""
+    db = _ListDB([(1, "А"), (2, "Б")], playable_ids=[1, 2])
+    list_playlists({}, db)
+    playable_calls = [p for s, p in db.calls if "FROM playlist_items" in s]
+    assert playable_calls == [{"venue": "store_alcohol"}]

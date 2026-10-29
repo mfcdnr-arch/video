@@ -8,7 +8,8 @@ from datetime import date, datetime
 import pytest
 from fastapi import HTTPException
 from routers.placements import (parse_body, parse_decisions, unresolved, summary_text, overflow_notes,
-                                week_start, sort_listing, listing_row, check_stoppable, check_deletable)
+                                week_start, sort_listing, listing_row, check_stoppable, check_deletable,
+                                broadcast_notice)
 
 T = date(2026, 10, 26)
 B = {"playlist_id": 1, "all_screens": False, "screen_ids": [3], "date_from": "2026-11-01",
@@ -156,3 +157,13 @@ def test_check_deletable_only_planned():
             check_deletable(status)
         assert e.value.status_code == 409
         assert e.value.detail == "Показ уже идёт или закончился — используйте «Остановить»"
+
+
+def test_broadcast_notice_names_the_term_and_does_not_claim_all_screens():
+    """Эфир перекрывает показы только там, где ему есть что играть, — в фразе нет «показы не идут»."""
+    until = broadcast_notice({"until_at": datetime(2026, 10, 28, 16, 0)})
+    assert until == ("Сейчас включён «Эфир сети» (до 16:00) — пока он действует, "
+                     "на экранах, где ему есть что играть, он перекрывает показы")
+    assert "(до отмены)" in broadcast_notice({"until_at": None})
+    assert "(до 24:00)" in broadcast_notice({"until_at": datetime(2026, 10, 29, 0, 0)})
+    assert "не идут" not in until

@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from deps import get_db, get_current_admin, require_write
 from playlist_rules import repeat_warnings
+from routers.network import load_playable_by_venue
 
 router = APIRouter()
 
@@ -148,8 +149,14 @@ def create_playlist(name: str = Query(...), admin: dict = Depends(require_write)
 
 @router.get("/playlists")
 def list_playlists(admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
+    """Все плейлисты по названию. К полям таблицы добавлено `playable` — есть ли в плейлисте
+    хоть один ролик, который может идти на экране (готов, одобрен, срок не вышел; реклама
+    алкоголя считается: она идёт на площадке с алколицензией). Окно «Эфир сети» по нему
+    показывает серыми плейлисты, которым нечего играть. Фильтры роликов — те же, что у
+    «проигрываемых плейлистов» обзора сети (routers.network.load_playable_by_venue)."""
     rows = db.execute(text("SELECT * FROM playlists ORDER BY name")).fetchall()
-    return [dict(r._mapping) for r in rows]
+    playable = load_playable_by_venue(db, {"store_alcohol"})["store_alcohol"]
+    return [{**dict(r._mapping), "playable": r.id in playable} for r in rows]
 
 
 @router.post("/playlists/check")
