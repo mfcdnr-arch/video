@@ -85,7 +85,7 @@ def list_minipcs(admin: dict = Depends(get_current_admin), db: Session = Depends
                s.volume_day, s.volume_night, s.night_from, s.night_to,
                s.clock_drift_seconds, s.venue_type,
                s.display_connected, s.display_outputs, s.display_changed_at,
-               g.name as group_name
+               s.group_id, g.name as group_name
         FROM screens s
         LEFT JOIN sync_groups g ON g.id = s.group_id
         ORDER BY s.name

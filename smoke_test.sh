@@ -476,6 +476,13 @@ if [ -n "${SID:-}" ] && [ -n "${SCR_TOKEN:-}" ]; then
   else
     bad "экран без сигнала: ждали online=false и offline_for_seconds=null, HTTP $HTTP"
   fi
+  # вкладка «Экраны → Группы» раскладывает экраны по group_id: ключ должен быть в списке
+  # (null допустим), а если у экрана есть group_name — и group_id (экран сам попадает в «Все экраны»)
+  if body_has "any(x['id']==$SID and 'group_id' in x and (x['group_id'] is not None or x['group_name'] is None) for x in r)"; then
+    ok "GET /minipc отдаёт group_id экрана"
+  else
+    bad "GET /minipc: у экрана нет group_id (вкладка «Группы» не сможет разложить экраны)"
+  fi
   RESP=$($DC curl -s -w $'\n%{http_code}' -X POST "$API/heartbeat/$SID" -H "X-Token: $SCR_TOKEN" \
         -H 'Content-Type: application/json' -d '{"status":"online","playing_file":null}' 2>/dev/null)
   HTTP="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"

@@ -46,6 +46,16 @@ def test_templates_are_free_of_unfilled_placeholders():
     assert "{" not in offline_for_sql("s") and "}" not in offline_for_sql("s")
 
 
+def test_minipc_list_returns_group_id():
+    # вкладка «Экраны → Группы» (screens.js) раскладывает экраны по s.group_id:
+    # без этого поля в GET /minipc она всегда показывала «онлайн 0/0» и «без группы»
+    from routers import screens
+    src = inspect.getsource(screens.list_minipcs)
+    # именно в списке выбираемых колонок (JOIN ... ON g.id = s.group_id не в счёт)
+    select_list = src.split("SELECT", 1)[1].split("FROM screens", 1)[0]
+    assert "s.group_id" in select_list
+
+
 def test_routers_use_the_shared_rule():
     # «в сети» в списке экранов и на дашборде берётся из одного места, а не из screens.status
     from routers import screens, system
