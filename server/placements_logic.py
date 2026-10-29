@@ -338,7 +338,8 @@ KIND_EMPTY = "empty"
 
 
 def week_cells(days: list[date], screen_id: int, placements: list[dict], decisions: dict,
-               overrides: list[dict], slots: list[dict], names: dict[int, str]) -> list[dict]:
+               overrides: list[dict], slots: list[dict], names: dict[int, str],
+               playable: set[int] | None = None) -> list[dict]:
     """Что играет на экране `screen_id` в каждый час каждого из `days` (МСК).
 
     Источники по убыванию приоритета (спека §4.7, без «Эфира сети» — он живёт
@@ -349,7 +350,12 @@ def week_cells(days: list[date], screen_id: int, placements: list[dict], decisio
     overrides — переопределения (берутся только этого экрана),
     slots — слоты шаблона, уже выбранные для этого экрана (см. template_playlist),
     names — {playlist_id: название}; недостающее берётся из самих показов и
-    переопределений.
+    переопределений,
+    playable — id плейлистов, у которых на этом экране есть что играть (как
+    pick_active в ленте); None — не фильтровать. Плейлисты показов, которых в
+    playable нет, выпадают из часа до выбора источника: остальные играют как
+    обычно, а если не осталось ни одного — час проваливается к переопределению
+    с плейлистом, затем к шаблону (как лента с пустым показом).
 
     Клетка: {"date", "hour", "kind", "playlists": [названия], "playlist_ids": [id],
     "placement_id"}. kind: "off" | "placement" | "alternate" (в клетке ≥2
@@ -376,8 +382,17 @@ def week_cells(days: list[date], screen_id: int, placements: list[dict], decisio
         for hour in range(24):
             kind, ids, placement_id = KIND_EMPTY, [], None
             if not is_off:                       # уступленный переопределению час — ids пуст, см. ниже
-                ids, placement_id = _choose([p for p in mine if applies_at(p, day, hour)],
-                                            decisions, ov, screen_id)
+                applicable = [p for p in mine if applies_at(p, day, hour)]
+                ids, placement_id = _choose(applicable, decisions, ov, screen_id)
+                if playable is not None:
+                    kept = [i for i in ids if i in playable]
+                    if not kept:
+                        placement_id = None      # показов в этот час нет — дальше переопределение/шаблон
+                    elif kept[0] != ids[0]:      # плейлист вершины пуст — первым стал старший показ
+                        ordered = sorted(applicable, key=_recency, reverse=True)
+                        older = ordered[[p["id"] for p in ordered].index(placement_id) + 1:]
+                        placement_id = next((p["id"] for p in older if p["playlist_id"] == kept[0]), None)
+                    ids = kept
             if is_off:
                 kind = KIND_OFF
             elif ids:
