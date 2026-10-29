@@ -67,7 +67,7 @@ from routers import (
     auth, system, media, screens, playlists, schedule,
     ticker, agent_ota, users, backups, broadcast, reports, websockets,
     billing, campaigns, notifications, advertiser_office, advertiser_docs,
-    placements,
+    placements, network,
 )
 
 app.include_router(auth.router)
@@ -77,6 +77,7 @@ app.include_router(screens.router)
 app.include_router(playlists.router)
 app.include_router(schedule.router)
 app.include_router(placements.router)
+app.include_router(network.router)
 app.include_router(ticker.router)
 app.include_router(agent_ota.router)
 app.include_router(users.router)

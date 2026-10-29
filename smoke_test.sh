@@ -408,6 +408,19 @@ print(h.date(), h.hour, (h + d.timedelta(hours=1)).isoformat())" 2>/dev/null)
     if [ "$HTTP" = "200" ] && body_has "any(f['filename']=='$NOW_FILE' for f in r)"; then
       ok "ролик показа в списке закачки экрана"; else bad "ролика показа нет в списке закачки: HTTP $HTTP"; fi
 
+    # обзор сети («Эфир сети»): SMOKE-экран в таблице, «сейчас» — показ текущего часа до
+    # следующего целого часа (в 23 ч смены сегодня нет: until = null), сигнала ещё не было
+    req GET "/network/live"
+    if [ "$HTTP" = "200" ] && body_has "r['online_minutes']==5 and r['counts']['total']==len(r['screens']) and r['counts']['online']+r['counts']['offline']==r['counts']['total'] and r['broadcast']['screens_total']==len(r['screens'])"; then
+      ok "обзор сети: ответ собран, счётчики сходятся"; else bad "обзор сети: HTTP $HTTP"; fi
+    if [ -n "$BC_ON" ]; then
+      echo "  – включён «Эфир сети»: «сейчас» в обзоре — эфир, проверка показа пропущена"
+    elif body_has "any(x['id']==$SID and x['online'] is False and x['offline_for_seconds'] is None and x['playing'] is None and x['now']['kind']=='placement' and x['now']['playlist_ids']==[$PIDN] and (x['now']['until']=='$UNTIL' or ($HN==23 and x['now']['until'] is None)) and x['broadcast_skipped'] is False for x in r['screens']) and r['playlists']['$PIDN']['name']=='SMOKE_now_$STAMP'"; then
+      ok "обзор сети: SMOKE-экран — показ на текущий час до $UNTIL, не в сети"
+    else
+      bad "обзор сети: ждали показ #$PLCN до $UNTIL, получили HTTP $HTTP: $(echo "$BODY" | python3 -c "import sys,json;print([(x['online'], x['now']) for x in json.load(sys.stdin)['screens'] if x['id']==$SID])" 2>/dev/null)"
+    fi
+
     # пересечение: второй показ на тот же час — сначала «Заменить», потом правка на «Оставить …»
     PLCY=""
     if [ -n "${PID:-}" ]; then
@@ -504,6 +517,33 @@ if [ -n "${SID:-}" ] && [ -n "${SCR_TOKEN:-}" ]; then
 else
   bad "нет экрана или его токена — проверку «в сети» провести не на чем"
 fi
+
+# ── 4г-2. Обзор сети: «играет ролик» и слоты шаблона ─────────────────────────
+# Агент сообщил ролик (heartbeat с playing_file) → в обзоре сети экран в сети, ролик
+# сопоставлен с медиатекой (id и название); слоты недельного шаблона плейлиста считаются
+# (слот Пн 10:00 из основного цикла); неизвестный плейлист → 404.
+step "Обзор сети: ролик на экране и слоты шаблона"
+if [ -n "${SID:-}" ] && [ -n "${SCR_TOKEN:-}" ] && [ -n "${NOW_FILE:-}" ] && [ -n "${MID3:-}" ]; then
+  RESP=$($DC curl -s -w $'\n%{http_code}' -X POST "$API/heartbeat/$SID" -H "X-Token: $SCR_TOKEN" \
+        -H 'Content-Type: application/json' -d "{\"status\":\"online\",\"playing_file\":\"$NOW_FILE\"}" 2>/dev/null)
+  HTTP="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
+  [ "$HTTP" = "200" ] && ok "heartbeat с playing_file принят" || bad "heartbeat с playing_file: HTTP $HTTP"
+  req GET "/network/live"
+  if [ "$HTTP" = "200" ] && body_has "any(x['id']==$SID and x['online'] is True and x['offline_for_seconds'] < 60 and x['playing']=={'media_id': $MID3, 'title': 'SMOKE_media2_$STAMP', 'filename': '$NOW_FILE'} for x in r['screens'])"; then
+    ok "обзор сети: экран в сети, играет ролик SMOKE_media2 (id=$MID3)"
+  else
+    bad "обзор сети: «играет ролик» не сошёлся, HTTP $HTTP: $(echo "$BODY" | python3 -c "import sys,json;print([(x['online'], x['playing']) for x in json.load(sys.stdin)['screens'] if x['id']==$SID])" 2>/dev/null)"
+  fi
+else
+  bad "нет экрана, токена или ролика — «играет ролик» в обзоре сети проверить не на чем"
+fi
+if [ -n "${PID:-}" ]; then
+  req GET "/network/playlist/$PID/usage"
+  if [ "$HTTP" = "200" ] && body_has "set(r)=={'template_slots'} and isinstance(r['template_slots'], int) and r['template_slots']>=1"; then
+    ok "слоты шаблона плейлиста: template_slots=$(body_get template_slots)"; else bad "usage плейлиста: HTTP $HTTP $BODY"; fi
+fi
+req GET "/network/playlist/2147483000/usage"
+[ "$HTTP" = "404" ] && ok "usage несуществующего плейлиста → 404" || bad "usage несуществующего плейлиста: HTTP $HTTP (ждали 404)"
 
 # ── 4д. Общий эфир: срок «до ЧЧ:00» ──────────────────────────────────────────
 # Общий эфир сети идёт на ВСЕ экраны сразу, поэтому шаг выполняется только на стенде
@@ -608,12 +648,20 @@ print(n.hour, u.isoformat(), '24:00' if n.hour == 23 else '%02d:00' % (n.hour + 
         if [ "$HTTP" = "200" ] && body_has "r['active_source']!='broadcast'"; then
           ok "лента экрана: пустому плейлисту эфира нечего играть — эфир здесь не идёт"
         else bad "лента при пустом плейлисте эфира: HTTP $HTTP $(feed_brief)"; fi
+        req GET "/network/live"
+        if [ "$HTTP" = "200" ] && body_has "r['broadcast']['is_on'] is True and r['broadcast']['unplayable_screens']>=1 and any(x['id']==$SID and x['broadcast_skipped'] is True and x['now']['kind']!='broadcast' and x['next'] is None for x in r['screens'])"; then
+          ok "обзор сети: пустому плейлисту эфира нечего играть на SMOKE-экране (broadcast_skipped)"
+        else bad "обзор сети при пустом плейлисте эфира: HTTP $HTTP"; fi
         req POST "/playlists/$BC_PID_TMP/items?media_id=$MID3"
         [ "$HTTP" = "200" ] && ok "ролик SMOKE_now добавлен в плейлист эфира" || bad "ролик в плейлист эфира: HTTP $HTTP"
         dreq "/schedule/minipc/$SID"
         if [ "$HTTP" = "200" ] && body_has "r['active_source']=='broadcast' and r['active_playlist']['playlist_id']==$BC_PID_TMP and r['active_until']=='$BC_EXP' and any(i['filename']=='$NOW_FILE' for i in r['active_items'])"; then
           ok "лента экрана: идёт общий эфир, active_until=$BC_EXP"
         else bad "лента экрана при эфире: ждали эфир #$BC_PID_TMP до $BC_EXP, получили HTTP $HTTP $(feed_brief)"; fi
+        req GET "/network/live"
+        if [ "$HTTP" = "200" ] && body_has "r['broadcast']['is_on'] is True and r['broadcast']['until_at']=='$BC_EXP' and r['broadcast']['screens_total']==len(r['screens']) and r['broadcast']['offline_screens']==r['counts']['offline'] and r['playlists']['$BC_PID_TMP']['name']=='SMOKE_bc_$STAMP' and any(x['id']==$SID and x['broadcast_skipped'] is False and x['now']['kind']=='broadcast' and x['now']['playlist_ids']==[$BC_PID_TMP] and x['now']['until']=='$BC_EXP' and x['next'] is None and x['after_broadcast'] is not None for x in r['screens'])"; then
+          ok "обзор сети: на SMOKE-экране идёт общий эфир до $BC_EXP, после него — расписание"
+        else bad "обзор сети при эфире: HTTP $HTTP"; fi
         dreq "/files/list/$SID"
         if [ "$HTTP" = "200" ] && body_has "any(f['filename']=='$NOW_FILE' for f in r)"; then
           ok "ролик эфира в списке закачки экрана"; else bad "ролика эфира нет в списке закачки: HTTP $HTTP"; fi
@@ -666,6 +714,9 @@ print(n.hour, u.isoformat(), '24:00' if n.hour == 23 else '%02d:00' % (n.hour + 
         dreq "/schedule/minipc/$SID"
         if [ "$HTTP" = "200" ] && body_has "r['active_source']!='broadcast'"; then
           ok "после выключения лента экрана не отдаёт эфир"; else bad "лента после выключения эфира: HTTP $HTTP $(feed_brief)"; fi
+        req GET "/network/live"
+        if [ "$HTTP" = "200" ] && body_has "r['broadcast']['is_on'] is False and r['broadcast']['offline_screens']==0 and r['broadcast']['unplayable_screens']==0 and all(x['now']['kind']!='broadcast' and x['broadcast_skipped'] is False and x['after_broadcast'] is None for x in r['screens'])"; then
+          ok "обзор сети после выключения: эфира нет ни на одном экране"; else bad "обзор сети после выключения эфира: HTTP $HTTP"; fi
         dreq "/files/list/$SID"
         if [ "$HTTP" = "200" ] && ! body_has "any(f['filename']=='$NOW_FILE' for f in r)"; then
           ok "после выключения ролика эфира нет в списке закачки"; else bad "после выключения ролик эфира в списке закачки: HTTP $HTTP"; fi
