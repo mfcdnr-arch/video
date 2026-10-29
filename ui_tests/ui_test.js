@@ -41,6 +41,9 @@
  * созданный по ходу, удаляется страховочной уборкой по названию. Показ идёт
  * только на собственный экран прогона «E2E_стенд_…», а не на «Все экраны
  * сети»: даже при жёстком обрыве прогона настоящие экраны его не получат.
+ * Единственное исключение — общий эфир при E2E_ALLOW_BROADCAST=1: он по своей
+ * природе идёт на ВСЕ экраны сети (только на стенде), и при жёстком обрыве
+ * прогона его нужно выключить вручную.
  *
  * Запуск — через ui_test.sh (поднимает контейнер с Chromium).
  * Переменные: DS_URL (по умолч. http://nginx), ADMIN_USER, ADMIN_PASS,
@@ -276,7 +279,7 @@ async function heartbeat(page, id, token, file) {
 async function serverNow(page) {
   const r = await apiCall(page, 'GET', '/network/live');
   const g = String((r.data || {}).generated_at || '');        // «2026-10-29T13:56:05»
-  return { date: g.slice(0, 10), hour: parseInt(g.slice(11, 13), 10),
+  return { iso: g.slice(0, 19), date: g.slice(0, 10), hour: parseInt(g.slice(11, 13), 10),
            minute: parseInt(g.slice(14, 16), 10), second: parseInt(g.slice(17, 19), 10) };
 }
 
@@ -288,26 +291,42 @@ function untilHourOf(untilAt) {
   return (h === 0 && m === 0 && s === 0) ? 24 : h + ((m || s) ? 1 : 0);
 }
 
-/** Вернуть общий эфир в состояние до прогона (если шаг его трогал). Лишних записей в
- *  журнале не плодит: состояние уже прежнее — ничего не шлёт. */
+/** Вернуть общий эфир в состояние до прогона (если шаг его трогал).
+ *  Лишних записей в журнале не плодит: состояние уже прежнее — ничего не шлёт.
+ *  Флаг dirty сбрасывается только когда состояние ПОДТВЕРЖДЕНО (уже прежнее или запрос
+ *  вернул 200): при исключении и при ответе не 200 он остаётся, и страховочная уборка в конце
+ *  прогона повторит попытку.
+ *  Возвращает эфир через POST /broadcast/on, поэтому в журнале появится новая запись
+ *  «Общий эфир включён» (с новыми enabled_by / enabled_at). Если срок прежнего эфира
+ *  вышел, пока шёл прогон, эфир кончился сам — правильное «прежнее» состояние тогда
+ *  «выключен», и это не провал. */
 async function restoreBroadcast(page, fx) {
   if (!fx.bc || !fx.bc.dirty) return;
-  fx.bc.dirty = false;
   const prev = fx.bc.prev || {};
-  const cur = (await apiCall(page, 'GET', '/broadcast')).data || {};
-  if (!prev.is_on) {
-    if (!cur.is_on) { ok('общий эфир выключен, как и было'); return; }
+  const curR = await apiCall(page, 'GET', '/broadcast');
+  if (curR.status !== 200) throw new Error(`GET /broadcast вернул HTTP ${curR.status}`);
+  const cur = curR.data || {};
+  // Прежний эфир «до ЧЧ:00» мог кончиться по сроку за время прогона: тогда он, как и положено, выключен.
+  let wantOn = !!prev.is_on;
+  let offText = 'общий эфир выключен, как и было';
+  if (wantOn && prev.until_at && prev.until_at.slice(0, 19) <= (await serverNow(page)).iso) {
+    wantOn = false;
+    offText = 'прежний общий эфир кончился по сроку, пока шёл прогон, — теперь он выключен';
+  }
+  if (!wantOn) {
+    if (!cur.is_on) { fx.bc.dirty = false; ok(offText); return; }
     const r = await apiCall(page, 'POST', '/broadcast/off');
-    r.status === 200 ? ok('общий эфир выключен, как и было') : bad(`не удалось выключить общий эфир (HTTP ${r.status})`);
+    if (r.status === 200) { fx.bc.dirty = false; ok(offText); }
+    else bad(`не удалось выключить общий эфир (HTTP ${r.status})`);
     return;
   }
   if (cur.is_on && cur.playlist_id === prev.playlist_id && cur.until_at === prev.until_at) {
-    ok('прежний общий эфир на месте'); return;
+    fx.bc.dirty = false; ok('прежний общий эфир на месте'); return;
   }
   const r = await apiCall(page, 'POST', '/broadcast/on',
     { json: { playlist_id: prev.playlist_id, until_hour: untilHourOf(prev.until_at) } });
-  r.status === 200 ? ok(`прежний общий эфир возвращён (плейлист #${prev.playlist_id})`)
-                   : bad(`не удалось вернуть прежний общий эфир (HTTP ${r.status})`);
+  if (r.status === 200) { fx.bc.dirty = false; ok(`прежний общий эфир возвращён (плейлист #${prev.playlist_id})`); }
+  else bad(`не удалось вернуть прежний общий эфир (HTTP ${r.status})`);
 }
 
 (async () => {
