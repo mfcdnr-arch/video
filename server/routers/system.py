@@ -203,10 +203,9 @@ def system_selfcheck(db: Session = Depends(get_db), current_admin=Depends(get_cu
 
     # --- Эфир: офлайн-экраны и битые ролики (краткая сводка, детали на Дашборде)
     try:
-        row = db.execute(text("""
-            SELECT COUNT(*) FILTER (WHERE last_seen IS NULL
-                                     OR last_seen <= NOW() - INTERVAL '5 minutes') AS offline,
-                   COUNT(*) AS total FROM screens""")).fetchone()
+        row = db.execute(text(f"""
+            SELECT COUNT(*) FILTER (WHERE NOT {online_sql("s")}) AS offline,
+                   COUNT(*) AS total FROM screens s""")).fetchone()
         broken = db.execute(text(
             "SELECT COUNT(*) FROM media WHERE is_broken = TRUE")).scalar()
         if row.total and row.offline:

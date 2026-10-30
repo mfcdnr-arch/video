@@ -11,6 +11,7 @@ from deps import engine, get_db, get_current_admin, SECRET_KEY, ALGORITHM
 from ws_manager import ws_manager
 from dashboard_ws import dashboard_ws_manager
 from routers.system import compute_server_metrics
+from screen_online import offline_for_sql, online_sql
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +84,8 @@ async def dashboard_websocket(ws: WebSocket, db: Session = Depends(get_db)):
     WebSocket для администраторов: push-обновления статусов экранов.
     Авторизация: JWT через query-параметр ?token=...
     Пушит {"type":"screens_update", "screens": [...]} каждые 10 секунд.
+    «В сети» — единое правило screen_online: строки экранов несут готовые
+    online / offline_for_seconds, сводка считает по нему же.
     """
     from jose import JWTError, jwt as jose_jwt
     token = ws.query_params.get("token", "")
@@ -111,8 +114,10 @@ async def dashboard_websocket(ws: WebSocket, db: Session = Depends(get_db)):
             # Пушим актуальные данные каждые 10 секунд
             try:
                 with Session(engine) as db_sess:
-                    rows = db_sess.execute(text("""
+                    rows = db_sess.execute(text(f"""
                         SELECT s.id, s.name, s.city, s.status, s.playing_file,
+                               {online_sql("s")} AS online,
+                               {offline_for_sql("s")} AS offline_for_seconds,
                                s.last_seen, s.disk_free_gb, s.disk_total_gb,
                                s.ip_address, s.agent_version, s.os_version,
                                s.vlc_version, s.display_connected, s.display_outputs,
@@ -127,12 +132,14 @@ async def dashboard_websocket(ws: WebSocket, db: Session = Depends(get_db)):
                         if sc.get("last_seen"):
                             sc["last_seen"] = str(sc["last_seen"])
 
-                    summary = db_sess.execute(text("""
+                    # «в сети» — единое правило screen_online (screens.status в 'offline'
+                    # никто не переводит: пропавший экран так не считался бы)
+                    summary = db_sess.execute(text(f"""
                         SELECT
                             COUNT(*) as total,
-                            COUNT(*) FILTER (WHERE last_seen > NOW() - INTERVAL '5 minutes') as online,
-                            COUNT(*) FILTER (WHERE status = 'offline') as offline
-                        FROM screens
+                            COUNT(*) FILTER (WHERE {online_sql("s")}) as online,
+                            COUNT(*) FILTER (WHERE NOT {online_sql("s")}) as offline
+                        FROM screens s
                     """)).fetchone()
 
                     # ─── Метрики сервера (psutil) ──────────────────────────────

@@ -11,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from deps import get_db, get_current_admin
+from screen_online import ONLINE_MINUTES, online_sql
 
 log = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ router = APIRouter()
 def report_summary(admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
     total = db.execute(text("SELECT COUNT(*) FROM screens")).scalar()
     online = db.execute(text(
-        "SELECT COUNT(*) FROM screens WHERE last_seen > NOW() - INTERVAL '5 minutes'"
+        f"SELECT COUNT(*) FROM screens s WHERE {online_sql('s')}"
     )).scalar()
     media_count = db.execute(text("SELECT COUNT(*) FROM media WHERE status = 'ready'")).scalar()
     return {"total_screens": total, "online": online, "offline": total - online,
@@ -47,10 +48,11 @@ def report_screen(screen_id: int, days: int = Query(7), admin: dict = Depends(ge
 
 
 def _data_offline_screens(db: Session):
-    rows = db.execute(text("""
-        SELECT name, city, last_seen FROM screens
-        WHERE last_seen IS NULL OR last_seen < NOW() - INTERVAL '5 minutes'
-        ORDER BY last_seen NULLS FIRST
+    """Экраны не в сети — по единому правилу screen_online (в т. ч. ни разу не выходившие)."""
+    rows = db.execute(text(f"""
+        SELECT s.name, s.city, s.last_seen FROM screens s
+        WHERE NOT {online_sql("s")}
+        ORDER BY s.last_seen NULLS FIRST
     """)).fetchall()
     return [dict(r._mapping) for r in rows]
 
@@ -80,10 +82,10 @@ def report_low_disk(threshold_pct: float = Query(15), admin: dict = Depends(get_
 
 
 def _data_downtime(db: Session, hours_full: float = 8):
-    rows = db.execute(text("""
-        SELECT name, EXTRACT(EPOCH FROM (NOW() - COALESCE(last_seen, created_at))) / 3600.0 AS hours_offline
-        FROM screens
-        WHERE last_seen IS NULL OR last_seen < NOW() - INTERVAL '5 minutes'
+    rows = db.execute(text(f"""
+        SELECT s.name, EXTRACT(EPOCH FROM (NOW() - COALESCE(s.last_seen, s.created_at))) / 3600.0 AS hours_offline
+        FROM screens s
+        WHERE NOT {online_sql("s")}
     """)).fetchall()
     result = []
     for r in rows:
@@ -152,7 +154,9 @@ def report_versions(admin: dict = Depends(get_current_admin), db: Session = Depe
 
 
 def _data_connection_losses(db: Session, days: int = 30):
-    gap_rows = db.execute(text("""
+    """Потери связи: разрывы в истории сигналов дольше окна «в сети» (ONLINE_MINUTES) и
+    экраны, которые сейчас не в сети по единому правилу screen_online (ongoing)."""
+    gap_rows = db.execute(text(f"""
         WITH ordered AS (
             SELECT s.name, ms.screen_id, ms.timestamp,
                    LAG(ms.timestamp) OVER (PARTITION BY ms.screen_id ORDER BY ms.timestamp) AS prev_ts
@@ -163,13 +167,13 @@ def _data_connection_losses(db: Session, days: int = 30):
         SELECT name, prev_ts AS lost_at, timestamp AS restored_at,
                EXTRACT(EPOCH FROM (timestamp - prev_ts)) AS seconds
         FROM ordered
-        WHERE prev_ts IS NOT NULL AND timestamp - prev_ts > INTERVAL '5 minutes'
+        WHERE prev_ts IS NOT NULL AND timestamp - prev_ts > INTERVAL '{ONLINE_MINUTES} minutes'
         ORDER BY prev_ts DESC
     """), {"days": days}).fetchall()
 
-    ongoing_rows = db.execute(text("""
-        SELECT name, last_seen AS lost_at, EXTRACT(EPOCH FROM (NOW() - last_seen)) AS seconds
-        FROM screens WHERE last_seen IS NOT NULL AND last_seen < NOW() - INTERVAL '5 minutes'
+    ongoing_rows = db.execute(text(f"""
+        SELECT s.name, s.last_seen AS lost_at, EXTRACT(EPOCH FROM (NOW() - s.last_seen)) AS seconds
+        FROM screens s WHERE s.last_seen IS NOT NULL AND NOT {online_sql("s")}
     """)).fetchall()
 
     result = [{"screen": r.name, "lost_at": r.lost_at, "restored_at": r.restored_at,

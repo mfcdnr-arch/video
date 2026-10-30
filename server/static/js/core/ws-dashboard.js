@@ -46,12 +46,12 @@
       const row = document.querySelector(`[data-screen-id="${sc.id}"]`);
       if (!row) continue;
 
-      // Статус
+      // Статус: готовое поле online (единое правило «в сети» на сервере), не screens.status
       const statusEl = row.querySelector('.screen-status');
       if (statusEl) {
-        statusEl.textContent = sc.status === 'online' ? 'Online' : 'Offline';
+        statusEl.textContent = sc.online ? 'Online' : 'Offline';
         statusEl.className = 'screen-status badge ' +
-          (sc.status === 'online' ? 'bg-success' : 'bg-secondary');
+          (sc.online ? 'bg-success' : 'bg-secondary');
       }
 
       // Файл воспроизведения

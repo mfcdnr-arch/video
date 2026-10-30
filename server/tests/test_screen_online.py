@@ -64,3 +64,24 @@ def test_routers_use_the_shared_rule():
     dash_src = inspect.getsource(system.dashboard)
     assert dash_src.count("online_sql(") >= 3          # сводка, «сейчас в эфире», диски
     assert dash_src.count("offline_for_sql(") >= 2     # «сейчас в эфире», диски
+
+
+def test_reports_selfcheck_and_live_dashboard_use_the_shared_rule():
+    # отчёты, самодиагностика и WS-пуш дашборда считают «в сети» тем же правилом:
+    # без своих копий «5 минут» и без screens.status (в 'offline' его никто не переводит)
+    from routers import reports, system, websockets
+    for fn in (reports.report_summary, reports._data_offline_screens, reports._data_downtime,
+               reports._data_connection_losses, system.system_selfcheck, websockets.dashboard_websocket):
+        src = inspect.getsource(fn)
+        assert "online_sql(" in src, fn.__name__
+        assert "INTERVAL '5 minutes'" not in src and "status = 'offline'" not in src, fn.__name__
+    ws = inspect.getsource(websockets.dashboard_websocket)
+    assert ws.count("online_sql(") >= 3                  # строки экранов, «в сети» и «не в сети» в сводке
+    assert "offline_for_sql(" in ws                       # строки экранов — с готовым offline_for_seconds
+
+
+def test_connection_gaps_use_the_same_threshold():
+    # разрыв в истории сигналов — дольше того же окна ONLINE_MINUTES
+    from routers import reports
+    src = inspect.getsource(reports._data_connection_losses)
+    assert "ONLINE_MINUTES" in src
