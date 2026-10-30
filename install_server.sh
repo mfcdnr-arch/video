@@ -163,9 +163,11 @@ pass "docker compose up отработал"
 # На пустой БД миграции уже накатил initdb; на существующей — migrate.sh
 # добьёт недостающие. Повторный запуск безопасен (учёт в schema_migrations).
 echo; echo "▶ Миграции БД"
+# По TCP, а не через сокет: пока идут скрипты initdb, временный сервер
+# Postgres слушает только сокет — migrate.sh не должен влезть в их работу.
 echo -n "  … ожидание готовности PostgreSQL"
 for _ in $(seq 1 30); do
-    docker compose exec -T postgres pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 && break
+    docker compose exec -T postgres pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 && break
     echo -n "."; sleep 2
 done
 echo

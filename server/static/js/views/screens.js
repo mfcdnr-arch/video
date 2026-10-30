@@ -570,7 +570,7 @@ function groupAddForm(){
 }
 
 async function createGroup(){
-  const name=(document.getElementById('grp-name')||{}).value||'';
+  const name=((document.getElementById('grp-name')||{}).value||'').trim();
   const desc=(document.getElementById('grp-desc')||{}).value||'';
 
   if(!name){
@@ -583,7 +583,10 @@ async function createGroup(){
     toast('Группа создана');
     viewScreens('groups');
   }catch(e){
-    toast('Ошибка: '+e.message);
+    // api() бросает Error(тело ответа); 400/409 — {"detail": "текст"}
+    let msg=e.message;
+    try{ const j=JSON.parse(msg); if(j && typeof j.detail==='string') msg=j.detail; }catch(_){}
+    toast('Ошибка: '+msg);
   }
 }
 

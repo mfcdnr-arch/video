@@ -13,6 +13,7 @@ MSK = timezone(timedelta(hours=3))
 
 from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query, UploadFile
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from admin_panel import ad_sequence, build_hourly_sequence, filler_list
@@ -52,7 +53,7 @@ def register_minipc(
     if group_id is None:
         db.execute(text("""
             UPDATE screens SET group_id = (
-                SELECT id FROM sync_groups WHERE name = 'Все экраны' LIMIT 1
+                SELECT id FROM sync_groups WHERE name = 'Все экраны' ORDER BY id LIMIT 1
             ) WHERE id = :id AND group_id IS NULL
         """), {"id": screen_id})
     # Запись в журнал операций (если таблица существует)
@@ -728,12 +729,26 @@ def list_groups(admin: dict = Depends(get_current_admin), db: Session = Depends(
 
 
 @router.post("/groups")
-def create_group(name: str = Query(...), description: str = Query(""),
+def create_group(name: Optional[str] = Query(None), description: str = Query(""),
+                 body: Optional[dict] = Body(None),
                  admin: dict = Depends(require_write), db: Session = Depends(get_db)):
-    result = db.execute(text(
-        "INSERT INTO sync_groups (name, description) VALUES (:n, :d) RETURNING id"
-    ), {"n": name, "d": description})
-    gid = result.fetchone()[0]
+    """Создать группу. Панель шлёт JSON {name, description}; query-параметры
+    оставлены для совместимости. Имя группы уникально (миграция 033)."""
+    body = body or {}
+    name = str((name if name is not None else body.get("name")) or "").strip()
+    description = str(description or body.get("description") or "")
+    if not name:
+        raise HTTPException(400, "Введите название группы")
+    if db.execute(text("SELECT 1 FROM sync_groups WHERE name = :n"), {"n": name}).fetchone():
+        raise HTTPException(409, f"Группа «{name}» уже есть")
+    try:
+        gid = db.execute(text(
+            "INSERT INTO sync_groups (name, description) VALUES (:n, :d) RETURNING id"
+        ), {"n": name, "d": description}).fetchone()[0]
+    except IntegrityError:
+        # одновременное создание: проверку прошли оба, индекс пропустил одного
+        db.rollback()
+        raise HTTPException(409, f"Группа «{name}» уже есть")
     db.commit()
     return {"id": gid, "name": name}
 
