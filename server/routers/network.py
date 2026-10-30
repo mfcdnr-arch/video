@@ -25,12 +25,11 @@ from network_live import screen_live
 from placements_logic import week_cells
 from placements_store import (load_decisions, load_overrides, load_placements, load_playlist_names,
                               load_screen_slots, now_msk)
+from playable_store import DEFAULT_VENUE, load_playable_by_venue
 from routers.broadcast import broadcast_json
 from screen_online import ONLINE_MINUTES, offline_for_sql, online_sql
 
 router = APIRouter()
-
-DEFAULT_VENUE = "other"
 
 
 def playing_of(playing_file: str | None, media_id: int | None, media_title: str | None) -> dict | None:
@@ -66,28 +65,6 @@ def load_screens(db) -> list[dict]:
              "venue_type": r.venue_type, "online": bool(r.online),
              "offline_for_seconds": r.offline_for_seconds,
              "playing": playing_of(r.playing_file, r.media_id, r.media_title)} for r in rows]
-
-
-def load_playable_by_venue(db, venues) -> dict[str, set[int]]:
-    """{venue_type: id плейлистов, у которых на такой площадке есть что играть}.
-
-    Фильтры роликов те же, что у ленты экрана (routers/screens.py): готов и одобрен
-    модерацией, реклама алкоголя (ст. 21 38-ФЗ) только на площадке «магазин с
-    алколицензией», срок показа не вышел. Один запрос на тип площадки.
-    """
-    out: dict[str, set[int]] = {}
-    for venue in sorted(set(venues)):
-        rows = db.execute(text("""
-            SELECT DISTINCT pi.playlist_id
-            FROM playlist_items pi
-            JOIN media m ON m.id = pi.media_id
-            WHERE m.status = 'ready' AND m.review_status = 'approved'
-              AND (m.category IS NULL OR m.category <> 'alcohol' OR :venue = 'store_alcohol')
-              AND (m.valid_from  IS NULL OR m.valid_from  <= NOW())
-              AND (m.valid_until IS NULL OR m.valid_until >= NOW())
-        """), {"venue": venue}).fetchall()
-        out[venue] = {r.playlist_id for r in rows}
-    return out
 
 
 def _sort_key(name: str | None) -> str:

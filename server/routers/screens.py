@@ -21,6 +21,7 @@ from deps import get_db, get_current_admin, require_write, verify_device_token
 from dashboard_ws import dashboard_ws_manager
 from placements_logic import active_until_for, pick_active
 from placements_store import load_playlist_names, now_msk, resolve_placement_hour
+from playable_store import DEFAULT_VENUE, load_playable_items, venue_sql
 from playlist_rules import build_shared_hour, expand_repeats, interleave
 from screen_online import offline_for_sql, online_sql
 from ws_manager import ws_manager
@@ -393,24 +394,15 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
 
     # Тип площадки: реклама алкоголя (ст. 21 38-ФЗ) выдаётся только на
     # экраны «магазин с алколицензией» — фильтр :venue во всех выборках ниже.
-    scr = db.execute(text("SELECT group_id, COALESCE(venue_type,'other') AS venue_type "
+    scr = db.execute(text(f"SELECT group_id, COALESCE(venue_type,'{DEFAULT_VENUE}') AS venue_type "
                           "FROM screens WHERE id = :sid"), {"sid": screen_id}).fetchone()
-    venue = scr.venue_type if scr else "other"
-    VENUE_FILTER = " AND (m.category IS NULL OR m.category <> 'alcohol' OR :venue = 'store_alcohol') "
+    venue = scr.venue_type if scr else DEFAULT_VENUE
+    VENUE_FILTER = f" AND {venue_sql('m')} "
 
     def playlist_rows(pid):
-        """Проигрываемые ролики плейлиста по порядку; повторы ещё не развёрнуты."""
-        return [dict(r._mapping) for r in db.execute(text(f"""
-            SELECT m.id AS media_id, m.filename, m.filesize, m.md5_hash,
-                   pi.repeat_count, pi.position
-            FROM playlist_items pi
-            JOIN media m ON m.id = pi.media_id
-            WHERE pi.playlist_id = :p AND m.status = 'ready' AND m.review_status = 'approved'
-              {VENUE_FILTER}
-              AND (m.valid_from  IS NULL OR m.valid_from  <= NOW())
-              AND (m.valid_until IS NULL OR m.valid_until >= NOW())
-            ORDER BY pi.position
-        """), {"p": pid, "venue": venue}).fetchall()]
+        """Проигрываемые ролики плейлиста по порядку (общее правило playable_store:
+        модерация, площадка, срок показа); повторы ещё не развёрнуты."""
+        return load_playable_items(db, pid, venue)
 
     # 1) Общий эфир — действующий (срок не вышел, плейлист не удалён: строка
     # с вышедшим сроком, которую Celery ещё не сбросил, эфиром уже не считается)

@@ -18,6 +18,7 @@ from broadcast_store import get_broadcast
 from deps import engine, get_db, get_current_admin, require_write, require_moderator, verify_device_token, MEDIA_PATH
 from placements_logic import playlists_for_screen
 from placements_store import load_overrides, load_placements, now_msk
+from playable_store import DEFAULT_VENUE, venue_sql
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -819,8 +820,8 @@ def files_for_screen(screen_id: int, db: Session = Depends(get_db),
     Только готовые и одобренные; алкоголь — только для площадок «магазин с
     алколицензией» (38-ФЗ ст. 21). Каждый файл — один раз.
     """
-    venue = db.execute(text("SELECT COALESCE(venue_type,'other') FROM screens WHERE id = :sid"),
-                       {"sid": screen_id}).scalar() or "other"
+    venue = db.execute(text(f"SELECT COALESCE(venue_type,'{DEFAULT_VENUE}') FROM screens WHERE id = :sid"),
+                       {"sid": screen_id}).scalar() or DEFAULT_VENUE
     now = now_msk()
     pids: set[int] = set()       # плейлисты сверх шаблона: показы, переопределения, эфир
     # Ответ с ошибкой агент читает как пустой список, и ночная очистка стёрла
@@ -841,11 +842,11 @@ def files_for_screen(screen_id: int, db: Session = Depends(get_db),
     except Exception:
         log.exception("screen %s: плейлист общего эфира для загрузки не получен", screen_id)
         db.rollback()
-    rows = db.execute(text("""
+    rows = db.execute(text(f"""
         SELECT DISTINCT m.id, m.filename, m.filesize, m.md5_hash
         FROM media m
         WHERE m.status = 'ready' AND m.review_status = 'approved'
-          AND (m.category IS NULL OR m.category <> 'alcohol' OR :venue = 'store_alcohol')
+          AND {venue_sql("m")}
           AND (m.is_filler = TRUE
                OR m.id IN (
                    SELECT pi.media_id FROM playlist_items pi

@@ -11,6 +11,7 @@ from broadcast_store import get_broadcast
 from deps import get_db, get_current_admin, require_write
 from placements_logic import pick_active
 from placements_store import load_playlist_names, now_msk, resolve_placement_hour
+from playable_store import venue_sql
 from playlist_rules import expand_repeats, interleave
 
 router = APIRouter()
@@ -403,9 +404,11 @@ def simulate_schedule(
     dow = sim_date.weekday()
     notes = []
 
-    MEDIA_FILTER = """
+    # Тот же отбор, что у ленты экрана (playable_store.playable_sql), но срок показа —
+    # на выбранную дату, а не на «сейчас»
+    MEDIA_FILTER = f"""
         m.status = 'ready' AND m.review_status = 'approved'
-        AND (m.category IS NULL OR m.category <> 'alcohol' OR :venue = 'store_alcohol')
+        AND {venue_sql("m")}
         AND (m.valid_from  IS NULL OR m.valid_from  <= CAST(:simd AS date) + INTERVAL '23 hours')
         AND (m.valid_until IS NULL OR m.valid_until >= CAST(:simd AS date))
     """

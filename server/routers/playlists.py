@@ -19,15 +19,13 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from deps import get_db, get_current_admin, require_write
+from playable_store import LICENSED_VENUE, UNLICENSED_VENUE, load_playable_by_venue
 from playlist_rules import repeat_warnings
-from routers.network import load_playable_by_venue
 
 router = APIRouter()
 
 MAX_REPEAT = 99          # повторов одного ролика в плейлисте
 MAX_NAME = 128           # playlists.name VARCHAR(128)
-LICENSED_VENUE = "store_alcohol"      # площадка с алколицензией: ей разрешена реклама алкоголя
-UNLICENSED_VENUE = "other"            # любая другая площадка (store / mall / office / other) — без неё
 _MAX_INT4 = 2 ** 31 - 1  # media.id — SERIAL
 _INT = re.compile(r"-?[0-9]{1,12}")
 
@@ -152,7 +150,7 @@ def create_playlist(name: str = Query(...), admin: dict = Depends(require_write)
 @router.get("/playlists")
 def list_playlists(admin: dict = Depends(get_current_admin), db: Session = Depends(get_db)):
     """Все плейлисты по названию. К полям таблицы добавлены два флага (фильтры роликов те же,
-    что у «проигрываемых плейлистов» обзора сети — routers.network.load_playable_by_venue):
+    что у ленты экрана и обзора сети — playable_store.load_playable_by_venue):
     `playable` — есть ли хоть один ролик, который может идти на экране (готов, одобрен, срок
     не вышел; реклама алкоголя считается: она идёт на площадке с алколицензией) — окно «Эфир
     сети» по нему показывает серыми плейлисты, которым нечего играть; `playable_unlicensed` —

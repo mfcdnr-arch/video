@@ -1,6 +1,8 @@
 from fastapi import APIRouter
 from sqlalchemy import text
 
+from playable_store import playable_sql, venue_sql
+
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 @router.get("/health")
@@ -12,16 +14,14 @@ def ad_sequence(db, playlist_id: int, venue_type: str = "other") -> list[tuple[s
     """
     Реклама плейлиста в порядке показа: [(имя файла, длительность)], каждый
     ролик повторён repeat_count раз подряд. В выдачу попадают только готовые
-    одобренные ролики, действующие по датам и допустимые для типа точки.
+    одобренные ролики, действующие по датам и допустимые для типа точки
+    (общее правило playable_store.playable_sql — как у ленты экрана).
     """
-    ad_rows = db.execute(text("""
+    ad_rows = db.execute(text(f"""
         SELECT m.filename, COALESCE(m.duration_seconds, 0) AS duration, pi.repeat_count
         FROM playlist_items pi
         JOIN media m ON m.id = pi.media_id
-        WHERE pi.playlist_id = :pid AND m.status = 'ready' AND m.review_status = 'approved'
-          AND (m.category IS NULL OR m.category <> 'alcohol' OR :venue = 'store_alcohol')
-          AND (m.valid_from IS NULL OR m.valid_from <= NOW())
-          AND (m.valid_until IS NULL OR m.valid_until >= NOW())
+        WHERE pi.playlist_id = :pid AND {playable_sql("m")}
         ORDER BY pi.position
     """), {"pid": playlist_id, "venue": venue_type}).fetchall()
 
@@ -34,11 +34,11 @@ def ad_sequence(db, playlist_id: int, venue_type: str = "other") -> list[tuple[s
 
 def filler_list(db, venue_type: str = "other") -> list[tuple[str, float]]:
     """Заглушки (is_filler=TRUE), допустимые для типа точки: [(имя файла, длительность)]."""
-    filler_rows = db.execute(text("""
-        SELECT filename, COALESCE(duration_seconds, 0) AS duration
-        FROM media WHERE is_filler = TRUE AND status = 'ready' AND review_status = 'approved'
-          AND (category IS NULL OR category <> 'alcohol' OR :venue = 'store_alcohol')
-        ORDER BY id
+    filler_rows = db.execute(text(f"""
+        SELECT m.filename, COALESCE(m.duration_seconds, 0) AS duration
+        FROM media m WHERE m.is_filler = TRUE AND m.status = 'ready' AND m.review_status = 'approved'
+          AND {venue_sql("m")}
+        ORDER BY m.id
     """), {"venue": venue_type}).fetchall()
     return [(r.filename, float(r.duration or 0)) for r in filler_rows]
 
