@@ -7,7 +7,7 @@
 from datetime import date, datetime, timedelta
 
 from placements_logic import (dates_overlap, hours_overlap, applies_at, placement_status,
-                              find_conflicts, choose_playlists, template_playlist, slots_for_screen,
+                              find_conflicts, choose_playlists, template_playlist, template_tops, slots_for_screen,
                               week_cells, alternate_overlaps, pick_active, playlists_for_screen,
                               active_until_for, prefill_decisions)
 
@@ -484,6 +484,20 @@ def test_template_playable_filter_drops_the_chosen_slot_like_the_feed():
     assert template_playlist(slots, 0, 9, playable={3}) is None      # и «весь день» пуст — заглушки
     assert template_playlist(slots, 0, 9) == 2                       # без фильтра — как записано
     assert template_playlist(slots, 0, 9, playable=None) == 2
+
+
+def test_template_tops_hour_top_then_all_day_top():
+    """Очередь шаблона на час: вершина почасовых, затем вершина «весь день» — по ней идут
+    лента экрана, «Эфир сети» и симулятор (пустая вершина уступает следующей)."""
+    slots = [{"day_of_week": 0, "hour": None, "playlist_id": 1, "prio": 1},
+             {"day_of_week": 0, "hour": 9, "playlist_id": 3, "prio": 1},
+             {"day_of_week": 0, "hour": 9, "playlist_id": 2, "prio": 3},
+             {"day_of_week": 1, "hour": 9, "playlist_id": 9, "prio": 9}]
+    assert [s["playlist_id"] for s in template_tops(slots, 0, 9)] == [2, 1]
+    assert [s["playlist_id"] for s in template_tops(slots, 0, 10)] == [1]
+    assert [s["playlist_id"] for s in template_tops(slots, 1, 9)] == [9]
+    assert template_tops(slots, 2, 9) == [] and template_tops([], 0, 0) == []
+    assert template_tops(slots, 0, 9)[0] is slots[2]          # сам слот — с его полями
 
 
 def RAW(screen_id=None, group_id=None, dow=0, hour=None, pl=1):

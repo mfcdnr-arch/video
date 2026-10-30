@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from broadcast_rules import until_text
 from broadcast_store import get_broadcast
 from deps import get_db, get_current_admin, require_write
-from placements_logic import pick_active
+from placements_logic import pick_active, template_tops
 from placements_store import load_playlist_names, now_msk, resolve_placement_hour
 from playable_store import venue_sql
 from playlist_rules import expand_repeats, interleave
@@ -386,6 +386,11 @@ def simulate_schedule(
     показ по датам → переопределение даты с плейлистом → недельные слоты
     экран/группа/сеть → заглушки) и всех фильтров (модерация, тип площадки,
     срок действия ролика). Повторы ×N развёрнуты — как играет экран.
+    Недельный шаблон — как в ленте экрана и у агента (template_tops): вершина
+    часа (экран > группа > сеть) выбирается до фильтра роликов; если её плейлисту
+    нечего играть, слот уровнем ниже на этот час её не подменяет — идёт слот
+    «весь день», а если пуст и он — заглушки. Срок действия ролика симулятор
+    проверяет на выбранную дату, а не на час.
     Общий эфир — ручной рубильник текущего момента, для будущих дат он не
     предсказуем; если он идёт СЕЙЧАС, отмечаем — со сроком (broadcast_note).
     """
@@ -469,9 +474,11 @@ def simulate_schedule(
                 "playlist": ov.name, "items": playlist_items(ov.playlist_id),
                 "notes": notes}
 
-    # 4) недельные слоты: экран > группа > сеть; почасовой > «весь день»
-    slot = db.execute(text("""
-        SELECT ss.playlist_id, p.name, ss.hour,
+    # 4) недельные слоты — тот же выбор, что у ленты экрана и агента (template_tops):
+    # вершина часа (экран > группа > сеть) берётся ДО фильтра роликов; если её плейлисту
+    # нечего играть, идёт вершина «весь день», а если пуста и она — заглушки
+    slots = [dict(r._mapping) for r in db.execute(text("""
+        SELECT ss.day_of_week, ss.hour, ss.playlist_id, p.name,
                CASE WHEN ss.screen_id IS NOT NULL THEN 3
                     WHEN ss.group_id IS NOT NULL THEN 2 ELSE 1 END AS prio
         FROM schedule_slots ss JOIN playlists p ON p.id = ss.playlist_id
@@ -480,20 +487,24 @@ def simulate_schedule(
           AND (ss.screen_id = :sid
                OR (ss.screen_id IS NULL AND ss.group_id IS NOT NULL AND ss.group_id = :gid)
                OR (ss.screen_id IS NULL AND ss.group_id IS NULL))
-        ORDER BY (ss.hour IS NOT NULL) DESC, prio DESC
-        LIMIT 1
-    """), {"dow": dow, "h": hour, "sid": screen_id, "gid": scr.group_id}).fetchone()
-    if slot:
-        level = {3: "слот экрана", 2: "слот группы", 1: "слот всей сети"}[slot.prio]
-        kind = "почасовой" if slot.hour is not None else "на весь день"
-        items = playlist_items(slot.playlist_id)
-        if not items:
-            notes.append("Плейлист слота пуст после фильтров (модерация/площадка/срок) — "
-                         "экран уйдёт на заглушки")
-        else:
+    """), {"dow": dow, "h": hour, "sid": screen_id, "gid": scr.group_id}).fetchall()]
+    tops = template_tops(slots, dow, hour)
+    for i, slot in enumerate(tops):
+        level = {3: "слот экрана", 2: "слот группы", 1: "слот всей сети"}[slot["prio"]]
+        kind = "почасовой" if slot["hour"] is not None else "на весь день"
+        items = playlist_items(slot["playlist_id"])
+        if items:
             return {"screen": scr.name, "date": on_date, "hour": hour,
                     "source": "slot", "source_label": f"Недельный шаблон ({level}, {kind})",
-                    "playlist": slot.name, "items": items, "notes": notes}
+                    "playlist": slot["name"], "items": items, "notes": notes}
+        if i + 1 < len(tops):
+            lower = any(s["hour"] == hour and s is not slot for s in slots)
+            then = (("слоты уровнем ниже на этот час его не подменяют, " if lower else "")
+                    + "дальше — слот на весь день")
+        else:
+            then = "экран уйдёт на заглушки"
+        notes.append(f"Плейлист «{slot['name']}» ({level}, {kind}) пуст после фильтров "
+                     f"(модерация/площадка/срок) — {then}")
 
     # 5) заглушки (фолбэк)
     fillers = db.execute(text(f"""

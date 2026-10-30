@@ -340,6 +340,24 @@ def slots_for_screen(template: list[dict], screen_id: int, group_id: int | None)
     return out
 
 
+def template_tops(slots: list[dict], dow: int, hour: int) -> list[dict]:
+    """Очередь недельного шаблона на день недели `dow` и час `hour`: 0–2 слота.
+
+    slots: {"day_of_week", "hour" (None — весь день), "playlist_id", "prio", …}.
+    Сначала вершина почасовых слотов этого часа, затем вершина слотов «весь день»;
+    вершина — слот с наибольшим prio (экран > группа > сеть). Как в ленте экрана
+    (DISTINCT ON до фильтра роликов), вершина выбирается ДО фильтра: если её плейлисту
+    нечего играть, слот уровнем ниже на тот же час её не подменяет — очередь идёт к
+    следующей вершине. По этой очереди идут «Эфир сети» (template_playlist) и
+    симулятор (routers/schedule.py).
+    """
+    day_slots = [s for s in slots if s["day_of_week"] == dow]
+    return [max(group, key=lambda s: s.get("prio") or 0)
+            for group in ([s for s in day_slots if s.get("hour") == hour],
+                          [s for s in day_slots if s.get("hour") is None])
+            if group]
+
+
 def template_playlist(slots: list[dict], dow: int, hour: int, playable: set[int] | None = None) -> int | None:
     """Плейлист недельного шаблона для дня недели `dow` и часа `hour`.
 
@@ -350,14 +368,11 @@ def template_playlist(slots: list[dict], dow: int, hour: int, playable: set[int]
     ленте экрана: слот с наибольшим prio выбирается ДО фильтра, и если его плейлисту
     играть нечего, он выпадает целиком — слот уровнем ниже на тот же час его не
     подменяет; тогда идёт слот «весь день», а если пуст и он — None (заглушки).
+    Очередь — template_tops.
     """
-    day_slots = [s for s in slots if s["day_of_week"] == dow]
-    for group in ([s for s in day_slots if s.get("hour") == hour],
-                  [s for s in day_slots if s.get("hour") is None]):
-        if group:
-            playlist_id = max(group, key=lambda s: s.get("prio") or 0)["playlist_id"]
-            if playable is None or playlist_id in playable:
-                return playlist_id
+    for top in template_tops(slots, dow, hour):
+        if playable is None or top["playlist_id"] in playable:
+            return top["playlist_id"]
     return None
 
 
