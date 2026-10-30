@@ -40,6 +40,7 @@ services:
       - ./server/migrations/030_gov_owners.sql:/docker-entrypoint-initdb.d/30_gov_owners.sql:ro
       - ./server/migrations/031_placements.sql:/docker-entrypoint-initdb.d/31_placements.sql:ro
       - ./server/migrations/032_broadcast_until.sql:/docker-entrypoint-initdb.d/32_broadcast_until.sql:ro
+      - ./server/migrations/033_sync_groups_unique_name.sql:/docker-entrypoint-initdb.d/33_sync_groups_unique_name.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s

@@ -129,9 +129,10 @@ ALTER TABLE minipc_status ADD COLUMN IF NOT EXISTS disk_total_gb FLOAT;
 -- 7. СЛУЖЕБНАЯ ГРУППА «ВСЕ ЭКРАНЫ»
 -- ------------------------------------------------------------
 -- Особая группа: новый экран автоматически попадает в неё (логика в API).
-INSERT INTO sync_groups (name, description) VALUES
-  ('Все экраны', 'Служебная группа: включает все зарегистрированные экраны')
-ON CONFLICT DO NOTHING;
+-- Проверяем имя (уникальный ключ на name — только с миграции 033).
+INSERT INTO sync_groups (name, description)
+SELECT 'Все экраны', 'Служебная группа: включает все зарегистрированные экраны'
+WHERE NOT EXISTS (SELECT 1 FROM sync_groups WHERE name = 'Все экраны');
 
 -- ============================================================
 -- Конец миграции 002

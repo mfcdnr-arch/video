@@ -124,7 +124,8 @@ INSERT INTO users (username, password_hash, role) VALUES
   ('admin', '$2b$12$1rFNE5wroo/gieqz2mQYce4d.Dy6nVQv0pQS.kefuruC6Q7ma9VRG', 'superadmin')
 ON CONFLICT (username) DO NOTHING;
 
--- Группа синхронизации по умолчанию
-INSERT INTO sync_groups (name, description) VALUES
-  ('Зал 1', 'Основная группа синхронизации')
-ON CONFLICT DO NOTHING;
+-- Группа синхронизации по умолчанию. Уникального ключа на name здесь ещё
+-- нет (он появляется в 033), поэтому ON CONFLICT не помогает — проверяем имя.
+INSERT INTO sync_groups (name, description)
+SELECT 'Зал 1', 'Основная группа синхронизации'
+WHERE NOT EXISTS (SELECT 1 FROM sync_groups WHERE name = 'Зал 1');

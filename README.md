@@ -63,7 +63,7 @@ Video_miniPC_v16.2_modular/
 │   ├── broadcast_store.py     # SQL общего эфира: включить / сменить / выключить / истечь
 │   ├── screen_online.py       # Единое правило «в сети»: сигнал не старше 5 минут
 │   ├── static/                # Веб-панель (index.html, js/, css/)
-│   ├── migrations/            # SQL-миграции (001–032; 001 применяется как init при первом старте БД)
+│   ├── migrations/            # SQL-миграции (001–033; 001 применяется как init при первом старте БД)
 │   ├── tasks.py               # Celery-задачи (бэкапы, уведомления, expire_broadcast и др.)
 │   ├── ws_manager.py          # Реестр WebSocket-подключений
 │   ├── Dockerfile

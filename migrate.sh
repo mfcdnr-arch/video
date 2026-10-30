@@ -7,8 +7,15 @@
 #
 # Безопасность повторного запуска: применяются только НЕ применённые ранее
 # миграции (учёт в таблице schema_migrations); при этом все миграции проекта
-# идемпотентны (CREATE TABLE/ADD COLUMN IF NOT EXISTS, INSERT ... ON CONFLICT),
-# поэтому даже повторное применение не портит данные.
+# идемпотентны (CREATE TABLE/ADD COLUMN IF NOT EXISTS, INSERT ... ON CONFLICT
+# или WHERE NOT EXISTS), поэтому даже повторное применение не портит данные.
+#
+# Первый запуск после initdb (baseline): initdb сам в schema_migrations не
+# пишет. Если учёта ещё не было, а схема уже есть и экранов в ней нет (свежая
+# установка), файлы из списка initdb в docker-compose.yml записываются как
+# применённые без повторного запуска. Файлы не из этого списка initdb не
+# применял — они идут обычным порядком. Если же экраны уже есть (живая база
+# без учёта), baseline не делается: все миграции применяются, как раньше.
 #
 # Использование:  bash migrate.sh
 # Требуется запущенный контейнер ds_postgres (docker compose up -d postgres).
@@ -21,14 +28,17 @@ set -a; . ./.env 2>/dev/null || true; set +a
 
 psqldb(){ docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" "$@"; }
 
-# 1. Доступна ли БД
-if ! docker compose exec -T postgres pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1; then
+# 1. Доступна ли БД. По TCP, а не через сокет: пока идут скрипты initdb,
+# временный сервер Postgres слушает только сокет — baseline (шаг 3), снятый
+# посреди initdb, записал бы ещё не применённые файлы.
+if ! docker compose exec -T postgres pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1; then
     echo "ОШИБКА: PostgreSQL (ds_postgres) недоступна."
     echo "      └─ Запустите стек: docker compose up -d postgres  (и дождитесь healthy)"
     exit 1
 fi
 
-# 2. Таблица учёта применённых миграций
+# 2. Таблица учёта применённых миграций (была ли она до этого запуска — для шага 3)
+had_journal="$(psqldb -tAq -c "SELECT to_regclass('public.schema_migrations') IS NOT NULL" 2>/dev/null | tr -d '[:space:]')"
 if ! psqldb -q -c "CREATE TABLE IF NOT EXISTS schema_migrations (
         filename   text        PRIMARY KEY,
         applied_at timestamptz NOT NULL DEFAULT now());" >/dev/null 2>&1; then
@@ -36,7 +46,6 @@ if ! psqldb -q -c "CREATE TABLE IF NOT EXISTS schema_migrations (
     exit 1
 fi
 
-# 3. Применяем недостающие миграции по порядку
 shopt -s nullglob
 FILES=(server/migrations/*.sql)
 if [ ${#FILES[@]} -eq 0 ]; then
@@ -44,6 +53,27 @@ if [ ${#FILES[@]} -eq 0 ]; then
     exit 0
 fi
 
+# 3. Baseline: учёт только что создан, а схему уже накатил initdb
+if [ "$had_journal" = "f" ]; then
+    has_screens="$(psqldb -tAq -c "SELECT to_regclass('public.screens') IS NOT NULL" 2>/dev/null | tr -d '[:space:]')"
+    if [ "$has_screens" = "t" ]; then
+        n_screens="$(psqldb -tAq -c "SELECT count(*) FROM screens" 2>/dev/null | tr -d '[:space:]')"
+        if [ "$n_screens" = "0" ]; then
+            based=0
+            for f in "${FILES[@]}"; do
+                name="$(basename "$f")"
+                grep -qF "./server/migrations/$name:" docker-compose.yml || continue
+                psqldb -q -c "INSERT INTO schema_migrations(filename) VALUES ('$name') ON CONFLICT DO NOTHING;" >/dev/null 2>&1 \
+                    && based=$((based+1))
+            done
+            echo "Учёт миграций начат: файлы, применённые initdb, записаны без повторного запуска — $based шт."
+        elif [ -n "$n_screens" ]; then
+            echo "Учёта миграций не было, а экранов в базе $n_screens — применяю все миграции (они идемпотентны)."
+        fi
+    fi
+fi
+
+# 4. Применяем недостающие миграции по порядку
 applied=0; skipped=0; failed=0
 ERR="$(mktemp)"
 for f in "${FILES[@]}"; do
