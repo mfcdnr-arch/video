@@ -10,8 +10,9 @@ GET /network/live — одним запросом данные для табли
 .screen_live поверх клеток placements_logic.week_cells (та же логика приоритетов, что
 у ленты экрана и «Расписания → По датам»). SQL здесь только пакетный: показы,
 переопределения и решения — один раз на сегодня–завтра, «проигрываемые плейлисты» — один
-раз на тип площадки (venue_type), а не на экран. Слоты недельного шаблона — на экран
-(load_screen_slots). Все даты и часы — наивное МСК; весь расчёт идёт от одного now.
+раз на тип площадки (venue_type), а не на экран. Недельный шаблон читается целиком одним
+запросом (load_template_slots) и раскладывается по экранам в Python (slots_for_screen:
+экран > группа > сеть). Все даты и часы — наивное МСК; весь расчёт идёт от одного now.
 """
 from datetime import datetime, timedelta
 
@@ -22,9 +23,9 @@ from sqlalchemy.orm import Session
 from broadcast_store import get_broadcast
 from deps import get_current_admin, get_db
 from network_live import screen_live
-from placements_logic import week_cells
+from placements_logic import slots_for_screen, week_cells
 from placements_store import (load_decisions, load_overrides, load_placements, load_playlist_names,
-                              load_screen_slots, now_msk)
+                              load_template_slots, now_msk)
 from playable_store import DEFAULT_VENUE, load_playable_by_venue
 from routers.broadcast import broadcast_json
 from screen_online import ONLINE_MINUTES, offline_for_sql, online_sql
@@ -44,13 +45,13 @@ def playing_of(playing_file: str | None, media_id: int | None, media_title: str 
 
 
 def load_screens(db) -> list[dict]:
-    """Все экраны: адрес, тип площадки, «в сети» (единое правило) и «играет ролик».
+    """Все экраны: адрес, группа, тип площадки, «в сети» (единое правило) и «играет ролик».
 
     Ролик — media по имени файла из последнего сообщения агента; при дубле имени
     берётся новейший. Порядок — по названию.
     """
     rows = db.execute(text(f"""
-        SELECT s.id, s.name, s.city, s.location,
+        SELECT s.id, s.name, s.city, s.location, s.group_id,
                COALESCE(s.venue_type, '{DEFAULT_VENUE}') AS venue_type,
                {online_sql("s")} AS online,
                {offline_for_sql("s")} AS offline_for_seconds,
@@ -62,7 +63,7 @@ def load_screens(db) -> list[dict]:
         ORDER BY s.name, s.id
     """)).fetchall()
     return [{"id": r.id, "name": r.name, "city": r.city, "location": r.location,
-             "venue_type": r.venue_type, "online": bool(r.online),
+             "group_id": r.group_id, "venue_type": r.venue_type, "online": bool(r.online),
              "offline_for_seconds": r.offline_for_seconds,
              "playing": playing_of(r.playing_file, r.media_id, r.media_title)} for r in rows]
 
@@ -140,10 +141,11 @@ def live_snapshot(db) -> dict:
     placements = load_placements(db, days[0], days[-1])
     overrides = load_overrides(db, days[0], days[-1])
     decisions = load_decisions(db, [p["id"] for p in placements])
-    slots = {s["id"]: load_screen_slots(db, s["id"]) for s in screens}
+    template = load_template_slots(db)
+    slots = {s["id"]: slots_for_screen(template, s["id"], s.get("group_id")) for s in screens}
     names = load_playlist_names(
         db, {p["playlist_id"] for p in placements}
-        | {sl["playlist_id"] for ss in slots.values() for sl in ss}
+        | {sl["playlist_id"] for ss in slots.values() for sl in ss if sl["playlist_id"] is not None}
         | {o["playlist_id"] for o in overrides if o["playlist_id"] is not None})
 
     cells = {s["id"]: week_cells(days, s["id"], placements, decisions, overrides, slots[s["id"]], names,

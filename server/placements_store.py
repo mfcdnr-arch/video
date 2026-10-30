@@ -23,7 +23,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import text
 
-from placements_logic import applies_at, choose_playlists
+from placements_logic import applies_at, choose_playlists, slots_for_screen
 
 # Как в routers/screens.py: вся сеть живёт по Москве, сезонного перевода нет.
 MSK = timezone(timedelta(hours=3))
@@ -181,26 +181,31 @@ def get_placement(db, placement_id: int) -> dict | None:
             "hour_from": r.hour_from, "hour_to": r.hour_to, "stopped_at": r.stopped_at}
 
 
+def load_template_slots(db) -> list[dict]:
+    """Весь недельный шаблон сети одним запросом: {"screen_id", "group_id", "day_of_week",
+    "hour", "playlist_id"} (у общесетевого слота screen_id и group_id — None).
+
+    По экранам его раскладывает placements_logic.slots_for_screen — так обзор сети
+    читает шаблон один раз на все экраны, а не запросом на экран.
+    """
+    rows = db.execute(text("""
+        SELECT screen_id, group_id, day_of_week, hour, playlist_id
+        FROM schedule_slots ORDER BY id
+    """)).fetchall()
+    return [{"screen_id": r.screen_id, "group_id": r.group_id, "day_of_week": r.day_of_week,
+             "hour": r.hour, "playlist_id": r.playlist_id} for r in rows]
+
+
 def load_screen_slots(db, screen_id: int) -> list[dict]:
     """Слоты недельного шаблона, которые действуют на экране: его собственные,
     слоты его группы и общесетевые, с уровнем prio (экран 3 > группа 2 > сеть 1).
 
     Тот же отбор, что у ленты экрана (routers/screens.py) и симулятора
-    (routers/schedule.py); какой из слотов выбрать на (день, час) решает
-    placements_logic.template_playlist.
+    (routers/schedule.py) — placements_logic.slots_for_screen; какой из слотов
+    выбрать на (день, час) решает placements_logic.template_playlist.
     """
-    rows = db.execute(text("""
-        SELECT ss.day_of_week, ss.hour, ss.playlist_id,
-               CASE WHEN ss.screen_id IS NOT NULL THEN 3
-                    WHEN ss.group_id IS NOT NULL THEN 2 ELSE 1 END AS prio
-        FROM schedule_slots ss
-        WHERE ss.screen_id = :sid
-           OR (ss.screen_id IS NULL AND ss.group_id IS NOT NULL
-               AND ss.group_id = (SELECT group_id FROM screens WHERE id = :sid))
-           OR (ss.screen_id IS NULL AND ss.group_id IS NULL)
-    """), {"sid": screen_id}).fetchall()
-    return [{"day_of_week": r.day_of_week, "hour": r.hour, "playlist_id": r.playlist_id, "prio": r.prio}
-            for r in rows]
+    group_id = db.execute(text("SELECT group_id FROM screens WHERE id = :sid"), {"sid": screen_id}).scalar()
+    return slots_for_screen(load_template_slots(db), screen_id, group_id)
 
 
 def load_playlist_names(db, ids) -> dict[int, str]:

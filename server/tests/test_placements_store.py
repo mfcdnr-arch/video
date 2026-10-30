@@ -265,16 +265,30 @@ def test_get_placement_and_missing():
     assert store.get_placement(RoutedDB([]), 4) is None
 
 
-def test_load_screen_slots_keeps_level_priority_for_the_screen():
-    rows = [Row(day_of_week=0, hour=None, playlist_id=1, prio=1), Row(day_of_week=0, hour=9, playlist_id=2, prio=3)]
+def test_load_template_slots_reads_the_whole_template_in_one_query():
+    rows = [Row(screen_id=5, group_id=None, day_of_week=0, hour=9, playlist_id=2),
+            Row(screen_id=None, group_id=7, day_of_week=1, hour=None, playlist_id=3),
+            Row(screen_id=None, group_id=None, day_of_week=2, hour=None, playlist_id=1)]
     db = RoutedDB([("FROM schedule_slots", rows)])
+    assert store.load_template_slots(db) == [
+        {"screen_id": 5, "group_id": None, "day_of_week": 0, "hour": 9, "playlist_id": 2},
+        {"screen_id": None, "group_id": 7, "day_of_week": 1, "hour": None, "playlist_id": 3},
+        {"screen_id": None, "group_id": None, "day_of_week": 2, "hour": None, "playlist_id": 1}]
+    assert len(db.calls) == 1 and "WHERE" not in db.calls[0][0]          # весь шаблон, без фильтра по экрану
+
+
+def test_load_screen_slots_keeps_level_priority_for_the_screen():
+    rows = [Row(screen_id=None, group_id=None, day_of_week=0, hour=None, playlist_id=1),
+            Row(screen_id=5, group_id=None, day_of_week=0, hour=9, playlist_id=2),
+            Row(screen_id=None, group_id=7, day_of_week=0, hour=10, playlist_id=3),
+            Row(screen_id=None, group_id=8, day_of_week=0, hour=10, playlist_id=4),
+            Row(screen_id=6, group_id=None, day_of_week=0, hour=9, playlist_id=5)]
+    db = RoutedDB([("FROM schedule_slots", rows), ("SELECT group_id FROM screens", [7])])
     assert store.load_screen_slots(db, 5) == [
         {"day_of_week": 0, "hour": None, "playlist_id": 1, "prio": 1},
-        {"day_of_week": 0, "hour": 9, "playlist_id": 2, "prio": 3}]
-    (params,) = db.params("FROM schedule_slots")
-    assert params == {"sid": 5}
-    sql = db.calls[0][0]
-    assert "ss.screen_id = :sid" in sql and "ss.group_id IS NOT NULL" in sql and "prio" in sql      # экран / группа экрана / сеть
+        {"day_of_week": 0, "hour": 9, "playlist_id": 2, "prio": 3},
+        {"day_of_week": 0, "hour": 10, "playlist_id": 3, "prio": 2}]       # чужие группа и экран — мимо
+    assert db.params("SELECT group_id FROM screens") == [{"sid": 5}]
 
 
 def test_load_playlist_names():

@@ -7,7 +7,7 @@
 from datetime import date, datetime, timedelta
 
 from placements_logic import (dates_overlap, hours_overlap, applies_at, placement_status,
-                              find_conflicts, choose_playlists, template_playlist,
+                              find_conflicts, choose_playlists, template_playlist, slots_for_screen,
                               week_cells, alternate_overlaps, pick_active, playlists_for_screen,
                               active_until_for, prefill_decisions)
 
@@ -473,6 +473,44 @@ def test_template_prio_within_group_and_other_days_ignored():
     assert template_playlist(slots, 0, 0) == 4          # час 0 — это час, а не «весь день»
     assert template_playlist(slots, 1, 5) is None
     assert template_playlist([], 0, 0) is None
+
+
+def RAW(screen_id=None, group_id=None, dow=0, hour=None, pl=1):
+    """Слот шаблона, как его читает placements_store.load_template_slots."""
+    return {"screen_id": screen_id, "group_id": group_id, "day_of_week": dow, "hour": hour, "playlist_id": pl}
+
+
+def test_slots_for_screen_levels_screen_group_network():
+    raw = [RAW(screen_id=5, pl=1), RAW(group_id=7, pl=2), RAW(pl=3, hour=9)]
+    assert slots_for_screen(raw, 5, 7) == [
+        {"day_of_week": 0, "hour": None, "playlist_id": 1, "prio": 3},       # свой слот экрана
+        {"day_of_week": 0, "hour": None, "playlist_id": 2, "prio": 2},       # слот его группы
+        {"day_of_week": 0, "hour": 9, "playlist_id": 3, "prio": 1}]          # общесетевой
+
+
+def test_slots_for_screen_skips_other_screens_and_groups():
+    raw = [RAW(screen_id=6, pl=1), RAW(group_id=8, pl=2), RAW(screen_id=6, group_id=7, pl=4)]
+    assert slots_for_screen(raw, 5, 7) == []          # чужой экран (даже из своей группы) и чужая группа
+
+
+def test_slots_for_screen_without_group_gets_no_group_slots():
+    raw = [RAW(group_id=7, pl=2), RAW(pl=3)]
+    assert slots_for_screen(raw, 5, None) == [{"day_of_week": 0, "hour": None, "playlist_id": 3, "prio": 1}]
+
+
+def test_slots_for_screen_slot_with_screen_and_group_is_a_screen_slot():
+    # как в SQL ленты: есть screen_id — это слот экрана (prio 3), group_id не важен
+    assert slots_for_screen([RAW(screen_id=5, group_id=8, pl=4)], 5, 7) == [
+        {"day_of_week": 0, "hour": None, "playlist_id": 4, "prio": 3}]
+
+
+def test_slots_for_screen_feeds_template_priority():
+    raw = [RAW(pl=1, hour=9), RAW(group_id=7, pl=2, hour=9), RAW(screen_id=5, pl=3, hour=9), RAW(pl=4)]
+    mine = slots_for_screen(raw, 5, 7)
+    assert template_playlist(mine, 0, 9) == 3                                  # экран > группа > сеть
+    assert template_playlist(slots_for_screen(raw, 6, 7), 0, 9) == 2         # сосед по группе — групповой
+    assert template_playlist(slots_for_screen(raw, 6, None), 0, 9) == 1      # без группы — сетевой
+    assert template_playlist(mine, 0, 10) == 4                                 # «весь день» сети
 
 
 # --- недельная сетка ---------------------------------------------------------

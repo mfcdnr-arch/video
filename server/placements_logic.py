@@ -315,6 +315,31 @@ def active_until_for(source: str, now: datetime, broadcast_until: datetime | Non
 
 # --- недельный шаблон --------------------------------------------------------
 
+def slots_for_screen(template: list[dict], screen_id: int, group_id: int | None) -> list[dict]:
+    """Слоты недельного шаблона, которые действуют на экране `screen_id` из группы `group_id`.
+
+    template — весь шаблон сети (placements_store.load_template_slots): {"screen_id",
+    "group_id", "day_of_week", "hour", "playlist_id"}. Берутся слоты самого экрана
+    (prio 3), его группы (2; у экрана без группы их нет) и общесетевые (1) — тот же
+    отбор, что у ленты экрана (routers/screens.py). Слот с screen_id — слот экрана,
+    какая бы группа в нём ни стояла. Какой из слотов играет на (день, час), решает
+    template_playlist. Формат: {"day_of_week", "hour", "playlist_id", "prio"}, порядок —
+    как в template.
+    """
+    out = []
+    for s in template:
+        if s.get("screen_id") is not None:
+            prio = 3 if s["screen_id"] == screen_id else None
+        elif s.get("group_id") is not None:
+            prio = 2 if group_id is not None and s["group_id"] == group_id else None
+        else:
+            prio = 1
+        if prio is not None:
+            out.append({"day_of_week": s["day_of_week"], "hour": s["hour"],
+                        "playlist_id": s["playlist_id"], "prio": prio})
+    return out
+
+
 def template_playlist(slots: list[dict], dow: int, hour: int) -> int | None:
     """Плейлист недельного шаблона для дня недели `dow` и часа `hour`.
 

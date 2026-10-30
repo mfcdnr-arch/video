@@ -282,7 +282,8 @@ class Calls:
 
 def test_snapshot_batches_queries_and_uses_one_now(monkeypatch):
     calls = Calls()
-    screens = [scr(1, "Б", venue="other"), scr(2, "А", venue="other"), scr(3, "В", venue="store_alcohol")]
+    screens = [{**scr(1, "Б", venue="other"), "group_id": 7}, {**scr(2, "А", venue="other"), "group_id": None},
+               {**scr(3, "В", venue="store_alcohol"), "group_id": 8}]
     placement = {"id": 11, "playlist_id": 2, "playlist_name": "PL2", "date_from": D, "date_to": D,
                  "hour_from": 10, "hour_to": 12, "stopped_at": None, "saved_at": datetime(2026, 10, 27, 9, 0),
                  "screens": {1, 3}, "all_screens": False}
@@ -299,7 +300,10 @@ def test_snapshot_batches_queries_and_uses_one_now(monkeypatch):
     monkeypatch.setattr(network, "load_placements", calls.rec("placements", [placement]))
     monkeypatch.setattr(network, "load_overrides", calls.rec("overrides", []))
     monkeypatch.setattr(network, "load_decisions", calls.rec("decisions", {}))
-    monkeypatch.setattr(network, "load_screen_slots", calls.rec("slots", lambda db, sid: [{"playlist_id": 1}]))
+    template = [{"screen_id": 1, "group_id": None, "day_of_week": 2, "hour": 9, "playlist_id": 4},
+                {"screen_id": None, "group_id": 7, "day_of_week": 2, "hour": None, "playlist_id": 5},
+                {"screen_id": None, "group_id": None, "day_of_week": 2, "hour": None, "playlist_id": 1}]
+    monkeypatch.setattr(network, "load_template_slots", calls.rec("slots", template))
     monkeypatch.setattr(network, "load_playlist_names", calls.rec("names", {1: "PL1", 2: "PL2"}))
     monkeypatch.setattr(network, "week_cells", fake_week_cells)
 
@@ -310,12 +314,19 @@ def test_snapshot_batches_queries_and_uses_one_now(monkeypatch):
     assert names.count("screens") == 1 and names.count("placements") == 1
     assert names.count("overrides") == 1 and names.count("decisions") == 1
     assert names.count("playable") == 1 and names.count("names") == 1        # на всех, не на экран
-    assert names.count("slots") == 3                                       # слоты — по экрану (допустимо)
+    assert names.count("slots") == 1                                       # весь шаблон одним запросом
     playable_call = next(c for c in calls.log if c[0] == "playable")
     assert set(playable_call[1][0]) == {"other", "store_alcohol"}          # по разу на тип площадки
     # окно — сегодня и завтра от одного now; показы грузятся на то же окно
     assert all(v["days"] == [D, D2] for v in seen_cells.values())
     assert next(c for c in calls.log if c[0] == "placements")[1] == (D, D2)
     assert seen_cells[1]["playable"] == {2} and seen_cells[3]["playable"] == {2}
+    # шаблон разложен по экранам в Python: экран 3 > группа 2 > сеть 1
+    assert seen_cells[1]["slots"] == [{"day_of_week": 2, "hour": 9, "playlist_id": 4, "prio": 3},
+                                      {"day_of_week": 2, "hour": None, "playlist_id": 5, "prio": 2},
+                                      {"day_of_week": 2, "hour": None, "playlist_id": 1, "prio": 1}]
+    assert seen_cells[2]["slots"] == seen_cells[3]["slots"] == [
+        {"day_of_week": 2, "hour": None, "playlist_id": 1, "prio": 1}]   # без группы / чужая группа
+    assert next(c for c in calls.log if c[0] == "names")[1][0] == {1, 2, 4, 5}  # названия — одним запросом на всех
     assert r["generated_at"] == "2026-10-28T10:30:00"
     assert [s["name"] for s in r["screens"]] == ["А", "Б", "В"]
