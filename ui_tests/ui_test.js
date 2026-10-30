@@ -820,8 +820,12 @@ async function restoreBroadcast(page, fx) {
     try {
       if (!fx.screenId || !fx.mediaId || !fx.token) throw new Error('нет тестового экрана или ролика — проверять не на чем');
       dialogMode = 'dismiss';
-      const bcPrev = (await apiCall(page, 'GET', '/broadcast')).data || {};
-      const bcOn = !!bcPrev.is_on;       // эфир уже включён до прогона: таблица показывает его, а не расписание
+      // Прежнее состояние эфира читаем ДО любых изменений и только из настоящего ответа: при сбое GET пустой
+      // объект выглядел бы как «эфир выключен», и живой прежний эфир «вернулся» бы выключенным.
+      const bcPrevR = await apiCall(page, 'GET', '/broadcast');
+      if (bcPrevR.status !== 200) throw new Error(`GET /broadcast вернул HTTP ${bcPrevR.status} — прежнее состояние общего эфира неизвестно`);
+      const bcPrev = bcPrevR.data || {};
+      const bcOn = !!bcPrev.is_on;      // эфир уже включён до прогона: таблица показывает его, а не расписание
       if (bcOn && BC_ALLOWED) {
         // стенд в состоянии «эфир идёт»: выключаем на время прогона, в конце вернём как было
         fx.bc = { prev: bcPrev, dirty: true };
