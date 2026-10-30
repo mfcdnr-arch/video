@@ -330,10 +330,12 @@ def test_week_cells_playable_off_override_still_beats_everything():
 
 
 def test_week_cells_playable_empty_set_drops_all_placements():
-    c = grid([P(7, 9, 13, 10)], playable=set())
+    c = grid([P(7, 9, 13, 10)], playable={1})                # играет только шаблон
     assert all(cell["kind"] == "template" for cell in c.values())
     c = grid([P(7, 9, 13, 10)], slots=[], playable=set())    # шаблона нет — пусто
     assert c[(D, 10)]["kind"] == "empty" and c[(D, 10)]["playlist_ids"] == []
+    c = grid([P(7, 9, 13, 10)], playable=set())              # нечего играть ни показу, ни шаблону — заглушки
+    assert all(cell["kind"] == "empty" and cell["playlist_ids"] == [] for cell in c.values())
 
 
 def test_week_cells_playable_alternate_with_one_unplayable_becomes_single():
@@ -372,3 +374,55 @@ def test_week_cells_playable_override_alternating_with_placement():
 def test_week_cells_playable_other_screen_placements_unaffected():
     c = grid([P(7, 9, 13, 10, screens=(6,))], playable={1})
     assert all(cell["kind"] == "template" for cell in c.values())
+
+
+# --- шаблон и замена на дату, которым нечего играть: как в ленте экрана ------------------
+# Лента выбирает слот шаблона на (день, час) с наибольшим prio ДО фильтра роликов; если его
+# плейлисту играть нечего, слот выпадает целиком (слот уровнем ниже на тот же час его не
+# подменяет), и агент берёт слот «весь день», а без него — заглушки. Замена на дату с
+# пустым плейлистом агентом пропускается так же — дальше шаблон.
+
+def SLOT(hour, pl, prio, dow=D.weekday()):
+    return {"day_of_week": dow, "hour": hour, "playlist_id": pl, "prio": prio}
+
+
+def test_week_cells_unplayable_hour_slot_falls_to_all_day_slot():
+    slots = [SLOT(10, 40, 3), SLOT(None, 1, 1)]
+    c = grid([], slots=slots, playable={1})
+    cell = c[(D, 10)]
+    assert (cell["kind"], cell["playlist_ids"], cell["playlists"]) == ("template", [1], ["Общий"])
+    assert grid([], slots=slots, playable={1, 40})[(D, 10)]["playlist_ids"] == [40]     # играет — как раньше
+
+
+def test_week_cells_unplayable_top_slot_is_not_replaced_by_lower_level_same_hour():
+    # экранный слот 10:00 пуст, групповой слот того же часа играл бы — но лента выбирает
+    # вершину до фильтра и выбрасывает её: дальше «весь день», а не групповой
+    slots = [SLOT(10, 40, 3), SLOT(10, 50, 2), SLOT(None, 1, 1)]
+    assert grid([], slots=slots, playable={1, 50})[(D, 10)]["playlist_ids"] == [1]
+
+
+def test_week_cells_unplayable_all_day_slot_leaves_the_hour_empty():
+    c = grid([], slots=[SLOT(None, 1, 1)], playable=set())
+    assert (c[(D, 10)]["kind"], c[(D, 10)]["playlist_ids"], c[(D, 10)]["playlists"]) == ("empty", [], [])
+    # почасовой пуст и «весь день» пуст — тоже заглушки
+    c = grid([], slots=[SLOT(10, 40, 3), SLOT(None, 1, 1)], playable=set())
+    assert c[(D, 10)]["kind"] == "empty"
+
+
+def test_week_cells_unplayable_override_falls_to_template():
+    c = grid([], overrides=[OV(3, D, pl=30)], playable={1})
+    cell = c[(D, 10)]
+    assert (cell["kind"], cell["playlist_ids"], cell["placement_id"]) == ("template", [1], None)
+    assert grid([], overrides=[OV(3, D, pl=30)], playable={1, 30})[(D, 10)]["kind"] == "override"
+
+
+def test_week_cells_unplayable_placement_and_override_fall_to_template():
+    c = grid([P(7, 9, 13, 10)], overrides=[OV(3, D, pl=30)], playable={1})
+    assert (c[(D, 10)]["kind"], c[(D, 10)]["playlist_ids"]) == ("template", [1])
+
+
+def test_week_cells_without_playable_template_and_override_are_unfiltered():
+    # «Расписание → По датам» фильтр не передаёт: шаблон и замена — как записаны
+    slots = [SLOT(10, 40, 3), SLOT(None, 1, 1)]
+    assert grid([], slots=slots)[(D, 10)]["playlist_ids"] == [40]
+    assert grid([], overrides=[OV(3, D, pl=30)])[(D, 10)]["kind"] == "override"

@@ -475,6 +475,17 @@ def test_template_prio_within_group_and_other_days_ignored():
     assert template_playlist([], 0, 0) is None
 
 
+def test_template_playable_filter_drops_the_chosen_slot_like_the_feed():
+    slots = [{"day_of_week": 0, "hour": 9, "playlist_id": 2, "prio": 3},
+             {"day_of_week": 0, "hour": 9, "playlist_id": 3, "prio": 1},
+             {"day_of_week": 0, "hour": None, "playlist_id": 1, "prio": 1}]
+    assert template_playlist(slots, 0, 9, playable={1, 2, 3}) == 2
+    assert template_playlist(slots, 0, 9, playable={1, 3}) == 1      # вершина часа пуста — «весь день», не prio 1
+    assert template_playlist(slots, 0, 9, playable={3}) is None      # и «весь день» пуст — заглушки
+    assert template_playlist(slots, 0, 9) == 2                       # без фильтра — как записано
+    assert template_playlist(slots, 0, 9, playable=None) == 2
+
+
 def RAW(screen_id=None, group_id=None, dow=0, hour=None, pl=1):
     """Слот шаблона, как его читает placements_store.load_template_slots."""
     return {"screen_id": screen_id, "group_id": group_id, "day_of_week": dow, "hour": hour, "playlist_id": pl}

@@ -340,17 +340,24 @@ def slots_for_screen(template: list[dict], screen_id: int, group_id: int | None)
     return out
 
 
-def template_playlist(slots: list[dict], dow: int, hour: int) -> int | None:
+def template_playlist(slots: list[dict], dow: int, hour: int, playable: set[int] | None = None) -> int | None:
     """Плейлист недельного шаблона для дня недели `dow` и часа `hour`.
 
     slots: {"day_of_week", "hour" (None — весь день), "playlist_id", "prio"}.
     Почасовой слот приоритетнее «весь день»; внутри группы — больший prio.
+
+    playable — id плейлистов, которым есть что играть (None — не фильтровать). Как в
+    ленте экрана: слот с наибольшим prio выбирается ДО фильтра, и если его плейлисту
+    играть нечего, он выпадает целиком — слот уровнем ниже на тот же час его не
+    подменяет; тогда идёт слот «весь день», а если пуст и он — None (заглушки).
     """
     day_slots = [s for s in slots if s["day_of_week"] == dow]
     for group in ([s for s in day_slots if s.get("hour") == hour],
                   [s for s in day_slots if s.get("hour") is None]):
         if group:
-            return max(group, key=lambda s: s.get("prio") or 0)["playlist_id"]
+            playlist_id = max(group, key=lambda s: s.get("prio") or 0)["playlist_id"]
+            if playable is None or playlist_id in playable:
+                return playlist_id
     return None
 
 
@@ -382,6 +389,9 @@ def week_cells(days: list[date], screen_id: int, placements: list[dict], decisio
     выбранных показов, которых в playable нет, выпадают из часа, остальные
     играют как обычно, а если не осталось ни одного — час проваливается к
     переопределению с плейлистом, затем к шаблону (как лента с пустым показом).
+    Переопределение с пустым плейлистом агент тоже пропускает — дальше шаблон;
+    слот шаблона с пустым плейлистом выпадает так же, как в ленте (см.
+    template_playlist): дальше «весь день», а без него — пусто (заглушки).
 
     Клетка: {"date", "hour", "kind", "playlists": [названия], "playlist_ids": [id],
     "placement_id"}. kind: "off" | "placement" | "alternate" (в клетке ≥2
@@ -423,10 +433,10 @@ def week_cells(days: list[date], screen_id: int, placements: list[dict], decisio
                 kind = KIND_OFF
             elif ids:
                 kind = KIND_ALTERNATE if len(ids) >= 2 else KIND_PLACEMENT
-            elif ov and ov.get("playlist_id") is not None:
+            elif ov and ov.get("playlist_id") is not None and (playable is None or ov["playlist_id"] in playable):
                 kind, ids = KIND_OVERRIDE, [ov["playlist_id"]]
             else:
-                template_id = template_playlist(slots, day.weekday(), hour)
+                template_id = template_playlist(slots, day.weekday(), hour, playable)
                 if template_id is not None:
                     kind, ids = KIND_TEMPLATE, [template_id]
             cells.append({"date": day, "hour": hour, "kind": kind,
