@@ -24,7 +24,9 @@
  *      таблица страницы со своим тестовым экраном, поиск, панель «О плейлисте»
  *      (ролики, «Где и когда идёт», просмотр ролика), «✎ Изменить плейлист» и
  *      «📤 Отправить на экраны» поверх страницы (закрываются Esc без сохранения),
- *      полоса общего эфира и окно включения (отмена ничего не отправляет).
+ *      зависший GET /network/live (через 20 с обрыв и строка ошибки, потом
+ *      данные снова обновляются), полоса общего эфира и окно включения (отмена
+ *      ничего не отправляет).
  *      Само ВКЛЮЧЕНИЕ эфира идёт на все экраны сети и выполняется только при
  *      E2E_ALLOW_BROADCAST=1 (на стенде): до следующего часа → жёлтая полоса →
  *      «Сменить плейлист» (окно) → «Выключить»; прежнее состояние эфира
@@ -1014,6 +1016,41 @@ async function restoreBroadcast(page, fx) {
       await page.keyboard.press('Escape');
       (await waitUntil(page, () => document.getElementById('nl-drawer').hidden, null, 5000))
         ? ok('Esc закрывает панель') : bad('Esc не закрыл панель');
+
+      // ── зависший запрос: автообновление не замирает ──
+      // GET /network/live «висит» (перехват без ответа): через 20 с страница обрывает его и
+      // показывает ошибку над прежней таблицей. Обрыв — ожидаемый «запрос не выполнен».
+      // Пока ждём, тик автообновления может поставить ещё один запрос — его держим так же,
+      // а после снятия перехвата он уходит на сервер как обычный.
+      step = 'эфир сети: зависший запрос';
+      expected = [/^запрос не выполнен: .*\/api\/network\/live/];
+      const held = [];
+      const hold = (req) => {
+        if (req.isInterceptResolutionHandled()) return;
+        if (/\/api\/network\/live(\?|$)/.test(req.url())) held.push(req);     // не отвечаем — запрос «висит»
+        else req.continue().catch(() => {});
+      };
+      await page.setRequestInterception(true);
+      page.on('request', hold);
+      let hung = false;
+      try {
+        await page.evaluate(() => { Signage.refreshNetworkLive(); });
+        hung = await waitUntil(page, () => /сервер не ответил за 20 с/.test(
+          (document.querySelector('#nl-main .nl-err') || {}).textContent || ''), null, 30000);
+      } finally {
+        page.off('request', hold);
+        for (const r of held) await r.continue().catch(() => {});            // оборванный браузером — уже не уйдёт
+        await page.setRequestInterception(false);
+      }
+      hung ? ok('зависший запрос оборван через 20 с: «Не удалось обновить данные: сервер не ответил за 20 с»')
+           : bad('зависший запрос не превратился в ошибку за 30 с');
+      (await page.$(rowSel)) ? ok('при ошибке таблица осталась прежней') : bad('при ошибке таблица пропала');
+      await sleep(500);
+      const retryBtn = await page.$('#nl-main [data-action="nl-retry"]');
+      if (retryBtn) await retryBtn.click().catch(() => {});
+      (await waitUntil(page, () => !document.querySelector('#nl-main .nl-err') && !!document.querySelector('#nl-main tbody tr'), null, 15000))
+        ? ok('после зависания данные снова обновляются, ошибка ушла') : bad('после зависания ошибка осталась');
+      expected = [];
 
       // ── полоса общего эфира и окно включения ──
       // окно: открыть кнопкой полосы, выбрать свой плейлист (серый выбрать нельзя)

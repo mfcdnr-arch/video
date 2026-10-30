@@ -18,6 +18,9 @@
 // правом записи).
 //
 // Страница сама перечитывает данные каждые 30 с, пока открыта и вкладка видима.
+// Запрос, не получивший ответа за 20 с, обрывается (AbortController): иначе один
+// зависший запрос держал бы автообновление вечно, без ошибки на странице. Тогда над
+// прежней таблицей — «Не удалось обновить данные: сервер не ответил за 20 с».
 // Поиск, открытая панель (перерисовывается для того же плейлиста), прокрутка и
 // фокус при этом сохраняются: поле поиска и контейнер полосы эфира не
 // перерисовываются, а таблица и панель — только если их разметка изменилась.
@@ -30,6 +33,7 @@
 //=============================================================================
 (function(){
   const REFRESH_MS = 30000;      // автообновление
+  const LOAD_TIMEOUT_MS = 20000; // запрос дольше — ошибка «сервер не ответил», а не вечное ожидание
   const DRAWER_ID = 'nl-drawer';
 
   let S = null;                  // состояние открытого раздела (один на всё приложение)
@@ -496,8 +500,10 @@
 
   function load(st){
     const p = (async () => {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), LOAD_TIMEOUT_MS);
       try{
-        const d = await api('/network/live');
+        const d = await api('/network/live', {signal: ctl.signal});
         if(!alive(st)) return;
         st.data = d;
         st.error = null;
@@ -508,7 +514,9 @@
         if(st.pid != null) loadDetail(st, st.pid);
       }catch(e){
         if(!alive(st) || String(e && e.message) === 'unauthorized') return;
-        st.error = errText(e);
+        st.error = ctl.signal.aborted ? `сервер не ответил за ${LOAD_TIMEOUT_MS / 1000} с` : errText(e);
+      }finally{
+        clearTimeout(timer);
       }
       if(alive(st)){ renderMain(st); renderDrawer(st); }
     })().finally(() => {
