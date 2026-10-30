@@ -44,12 +44,13 @@ def screen_live(cells: list[dict], now: datetime, broadcast: dict | None, broadc
     срок (None — «до отмены»); иначе начало первого часа СЕГОДНЯ, где источник
     или набор плейлистов (kind, playlist_ids) другой; None — до конца дня
     смены нет («до конца дня без изменений», текст пишет фронт). next — эта же
-    первая отличающаяся клетка (from — её начало) или None; при действующем
-    эфире next всегда None: расписание на это время перекрыто, вместо него —
+    первая отличающаяся клетка (from — её начало) или None; пока эфир идёт на
+    этом экране, next None: расписание на это время перекрыто, вместо него —
     after_broadcast: клетка на момент срока эфира (час, в который попал
     срок; за пределами 48 клеток — None) либо текущая клетка, если «до отмены».
     broadcast_skipped — эфир действует, но на этом экране играть нечего: идёт
-    расписание (now — его клетка с ближайшей сменой), экран эфир пропускает.
+    расписание (now — его клетка с ближайшей сменой), экран эфир пропускает;
+    next у такого экрана считается как без эфира — это его ближайшая смена.
     """
     if broadcast is not None and not broadcast.get("is_on", True):
         broadcast = None                          # выключенный эфир в виде get_broadcast — это не эфир
@@ -75,7 +76,10 @@ def screen_live(cells: list[dict], now: datetime, broadcast: dict | None, broadc
     else:
         now_view = {**_view(current), "until": change_at}
 
-    next_view = {**_view(change), "from": change_at} if change is not None and broadcast is None else None
+    # «Дальше» скрыто, только пока эфир реально идёт на этом экране; там, где он пропущен
+    # (нечего играть), экран живёт по расписанию и его ближайшая смена видна, как без эфира.
+    airing = broadcast is not None and broadcast_playable
+    next_view = {**_view(change), "from": change_at} if change is not None and not airing else None
 
     after = None
     if broadcast is not None:

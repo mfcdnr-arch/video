@@ -21,9 +21,6 @@ _ONLINE_TMPL = ("({a}.last_seen IS NOT NULL "
 _OFFLINE_FOR_TMPL = ("CASE WHEN {a}.last_seen IS NULL THEN NULL "
                      "ELSE CAST(EXTRACT(EPOCH FROM (NOW() - {a}.last_seen)) AS INTEGER) END")
 
-ONLINE_SQL = _ONLINE_TMPL
-OFFLINE_FOR_SQL = _OFFLINE_FOR_TMPL
-
 
 def online_sql(alias: str = "s") -> str:
     """SQL-условие «экран в сети» (boolean) для таблицы screens под алиасом alias."""

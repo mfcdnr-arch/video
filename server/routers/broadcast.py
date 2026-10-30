@@ -4,7 +4,8 @@
 наступлении срока он выключается сам (Celery-задача expire_broadcast), экраны
 возвращаются к расписанию. Правила — broadcast_rules, SQL — broadcast_store.
 """
-from datetime import datetime
+import re
+from datetime import date, datetime
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -17,22 +18,47 @@ from placements_store import now_msk
 router = APIRouter()
 
 
+_MAX_INT4 = 2 ** 31 - 1                       # playlists.id — SERIAL
+_ON_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+STALE_WINDOW_TEXT = "Время изменилось — проверьте час окончания"   # тот же текст показывает и окно в панели
+
+
 def _playlist_id(value) -> int | None:
-    """Положительное целое id плейлиста из JSON (int или строка цифр); bool и дроби — нет."""
+    """Положительное целое id плейлиста из JSON (int или строка ASCII-цифр) в пределах int4.
+
+    bool, дроби, «²», арабские и полноширинные цифры, а также числа за пределами
+    int4 (Postgres ответил бы 500) — не id: None, то есть 400 «Не выбран плейлист».
+    """
     if isinstance(value, bool):
         return None
-    if isinstance(value, str) and value.strip().isdigit():
-        value = int(value.strip())
-    return value if isinstance(value, int) and value > 0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        # длина — до int(): строка из тысяч цифр упирается в лимит Python на преобразование
+        value = int(text) if text.isascii() and text.isdigit() and len(text) <= 12 else None
+    return value if isinstance(value, int) and 0 < value <= _MAX_INT4 else None
+
+
+def _parse_on_date(value) -> date:
+    """`on_date` — МСК-дата, на которую открыто окно включения, строго ГГГГ-ММ-ДД; мусор — 400."""
+    if isinstance(value, str) and _ON_DATE.fullmatch(value):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            pass
+    raise HTTPException(400, "Дата окна — строка вида ГГГГ-ММ-ДД")
 
 
 def parse_on_request(body, query_playlist_id, now: datetime) -> tuple[int, datetime | None]:
     """Разобрать запрос на включение эфира → (playlist_id, until_at).
 
-    Основной вид — JSON {"playlist_id": N, "until_hour": H | null}. Для обратной
-    совместимости работает и старый вызов без тела: ?playlist_id=N — «до отмены».
-    id плейлиста из тела главнее запроса. Отсутствующий или null `until_hour` —
-    «до отмены»; всё, что не целый час 1…24 позже текущего, — 400 с понятным текстом.
+    Основной вид — JSON {"playlist_id": N, "until_hour": H | null, "on_date": "ГГГГ-ММ-ДД"}.
+    Для обратной совместимости работает и старый вызов без тела: ?playlist_id=N —
+    «до отмены». id плейлиста из тела главнее запроса. Отсутствующий или null
+    `until_hour` — «до отмены»; всё, что не целый час 1…24 позже текущего, — 400
+    с понятным текстом.
+    `on_date` необязателен: это МСК-дата, на которую открыто окно в панели. Если он
+    есть, а `until_hour` задан и дата уже не сегодняшняя — 400 (окно устарело);
+    без него — прежнее поведение (старые клиенты, smoke). Весь разбор тела — здесь.
     """
     if body is not None and not isinstance(body, dict):
         raise HTTPException(400, "Ожидается JSON-объект {playlist_id, until_hour}")
@@ -41,6 +67,12 @@ def parse_on_request(body, query_playlist_id, now: datetime) -> tuple[int, datet
     playlist_id = _playlist_id(raw_id)
     if playlist_id is None:
         raise HTTPException(400, "Не выбран плейлист")
+    if body.get("on_date") is not None:
+        day = _parse_on_date(body["on_date"])
+        if day != now.date() and body.get("until_hour") is not None:
+            # Час «до 24:00», выбранный вчера в 23:xx, после полуночи означал бы эфир на сутки вперёд.
+            # «До отмены» от даты не зависит.
+            raise HTTPException(400, STALE_WINDOW_TEXT)
     try:
         until_at = parse_until_hour(body.get("until_hour"), now)
     except ValueError as e:
@@ -75,6 +107,7 @@ def broadcast_on(body: dict | None = Body(None), playlist_id: int | None = Query
 
 @router.post("/broadcast/off")
 def broadcast_off(db: Session = Depends(get_db), current_admin=Depends(require_write)):
-    broadcast_store.disable(db, current_admin["username"])
+    now = now_msk()
+    broadcast_store.disable(db, current_admin["username"], now=now)
     db.commit()
-    return {"status": "ok", **broadcast_json(broadcast_store.get_broadcast(db, now_msk()))}
+    return {"status": "ok", **broadcast_json(broadcast_store.get_broadcast(db, now))}

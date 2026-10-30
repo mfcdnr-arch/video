@@ -649,8 +649,8 @@ print(n.hour, u.isoformat(), '24:00' if n.hour == 23 else '%02d:00' % (n.hour + 
           ok "лента экрана: пустому плейлисту эфира нечего играть — эфир здесь не идёт"
         else bad "лента при пустом плейлисте эфира: HTTP $HTTP $(feed_brief)"; fi
         req GET "/network/live"
-        if [ "$HTTP" = "200" ] && body_has "r['broadcast']['is_on'] is True and r['broadcast']['unplayable_screens']>=1 and any(x['id']==$SID and x['broadcast_skipped'] is True and x['now']['kind']!='broadcast' and x['next'] is None for x in r['screens'])"; then
-          ok "обзор сети: пустому плейлисту эфира нечего играть на SMOKE-экране (broadcast_skipped)"
+        if [ "$HTTP" = "200" ] && body_has "r['broadcast']['is_on'] is True and r['broadcast']['unplayable_screens']>=1 and any(x['id']==$SID and x['broadcast_skipped'] is True and x['now']['kind']!='broadcast' and (x['next'] is not None)==(x['now']['until'] is not None) and (x['next'] is None or x['next']['from']==x['now']['until']) for x in r['screens'])"; then
+          ok "обзор сети: пустому плейлисту эфира нечего играть на SMOKE-экране (broadcast_skipped), «дальше» — его расписание"
         else bad "обзор сети при пустом плейлисте эфира: HTTP $HTTP"; fi
         req POST "/playlists/$BC_PID_TMP/items?media_id=$MID3"
         [ "$HTTP" = "200" ] && ok "ролик SMOKE_now добавлен в плейлист эфира" || bad "ролик в плейлист эфира: HTTP $HTTP"

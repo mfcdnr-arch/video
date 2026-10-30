@@ -171,6 +171,18 @@ def test_unplayable_screens_count_broadcast_skipped():
     assert by_id[3]["broadcast_skipped"] is True
 
 
+def test_skipped_screen_keeps_its_schedule_next_while_a_playing_screen_hides_it():
+    # экран 1 играет эфир (расписание перекрыто), экран 2 эфир пропускает и идёт по расписанию
+    day = cells([(0, 12, "template", [1]), (12, 24, "placement", [2])])
+    screens = [scr(1, "А", venue="store_alcohol"), scr(2, "Б", venue="other")]
+    r = live(screens, cells_by_screen={1: day, 2: day}, broadcast=bc(), playable={"store_alcohol": {9}, "other": {1}})
+    by_id = {s["id"]: s for s in r["screens"]}
+    assert by_id[1]["broadcast_skipped"] is False and by_id[1]["next"] is None
+    assert by_id[2]["broadcast_skipped"] is True
+    assert by_id[2]["next"] == {"kind": "placement", "playlist_ids": [2], "playlists": ["PL2"],
+                                "from": "2026-10-28T12:00:00"}
+
+
 def test_venue_without_playable_set_cannot_play_broadcast():
     r = live([scr(1, "А", venue="unknown")], broadcast=bc(), playable={"other": {9}})
     assert r["screens"][0]["broadcast_skipped"] is True and r["broadcast"]["unplayable_screens"] == 1

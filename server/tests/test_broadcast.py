@@ -236,7 +236,39 @@ def test_enable_over_expired_row_is_a_fresh_start_not_a_change():
     """Срок вышел, Celery ещё не успел выключить — для журнала эфир уже не идёт."""
     db = bc_db(STATE(until_at=datetime(2026, 10, 28, 14, 0)))
     store.enable(db, 8, UNTIL, "admin", now=N)
-    assert audit(db)[0][0] == "Общий эфир включён"
+    assert audit(db)[-1][0] == "Общий эфир включён"
+
+
+EXPIRED = datetime(2026, 10, 28, 14, 0)         # срок вышел за 30 минут до N, Celery ещё не отработал
+
+
+def test_enable_before_celery_tick_journals_the_old_broadcast_expiry_first():
+    """Админ включает новый эфир в окне ≤ 60 с после срока: старый должен получить «завершён по времени»."""
+    db = bc_db(STATE(until_at=EXPIRED, name="Старый"), playlist="Новый")
+    store.enable(db, 8, UNTIL, "admin", now=N)
+    assert audit(db) == [
+        ("Общий эфир завершён по времени", "Плейлист: «Старый»", "система"),
+        ("Общий эфир включён", "Плейлист: «Новый» · до 16:00", "admin"),
+    ]
+    assert any("FOR UPDATE OF b" in s for s in db.sqls("FROM network_broadcast"))   # под блокировкой строки
+
+
+def test_enable_at_the_exact_until_moment_counts_as_expired():
+    db = bc_db(STATE(until_at=UNTIL, name="Старый"), playlist="Новый")
+    store.enable(db, 8, None, "admin", now=UNTIL)
+    assert [a[0] for a in audit(db)] == ["Общий эфир завершён по времени", "Общий эфир включён"]
+
+
+@pytest.mark.parametrize("state", [
+    STATE(until_at=UNTIL),                                  # идёт, срок впереди → «сменён», без записи об истечении
+    STATE(until_at=None),                                   # «до отмены» не истекает
+    STATE(is_on=False, playlist_id=None, name=None, until_at=EXPIRED),   # уже выключен
+])
+def test_enable_writes_no_expiry_entry_when_nothing_expired(state):
+    db = bc_db(state)
+    store.enable(db, 8, None, "admin", now=N)
+    assert all(a[0] != "Общий эфир завершён по времени" for a in audit(db))
+    assert len(audit(db)) == 1
 
 
 def test_enable_writes_enabled_at_in_msk_from_python_not_postgres_now():
@@ -263,7 +295,7 @@ def test_enable_unknown_playlist_changes_nothing():
 
 def test_disable_clears_state_and_journals():
     db = bc_db(STATE())
-    store.disable(db, "admin")
+    store.disable(db, "admin", now=N)
     (sql,) = db.sqls("UPDATE network_broadcast")
     assert "is_on = FALSE" in sql and "playlist_id = NULL" in sql and "until_at = NULL" in sql
     assert audit(db) == [("Общий эфир выключен", "Плейлист: «Акция»", "admin")]
@@ -272,8 +304,31 @@ def test_disable_clears_state_and_journals():
 
 def test_disable_custom_title_and_no_detail_when_nothing_was_on():
     db = bc_db(None)
-    store.disable(db, "система", "Общий эфир завершён по времени")
+    store.disable(db, "система", "Общий эфир завершён по времени", now=N)
     assert audit(db) == [("Общий эфир завершён по времени", None, "система")]
+
+
+def test_disable_before_celery_tick_journals_only_the_expiry_not_a_manual_off():
+    """«Выключить» в окне ≤ 60 с после срока: эфир уже кончился сам — записи «выключен» не будет."""
+    db = bc_db(STATE(until_at=EXPIRED))
+    store.disable(db, "admin", now=N)
+    assert audit(db) == [("Общий эфир завершён по времени", "Плейлист: «Акция»", "система")]
+    (sql,) = db.sqls("UPDATE network_broadcast")                      # строка всё равно выключена
+    assert "is_on = FALSE" in sql and "playlist_id = NULL" in sql and "until_at = NULL" in sql
+    assert any("FOR UPDATE OF b" in s for s in db.sqls("FROM network_broadcast"))
+
+
+def test_disable_before_deadline_is_still_a_manual_off():
+    db = bc_db(STATE(until_at=UNTIL))
+    store.disable(db, "admin", now=N)
+    assert audit(db) == [("Общий эфир выключен", "Плейлист: «Акция»", "admin")]
+
+
+def test_disable_default_now_is_msk(monkeypatch):
+    monkeypatch.setattr(store, "now_msk", lambda: N)
+    db = bc_db(STATE(until_at=EXPIRED))
+    store.disable(db, "admin")
+    assert audit(db)[0][0] == "Общий эфир завершён по времени"
 
 
 def test_expire_due_switches_off_after_until_and_journals_it():
@@ -346,6 +401,80 @@ def test_on_request_bad_until_hour_is_400_with_russian_text(hour):
         parse_on_request({"playlist_id": 5, "until_hour": hour}, None, N)
     assert e.value.status_code == 400
     assert "Час окончания" in e.value.detail
+
+
+# --- on_date: дата, для которой открыли окно (защита от «до 24:00» после полуночи) ---
+
+def test_on_request_matching_on_date_is_ok():
+    body = {"playlist_id": 5, "until_hour": 16, "on_date": "2026-10-28"}
+    assert parse_on_request(body, None, N) == (5, datetime(2026, 10, 28, 16, 0))
+
+
+def test_on_request_stale_on_date_with_until_hour_is_400_with_window_text():
+    """Окно открыли вчера в 23:xx, отправили после полуночи: «до 24:00» теперь значило бы сутки вперёд."""
+    for hour in (16, 24):
+        body = {"playlist_id": 5, "until_hour": hour, "on_date": "2026-10-27"}
+        with pytest.raises(HTTPException) as e:
+            parse_on_request(body, None, N)
+        assert e.value.status_code == 400
+        assert e.value.detail == "Время изменилось — проверьте час окончания"
+
+
+def test_on_request_future_on_date_is_also_stale():
+    with pytest.raises(HTTPException) as e:
+        parse_on_request({"playlist_id": 5, "until_hour": 16, "on_date": "2026-10-29"}, None, N)
+    assert e.value.status_code == 400 and "Время изменилось" in e.value.detail
+
+
+def test_on_request_stale_on_date_does_not_matter_for_until_cancel():
+    """«До отмены» от даты не зависит — запрос проходит."""
+    for body in ({"playlist_id": 5, "on_date": "2026-10-27"},
+                 {"playlist_id": 5, "until_hour": None, "on_date": "2026-10-27"}):
+        assert parse_on_request(body, None, N) == (5, None)
+
+
+def test_on_request_without_on_date_keeps_legacy_behaviour():
+    assert parse_on_request({"playlist_id": 5, "until_hour": 16}, None, N) == (5, datetime(2026, 10, 28, 16, 0))
+    assert parse_on_request({"playlist_id": 5, "until_hour": 16, "on_date": None}, None, N) == (5, datetime(2026, 10, 28, 16, 0))
+
+
+@pytest.mark.parametrize("bad", ["2026-13-45", "28.10.2026", "2026-1-5", "20261028", "2026-W44-3",
+                                 "", " 2026-10-28", "２０２６-１０-２８", 20261028, True, [], {}])
+def test_on_request_malformed_on_date_is_400(bad):
+    with pytest.raises(HTTPException) as e:
+        parse_on_request({"playlist_id": 5, "until_hour": 16, "on_date": bad}, None, N)
+    assert e.value.status_code == 400
+    assert "Дата окна" in e.value.detail
+
+
+def test_on_request_malformed_on_date_is_400_even_for_until_cancel():
+    with pytest.raises(HTTPException) as e:
+        parse_on_request({"playlist_id": 5, "on_date": "вчера"}, None, N)
+    assert e.value.status_code == 400
+
+
+# --- id плейлиста: «²» и числа за пределами int4 — 400, а не 500 ----------------
+
+@pytest.mark.parametrize("bad", ["²", " ² ", "٣", "５", "1_0", "5.5", "-3", "2147483648", 2147483648,
+                                 "99999999999999999999"])
+def test_on_request_exotic_or_huge_playlist_id_is_400(bad):
+    with pytest.raises(HTTPException) as e:
+        parse_on_request({"playlist_id": bad}, None, N)
+    assert e.value.status_code == 400
+    with pytest.raises(HTTPException):
+        parse_on_request(None, bad, N)                 # и из ?playlist_id=
+
+
+def test_on_request_absurdly_long_digit_string_is_400_not_a_crash():
+    """int() на строке длиннее 4300 цифр бросает ValueError — это должен быть 400, а не 500."""
+    with pytest.raises(HTTPException) as e:
+        parse_on_request({"playlist_id": "9" * 5000}, None, N)
+    assert e.value.status_code == 400
+
+
+def test_on_request_playlist_id_boundaries():
+    assert parse_on_request({"playlist_id": 2147483647}, None, N)[0] == 2147483647
+    assert parse_on_request({"playlist_id": " 12 "}, None, N)[0] == 12
 
 
 def test_broadcast_json_serializes_dates_as_iso():

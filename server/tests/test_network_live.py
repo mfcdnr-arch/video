@@ -186,8 +186,30 @@ def test_screen_live_broadcast_unplayable_falls_to_schedule():
     assert r["broadcast_skipped"] is True
     # на экране идёт расписание, а не эфир
     assert r["now"] == {"kind": "template", "playlist_ids": [1], "playlists": ["PL1"], "until": "2026-10-28T13:00:00"}
-    assert r["next"] is None                                  # эфир действует — колонка «После эфира»
+    # эфир на этом экране не идёт — экран живёт по расписанию, поэтому «дальше» — его ближайшая смена
+    assert r["next"] == {"kind": "placement", "playlist_ids": [2], "playlists": ["PL2"], "from": "2026-10-28T13:00:00"}
     assert r["after_broadcast"] == {"kind": "template", "playlist_ids": [1], "playlists": ["PL1"]}
+
+
+def test_screen_live_skipped_screen_next_equals_next_without_broadcast():
+    c = cells([(0, 13, "template", [1]), (13, 15, "placement", [2]), (15, 24, "template", [1])])
+    now = datetime(2026, 10, 28, 10, 30)
+    skipped = screen_live(c, now, bc(datetime(2026, 10, 28, 15, 0)), False)
+    without = screen_live(c, now, None, True)
+    assert skipped["next"] == without["next"] and skipped["next"] is not None
+    assert skipped["now"] == without["now"]
+
+
+def test_screen_live_skipped_screen_without_further_changes_has_no_next():
+    c = cells([(0, 24, "template", [1])])
+    r = screen_live(c, datetime(2026, 10, 28, 10, 30), bc(None), False)
+    assert r["broadcast_skipped"] is True and r["next"] is None
+
+
+def test_screen_live_playing_broadcast_still_hides_next():
+    c = cells([(0, 13, "template", [1]), (13, 24, "placement", [2])])
+    r = screen_live(c, datetime(2026, 10, 28, 10, 30), bc(datetime(2026, 10, 28, 18, 0)), True)
+    assert r["broadcast_skipped"] is False and r["next"] is None
 
 
 def test_screen_live_broadcast_unplayable_until_cancel():

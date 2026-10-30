@@ -51,6 +51,30 @@ def _audit(db, title: str, detail: str | None, actor: str) -> None:
     """), {"type": AUDIT_TYPE, "t": title, "d": detail, "a": actor})
 
 
+def _expired(row: dict | None, now: datetime) -> bool:
+    """Строка ещё помечена «включён», но срок (until_at) уже вышел: Celery не успел её выключить."""
+    return bool(row and row["is_on"] and row["until_at"] is not None and row["until_at"] <= now)
+
+
+def _playlist_detail(row: dict | None) -> str | None:
+    """Деталь журнала: плейлист, который шёл; None — если эфир не шёл или плейлиста уже нет."""
+    return f"Плейлист: «{row['playlist_name']}»" if row and row["is_on"] and row["playlist_name"] else None
+
+
+def _journal_expiry(db, row: dict | None) -> None:
+    """Запись «Общий эфир завершён по времени» от имени системы — одна и та же для Celery,
+    для включения и для выключения в окне между сроком и ближайшим тиком Celery."""
+    _audit(db, TITLE_EXPIRED, _playlist_detail(row), SYSTEM_ACTOR)
+
+
+def _reset(db) -> None:
+    db.execute(text("""
+        UPDATE network_broadcast
+        SET is_on = FALSE, playlist_id = NULL, until_at = NULL
+        WHERE id = 1
+    """))
+
+
 def get_broadcast(db, now: datetime) -> dict:
     """Состояние эфира в момент `now` (наивное МСК).
 
@@ -70,14 +94,22 @@ def enable(db, playlist_id: int, until_at: datetime | None, actor: str,
     """Включить общий эфир с плейлистом `playlist_id` до `until_at` (None — до отмены).
 
     Если эфир уже идёт — это смена плейлиста/срока: в журнале «Общий эфир
-    сменён», иначе «Общий эфир включён». Нет такого плейлиста — LookupError,
-    ничего не записано. `now` — для тестов, по умолчанию текущее МСК.
+    сменён», иначе «Общий эфир включён». Если у прежнего эфира срок уже вышел, а
+    Celery ещё не успел его выключить (окно до минуты), сначала пишется его
+    «Общий эфир завершён по времени» — иначе он бы исчез из журнала без следа.
+    Нет такого плейлиста — LookupError, ничего не записано. `now` — для тестов,
+    по умолчанию текущее МСК.
     """
     now = now or now_msk()
     pl = db.execute(text("SELECT name FROM playlists WHERE id = :pid"), {"pid": playlist_id}).fetchone()
     if pl is None:
         raise LookupError("Плейлист не найден")
-    running = get_broadcast(db, now)["is_on"]
+    row = _load(db, lock=True)                   # под блокировкой: Celery и другой админ подождут
+    if _expired(row, now):
+        _journal_expiry(db, row)
+        running = False
+    else:
+        running = effective_on(row, now)
 
     db.execute(text("""
         INSERT INTO network_broadcast (id, is_on, playlist_id, until_at, enabled_by, enabled_at)
@@ -90,21 +122,24 @@ def enable(db, playlist_id: int, until_at: datetime | None, actor: str,
            f"Плейлист: «{pl.name}» · {until_text(until_at)}", actor)
 
 
-def disable(db, actor: str, title: str = TITLE_OFF) -> None:
+def disable(db, actor: str, title: str = TITLE_OFF, now: datetime | None = None) -> None:
     """Выключить общий эфир (is_on = FALSE, плейлист и срок сброшены) и записать в журнал.
 
     В детали журнала — плейлист, который шёл. Все читатели (лента экрана,
     список закачки, симулятор, дашборд, предпросмотр показа) смотрят состояние
     через get_broadcast, напрямую таблицу никто не читает.
+
+    Если срок эфира уже вышел, а Celery ещё не выключил строку, эфир кончился
+    сам: пишем «Общий эфир завершён по времени» (а не «выключен» от админа),
+    второй записи нет, строка всё равно сбрасывается. `now` — для тестов.
     """
-    row = _load(db)
-    detail = f"Плейлист: «{row['playlist_name']}»" if row and row["is_on"] and row["playlist_name"] else None
-    db.execute(text("""
-        UPDATE network_broadcast
-        SET is_on = FALSE, playlist_id = NULL, until_at = NULL
-        WHERE id = 1
-    """))
-    _audit(db, title, detail, actor)
+    now = now or now_msk()
+    row = _load(db, lock=True)
+    _reset(db)
+    if _expired(row, now):
+        _journal_expiry(db, row)
+        return
+    _audit(db, title, _playlist_detail(row), actor)
 
 
 def expire_due(db, now: datetime) -> bool:
@@ -114,7 +149,8 @@ def expire_due(db, now: datetime) -> bool:
     миг, не будет сброшен по старому сроку. «До отмены» (until_at IS NULL) не трогаем.
     """
     row = _load(db, lock=True)
-    if not row or not row["is_on"] or row["until_at"] is None or row["until_at"] > now:
+    if not _expired(row, now):
         return False
-    disable(db, SYSTEM_ACTOR, TITLE_EXPIRED)
+    _reset(db)
+    _journal_expiry(db, row)
     return True
