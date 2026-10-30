@@ -24,20 +24,26 @@
 // экраны не на площадке store_alcohol (venue_type из /network/live) и ещё ДО
 // включения пишет «На K экранах нечего играть — там идёт обычное расписание»;
 // число обновляется при смене плейлиста.
-// POST /broadcast/on {playlist_id, until_hour}; ошибка сервера — внутри окна.
+// POST /broadcast/on {playlist_id, until_hour, on_date}; ошибка сервера — внутри окна.
 // Пока идёт запрос, кнопки отключены, форма заморожена, а Esc / ✕ / клик по фону
 // окно не закрывают. После успеха окно закрывается, страница перечитывается.
 // Час «до» собран от часа МСК на момент открытия: если к отправке час (или сутки)
 // сменился, запрос не уходит — список пересобирается, окно просит проверить час
-// (иначе «24:00», выбранное в 23:xx, после полуночи дало бы эфир на сутки).
+// (иначе «24:00», выбранное в 23:xx, после полуночи дало бы эфир на сутки). Вторая
+// страховка — on_date (МСК-дата, на которую собран список): сервер сам отвечает 400
+// «Время изменилось…», если к его приходу сутки уже сменились.
 //
 // Время от сервера — наивное МСК («2026-10-29T16:00:00»): ЧЧ:ММ берётся срезом
-// строки, через new Date() его пропускать нельзя. Единственное исключение —
-// «сегодняшний час по Москве» для списка часов: его даёт Intl с поясом Europe/Moscow.
+// строки, через new Date() его пропускать нельзя. «Сейчас по Москве» (час и дата для
+// списка часов и этой проверки) берётся не с часов браузера, а со времени сервера:
+// generated_at из /network/live + сколько прошло с его получения (часы компьютера
+// могут уходить; пояс браузера тоже ни при чём). Intl с поясом Europe/Moscow —
+// запасной путь, пока данных сервера ещё нет.
 //=============================================================================
 (function(){
   const TZ = 'Europe/Moscow';
   const PENDING_MS = 6000;          // сколько после успеха ждать свежих данных, не размораживая кнопки
+  const STALE_TEXT = 'Время изменилось — проверьте час окончания';   // тот же текст отдаёт сервер (400 по on_date)
 
   let barData = null;               // последние данные /network/live
   let barBusy = false;              // идёт запрос «Выключить»
@@ -46,6 +52,7 @@
   let barHtml = '';                 // что сейчас нарисовано (не перерисовываем то же самое)
   let barBox = null;                // контейнер, в который это нарисовано
   let W = null;                     // открытое окно (оно может быть только одно)
+  let clock = null;                 // {base, at}: «настенное» МСК сервера в мс на оси UTC и Date.now() в момент приёма
 
   const $ = id => document.getElementById(id);
   const hh = n => String(n).padStart(2, '0');
@@ -110,14 +117,28 @@
     return h && m ? `${h} ч ${m} мин` : h ? `${h} ч` : `${m} мин`;
   }
 
-  // Текущий час по Москве (0…23) — по часам браузера, в поясе Москвы
-  function mskHour(refIso){
-    try{
-      const h = parseInt(new Intl.DateTimeFormat('ru-RU', {timeZone: TZ, hour: '2-digit', hourCycle: 'h23'}).format(new Date()), 10);
-      if(h >= 0 && h <= 23) return h;
+  // Запомнить время сервера из свежего ответа /network/live (generated_at — наивное МСК)
+  function syncClock(iso){
+    const t = secs(iso);
+    if(isFinite(t)) clock = {base: t * 1000, at: Date.now()};
+  }
+
+  // «Сейчас по Москве»: {hour: 0…23, date: 'ГГГГ-ММ-ДД'}. Время сервера + прошедшее с его получения;
+  // «настенные» числа МСК лежат на оси UTC (Date.UTC), поэтому читаем их getUTC*, не локальными.
+  function mskNow(){
+    if(clock){
+      const d = new Date(clock.base + (Date.now() - clock.at));
+      return {hour: d.getUTCHours(), date: `${d.getUTCFullYear()}-${hh(d.getUTCMonth() + 1)}-${hh(d.getUTCDate())}`};
+    }
+    try{                                                            // данных сервера ещё нет — Intl с поясом Москвы
+      const parts = new Intl.DateTimeFormat('en-CA', {timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', hourCycle: 'h23'}).formatToParts(new Date());
+      const get = t => (parts.find(x => x.type === t) || {}).value;
+      const hour = parseInt(get('hour'), 10);
+      if(hour >= 0 && hour <= 23 && /^\d{4}$/.test(get('year') || '')) return {hour, date: `${get('year')}-${get('month')}-${get('day')}`};
     }catch(_){}
-    const g = parseInt(String(refIso || '').slice(11, 13), 10);    // запасной путь: час из ответа сервера
-    return g >= 0 && g <= 23 ? g : new Date().getHours();
+    const d = new Date();                                           // совсем запасной путь: часы компьютера
+    return {hour: d.getHours(), date: `${d.getFullYear()}-${hh(d.getMonth() + 1)}-${hh(d.getDate())}`};
   }
 
   // ---- полоса ---------------------------------------------------------------------
@@ -186,6 +207,7 @@
 
   function renderBroadcastBar(data){
     barData = data || null;
+    if(data) syncClock(data.generated_at);       // сюда приходят только свежие данные /network/live
     barPending = false;            // свежие данные пришли — кнопки снова живые
     clearTimeout(barTimer);
     paintBar();
@@ -204,7 +226,7 @@
   async function turnOff(){
     if(barBusy || barPending || !canWrite()) return;
     const name = barData && barData.broadcast && barData.broadcast.playlist_name;
-    if(!confirm(`Выключить общий эфир${name ? ` «${name}»` : ''}? Экраны сразу вернутся к своему расписанию.`)) return;
+    if(!confirm(`Выключить общий эфир${name ? ` «${name}»` : ''}? Экраны вернутся к своему расписанию в течение минуты.`)) return;
     barBusy = true;
     paintBar();
     let ok = false;
@@ -232,9 +254,12 @@
     return h;
   }
 
+  // «Включить на N экранах» — число N это экраны, на которых эфир реально пойдёт: если ему нигде нечего
+  // играть (предупреждение «Эфир ничего не перекроет»), подпись без числа, чтобы не обещать лишнего
   function submitLabel(st){
     if(st.mode === 'change') return 'Сменить плейлист';
-    return st.n > 0 ? 'Включить ' + onScreens(st.n) : 'Включить';
+    if(!(st.n > 0) || (st.loaded && coverage(st).play === 0)) return 'Включить';
+    return 'Включить ' + onScreens(st.n);
   }
 
   function playlistCaption(p){ return p.playable ? '' : 'нечего играть — нет одобренных роликов в сроке'; }
@@ -363,12 +388,14 @@
   }
 
   // Список часов пересобирается от текущего часа по МСК (при открытии окна, после отказа сервера и
-  // если к отправке час сменился). Наступили новые сутки (час стал меньше прежнего) — выбранный час
-  // сбрасывается на ближайший: прежнее «24:00» теперь означало бы эфир на сутки вперёд.
+  // если к отправке час сменился). Наступили новые сутки (изменилась дата или час стал меньше прежнего) —
+  // выбранный час сбрасывается на ближайший: прежнее «24:00» теперь означало бы эфир на сутки вперёд.
   function rebuildHours(st){
-    const prev = st.nowHour;
-    st.nowHour = mskHour(barData && barData.generated_at);
-    if(st.nowHour < prev || !(st.hour > st.nowHour && st.hour <= 24)) st.hour = st.nowHour + 1;
+    const prevHour = st.nowHour, prevDate = st.nowDate;
+    const now = mskNow();
+    st.nowHour = now.hour;
+    st.nowDate = now.date;
+    if(now.hour < prevHour || now.date !== prevDate || !(st.hour > st.nowHour && st.hour <= 24)) st.hour = st.nowHour + 1;
     const sel = $('bc-until-hour');
     if(sel) sel.innerHTML = hoursHtml(st.nowHour, st.hour);
   }
@@ -380,9 +407,10 @@
     if(!st || st.busy || !st.loaded || st.picked == null) return;
     const pl = st.playlists.find(p => p.id === st.picked);
     if(!pl || !pl.playable) return;
-    if(st.dur === 'until' && mskHour(barData && barData.generated_at) !== st.nowHour){
-      rebuildHours(st);                        // час сменился, пока окно было открыто: ничего не шлём
-      showErr('Время изменилось — проверьте час окончания');
+    const now = mskNow();
+    if(st.dur === 'until' && (now.hour !== st.nowHour || now.date !== st.nowDate)){
+      rebuildHours(st);                        // час (или сутки) сменился, пока окно было открыто: ничего не шлём
+      showErr(STALE_TEXT);
       const sel = $('bc-until-hour');
       if(sel) sel.focus({preventScroll: true});
       return;
@@ -391,8 +419,9 @@
     showErr('');
     let r;
     try{
-      r = await api('/broadcast/on', {method: 'POST',
-        body: JSON.stringify({playlist_id: st.picked, until_hour: st.dur === 'until' ? st.hour : null})});
+      const body = {playlist_id: st.picked, until_hour: st.dur === 'until' ? st.hour : null};
+      if(st.dur === 'until') body.on_date = st.nowDate;      // дата, на которую собран список часов (сервер сверяет)
+      r = await api('/broadcast/on', {method: 'POST', body: JSON.stringify(body)});
     }catch(e){
       if(String(e && e.message) === 'unauthorized'){ if(!st.closed) st.modal.close(); return; }
       if(st.closed) return;
@@ -420,7 +449,7 @@
 
     const st = W = {
       mode, loaded: false, closed: false, busy: false,
-      playlists: [], picked: null, query: '', dur: 'until', hour: 0, nowHour: 0,
+      playlists: [], picked: null, query: '', dur: 'until', hour: 0, nowHour: 0, nowDate: '',
       n: 0, screens: [], currentPid: null, modal: null,
     };
     const modal = openModal({
@@ -453,7 +482,9 @@
 
     let data, list;
     try{
-      [data, list] = await Promise.all([barData || api('/network/live'), api('/playlists')]);
+      // свежие данные /network/live — часы сервера запоминаем в момент ответа, не дожидаясь /playlists
+      const live = barData || api('/network/live').then(d => { if(d) syncClock(d.generated_at); return d; });
+      [data, list] = await Promise.all([live, api('/playlists')]);
     }catch(e){
       if(st.closed) return;
       modal.el.querySelector('.modal-body').innerHTML =
@@ -473,7 +504,9 @@
       .sort((x, y) => (y.playable - x.playable)
         || x.name.localeCompare(y.name, 'ru', {numeric: true, sensitivity: 'base'}) || x.id - y.id);
 
-    st.nowHour = mskHour(data && data.generated_at);
+    const now = mskNow();
+    st.nowHour = now.hour;
+    st.nowDate = now.date;
     st.hour = st.nowHour + 1;
     if(mode === 'change' && b.is_on){
       st.currentPid = b.playlist_id != null ? Number(b.playlist_id) : null;
