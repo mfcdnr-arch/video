@@ -5,7 +5,9 @@
   • это не реклама алкоголя (category 'alcohol') — она идёт только на площадке
     «магазин с алколицензией» (ст. 21 38-ФЗ);
   • срок показа не вышел: valid_from ≤ сейчас ≤ valid_until (пустая граница не
-    ограничивает). «Сейчас» — часы БД (NOW()).
+    ограничивает). Срок — TIMESTAMP без пояса, панель пишет его по Москве, поэтому
+    «сейчас» — часы БД, переведённые в МСК (NOW_MSK_SQL): голое NOW() в контейнере
+    БД — UTC, и «по 18:00» играло бы до 21:00.
 
 Правило — SQL-фрагмент playable_sql с параметром :venue (тип площадки экрана). Его
 берут лента экрана (load_playable_items), часовой блок (admin_panel.ad_sequence) и
@@ -21,6 +23,10 @@ LICENSED_VENUE = "store_alcohol"      # площадка с алколиценз
 UNLICENSED_VENUE = "other"            # любая другая площадка (store / mall / office / other) — без неё
 DEFAULT_VENUE = "other"               # тип площадки экрана, у которого он не задан (venue_type NULL)
 
+# «Сейчас» по Москве в самом SQL — для сравнения с наивными МСК-колонками срока показа
+# (media.valid_from / valid_until). Берут и отчёт по срокам, и дашборд.
+NOW_MSK_SQL = "(NOW() AT TIME ZONE 'Europe/Moscow')"
+
 
 def venue_sql(alias: str = "m") -> str:
     """SQL-условие «ролик допустим на площадке :venue» (реклама алкоголя — только с алколицензией)."""
@@ -32,8 +38,8 @@ def playable_sql(alias: str = "m") -> str:
     """SQL-условие «ролик можно играть сейчас на площадке :venue» для таблицы media под алиасом alias."""
     a = alias
     return (f"{a}.status = 'ready' AND {a}.review_status = 'approved' AND {venue_sql(a)} "
-            f"AND ({a}.valid_from IS NULL OR {a}.valid_from <= NOW()) "
-            f"AND ({a}.valid_until IS NULL OR {a}.valid_until >= NOW())")
+            f"AND ({a}.valid_from IS NULL OR {a}.valid_from <= {NOW_MSK_SQL}) "
+            f"AND ({a}.valid_until IS NULL OR {a}.valid_until >= {NOW_MSK_SQL})")
 
 
 def load_playable_items(db, playlist_id: int, venue: str) -> list[dict]:

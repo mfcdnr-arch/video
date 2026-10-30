@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import admin_panel
 import playable_store
-from playable_store import (DEFAULT_VENUE, LICENSED_VENUE, UNLICENSED_VENUE, load_playable_by_venue,
+from playable_store import (DEFAULT_VENUE, LICENSED_VENUE, NOW_MSK_SQL, UNLICENSED_VENUE, load_playable_by_venue,
                             load_playable_items, playable_sql, venue_sql)
 
 
@@ -52,8 +52,8 @@ def test_playable_sql_has_every_condition():
     assert "m.status = 'ready'" in sql
     assert "m.review_status = 'approved'" in sql                      # модерация 38-ФЗ
     assert venue_sql("m") in sql                                      # алкоголь — по площадке
-    assert "(m.valid_from IS NULL OR m.valid_from <= NOW())" in sql   # срок показа — часы БД
-    assert "(m.valid_until IS NULL OR m.valid_until >= NOW())" in sql
+    assert f"(m.valid_from IS NULL OR m.valid_from <= {NOW_MSK_SQL})" in sql   # срок показа — по Москве
+    assert f"(m.valid_until IS NULL OR m.valid_until >= {NOW_MSK_SQL})" in sql
 
 
 def test_venue_sql_lets_alcohol_only_on_licensed_venue():
@@ -165,3 +165,32 @@ def test_feed_template_slots_use_the_rule_with_validity():
     screens.schedule_for_minipc(1, db=db, _screen=None)
     (slots_sql,) = [s for s in db.sqls if "FROM best b" in s and "json_agg" in s]
     assert " ".join(playable_sql("m").split()) in slots_sql
+
+
+# --- срок показа — по московскому времени ------------------------------------------
+# valid_from / valid_until — TIMESTAMP без пояса, панель пишет их по Москве, а NOW() БД
+# живёт в UTC: голое сравнение с NOW() сдвигало срок на 3 часа («по 18:00» играло до 21:00).
+
+def test_now_msk_sql_is_moscow_time_of_the_db_clock():
+    assert NOW_MSK_SQL == "(NOW() AT TIME ZONE 'Europe/Moscow')"
+
+
+def test_playable_sql_compares_validity_with_moscow_time_only():
+    sql = playable_sql("m")
+    assert sql.count(NOW_MSK_SQL) == 2
+    assert "NOW()" not in sql.replace(NOW_MSK_SQL, "")             # голого NOW() (UTC) нет
+
+
+def test_validity_report_uses_moscow_time():
+    from routers import reports
+    db = RecDB()
+    reports._data_validity(db)
+    ((sql, _),) = db.calls
+    assert sql.count(NOW_MSK_SQL) == 2 and "NOW()" not in sql.replace(NOW_MSK_SQL, "")
+
+
+def test_dashboard_expiring_media_uses_moscow_time():
+    from routers import system
+    src = inspect.getsource(system.dashboard)
+    block = src[src.index("expiring = db.execute"):src.index(".fetchall()", src.index("expiring = db.execute"))]
+    assert block.count("NOW_MSK_SQL") == 2 and "NOW()" not in block

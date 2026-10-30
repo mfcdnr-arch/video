@@ -21,6 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from deps import get_db, get_current_admin, advertiser_scope
+from placements_store import now_msk
 from routers.billing import _calc_amount, _parse_date
 
 router = APIRouter()
@@ -430,7 +431,7 @@ def advertiser_alerts(aid: int = Depends(advertiser_scope),
                valid_until, is_broken
         FROM media WHERE advertiser_id = :aid
     """), {"aid": aid}).fetchall()
-    now = datetime.utcnow()
+    now = now_msk()               # срок показа и сроки оплаты — по Москве, как их вводят
     for c in creatives:
         if c.review_status == "rejected":
             out.append({"level": "danger", "kind": "rejected",
@@ -456,7 +457,7 @@ def advertiser_alerts(aid: int = Depends(advertiser_scope),
         FROM invoices WHERE advertiser_id = :aid AND status = 'issued'
         ORDER BY period_start DESC
     """), {"aid": aid}).fetchall()
-    today = (now + timedelta(hours=3)).date()
+    today = now.date()
     for i in invoices:
         total = float(i.amount) + float(i.adjustment_amount or 0)
         overdue = i.due_date and i.due_date < today

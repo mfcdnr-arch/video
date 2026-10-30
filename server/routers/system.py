@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from broadcast_store import get_broadcast
 from deps import get_db, get_current_admin
 from placements_store import now_msk
+from playable_store import NOW_MSK_SQL
 from screen_online import offline_for_sql, online_sql
 
 router = APIRouter()
@@ -252,14 +253,15 @@ def dashboard(db: Session = Depends(get_db), current_admin=Depends(get_current_a
 
     # Ролики, срок действия которых истекает в ближайшие 3 дня, — они тихо
     # пропадут из эфира; владелец должен успеть продлить или заменить.
-    expiring = db.execute(text("""
+    # Срок записан по Москве — сравниваем с «сейчас» по Москве, не с NOW() (UTC).
+    expiring = db.execute(text(f"""
         SELECT m.id, m.title, m.valid_until, a.name AS advertiser
         FROM media m
         LEFT JOIN advertisers a ON a.id = m.advertiser_id
         WHERE m.status = 'ready' AND m.review_status = 'approved'
           AND m.valid_until IS NOT NULL
-          AND m.valid_until > NOW()
-          AND m.valid_until <= NOW() + INTERVAL '3 days'
+          AND m.valid_until > {NOW_MSK_SQL}
+          AND m.valid_until <= {NOW_MSK_SQL} + INTERVAL '3 days'
         ORDER BY m.valid_until
     """)).fetchall()
 

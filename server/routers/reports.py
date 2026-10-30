@@ -11,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from deps import get_db, get_current_admin
+from playable_store import NOW_MSK_SQL
 from screen_online import ONLINE_MINUTES, online_sql
 
 log = logging.getLogger(__name__)
@@ -113,8 +114,8 @@ def _data_validity(db: Session, advertiser=None, media_id=None):
         SELECT m.title, a.name AS advertiser, m.valid_from, m.valid_until,
                CASE
                  WHEN m.valid_from IS NULL AND m.valid_until IS NULL THEN 'unlimited'
-                 WHEN m.valid_from IS NOT NULL AND m.valid_from > NOW() THEN 'upcoming'
-                 WHEN m.valid_until IS NOT NULL AND m.valid_until < NOW() THEN 'expired'
+                 WHEN m.valid_from IS NOT NULL AND m.valid_from > {NOW_MSK_SQL} THEN 'upcoming'
+                 WHEN m.valid_until IS NOT NULL AND m.valid_until < {NOW_MSK_SQL} THEN 'expired'
                  ELSE 'active'
                END AS validity_status
         FROM media m

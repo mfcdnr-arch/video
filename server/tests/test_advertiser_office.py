@@ -6,7 +6,8 @@
 
 Проверяем ровно это плюс защиту от бессмысленных диапазонов.
 """
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -67,3 +68,62 @@ def test_bucket_is_larger_than_heartbeat_interval():
     # Агент шлёт heartbeat раз в 30 секунд. Корзина должна быть заметно
     # больше, иначе единичный потерянный пакет превратится в «простой».
     assert BUCKET_MIN * 60 >= 120
+
+
+# --- уведомления: «истекает срок показа» по Москве --------------------------------------
+
+class _Res:
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def fetchall(self):
+        return self._rows
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+
+class _AlertsDB:
+    """Рекламодатель, его ролики и счета — по подстроке SQL; остальное пусто."""
+
+    def __init__(self, creatives, invoices=()):
+        self.routes = [("FROM advertisers WHERE id", [SimpleNamespace(
+                            id=1, name="Ромашка", billing_mode="per_minute", price_per_minute=0,
+                            price_per_play=0, legal_name=None, inn=None, kpp=None, legal_address=None,
+                            contact_person=None, phone=None, email=None)]),
+                       ("FROM media WHERE advertiser_id", list(creatives)),
+                       ("FROM invoices", list(invoices))]
+
+    def execute(self, query, params=None):
+        sql = " ".join(str(query).split())
+        for needle, rows in self.routes:
+            if needle in sql:
+                return _Res(rows)
+        return _Res([])
+
+
+def _clip(mid, valid_until):
+    return SimpleNamespace(id=mid, title=f"Ролик {mid}", review_status="approved", reject_reason=None,
+                           valid_until=valid_until, is_broken=False)
+
+
+def test_alerts_expiring_counts_from_moscow_now(monkeypatch):
+    from routers import advertiser_office
+    n = datetime(2026, 10, 30, 15, 0)                      # «сейчас» по Москве
+    monkeypatch.setattr(advertiser_office, "now_msk", lambda: n)
+    db = _AlertsDB([_clip(1, n - timedelta(hours=1)),      # срок вышел час назад (по UTC было бы «впереди»)
+                    _clip(2, n + timedelta(hours=1)),      # истекает через час
+                    _clip(3, n + timedelta(days=4))])      # ещё нескоро
+    out = advertiser_office.advertiser_alerts(aid=1, admin={}, db=db)
+    assert [i["media_id"] for i in out["items"] if i["kind"] == "expiring"] == [2]
+
+
+def test_alerts_invoice_overdue_by_moscow_date(monkeypatch):
+    from routers import advertiser_office
+    n = datetime(2026, 10, 30, 1, 0)                       # 01:00 МСК — по UTC ещё 29.10
+    monkeypatch.setattr(advertiser_office, "now_msk", lambda: n)
+    inv = SimpleNamespace(id=7, period_start=date(2026, 10, 1), period_end=date(2026, 10, 28), amount=100,
+                          adjustment_amount=0, status="issued", due_date=date(2026, 10, 29))
+    out = advertiser_office.advertiser_alerts(aid=1, admin={}, db=_AlertsDB([], [inv]))
+    (item,) = [i for i in out["items"] if i["kind"] == "invoice"]
+    assert item["level"] == "danger" and "просрочен" in item["text"]
