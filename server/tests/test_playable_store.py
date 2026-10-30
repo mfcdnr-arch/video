@@ -127,3 +127,41 @@ def test_playlists_no_longer_import_from_the_network_router():
 def test_module_has_no_router_dependencies():
     imports = [ln for ln in inspect.getsource(playable_store).splitlines() if ln.startswith(("from ", "import "))]
     assert imports == ["from sqlalchemy import text"]                 # ни fastapi, ни роутеров
+
+
+class _AnyResult:
+    def fetchall(self):
+        return []
+
+    def fetchone(self):
+        return None
+
+    def scalar(self):
+        return None
+
+
+class FeedDB:
+    """Мок сессии для ленты экрана целиком: всё пусто, тексты запросов копятся."""
+
+    def __init__(self):
+        self.sqls: list[str] = []
+
+    def execute(self, query, params=None):
+        self.sqls.append(" ".join(str(query).split()))
+        return _AnyResult()
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+def test_feed_template_slots_use_the_rule_with_validity():
+    # слоты недельного шаблона в ленте — то же правило, со сроком показа: ролик, у которого
+    # срок вышел или ещё не начался, в шаблоне не играет — как у эфира, показов и замен
+    from routers import screens
+    db = FeedDB()
+    screens.schedule_for_minipc(1, db=db, _screen=None)
+    (slots_sql,) = [s for s in db.sqls if "FROM best b" in s and "json_agg" in s]
+    assert " ".join(playable_sql("m").split()) in slots_sql

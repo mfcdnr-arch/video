@@ -21,7 +21,7 @@ from deps import get_db, get_current_admin, require_write, verify_device_token
 from dashboard_ws import dashboard_ws_manager
 from placements_logic import active_until_for, pick_active
 from placements_store import load_playlist_names, now_msk, resolve_placement_hour
-from playable_store import DEFAULT_VENUE, load_playable_items, venue_sql
+from playable_store import DEFAULT_VENUE, load_playable_items, playable_sql, venue_sql
 from playlist_rules import build_shared_hour, expand_repeats, interleave
 from screen_online import offline_for_sql, online_sql
 from ws_manager import ws_manager
@@ -478,6 +478,10 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
 
     # Трёхуровневая резолюция недельного шаблона: на каждый (день, час)
     # берётся слот с наивысшим приоритетом: экран (3) > группа (2) > сеть (1).
+    # Ролики слотов — по общему правилу playable_sql (модерация, площадка, срок
+    # показа), как у эфира, показа и замены: слот, плейлисту которого играть
+    # нечего, выпадает, и агент берёт «весь день» или заглушки. Список files
+    # ниже срок не проверяет — он справочный, ролики качаются заранее.
     _SLOT_RESOLUTION = """
         WITH candidates AS (
             SELECT day_of_week, hour, playlist_id,
@@ -511,8 +515,7 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
         JOIN playlists p ON p.id = b.playlist_id
         JOIN playlist_items pi ON pi.playlist_id = p.id
         JOIN media m ON m.id = pi.media_id
-        WHERE m.status = 'ready' AND m.review_status = 'approved'
-          {VENUE_FILTER}
+        WHERE {playable_sql("m")}
         GROUP BY b.day_of_week, b.hour, p.id, p.name
         ORDER BY b.day_of_week, b.hour
     """), {"sid": screen_id, "venue": venue}).fetchall()
