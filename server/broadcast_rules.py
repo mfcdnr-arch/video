@@ -10,6 +10,8 @@
 """
 from datetime import datetime, time, timedelta
 
+STALE_WINDOW_TEXT = "Время изменилось — проверьте час окончания"   # тот же текст показывает и окно в панели
+
 
 def parse_until_hour(value, now: datetime) -> datetime | None:
     """Час окончания эфира → момент окончания (наивное МСК); None — «до отмены».

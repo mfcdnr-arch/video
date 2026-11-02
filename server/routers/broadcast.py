@@ -11,7 +11,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 import broadcast_store
-from broadcast_rules import parse_until_hour
+from broadcast_rules import STALE_WINDOW_TEXT, parse_until_hour
 from deps import get_db, get_current_admin, require_write
 from placements_store import now_msk
 
@@ -20,7 +20,6 @@ router = APIRouter()
 
 _MAX_INT4 = 2 ** 31 - 1                       # playlists.id — SERIAL
 _ON_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
-STALE_WINDOW_TEXT = "Время изменилось — проверьте час окончания"   # тот же текст показывает и окно в панели
 
 
 def _playlist_id(value) -> int | None:
