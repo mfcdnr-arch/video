@@ -31,13 +31,6 @@ router = APIRouter()
 _LEGACY_KEYS = ("id", "message", "color", "speed", "is_all", "target", "until_at", "started_at", "started_by")
 
 
-def auto_clear_tickers(db: Session, reason: str) -> int:
-    """Прежнее автоснятие строк при «Стоп» и смене плейлиста. Удаляется в Task 4 вместе с вызовами
-    в routers/screens.py: теперь «Стоп» и смена плейлиста бегущую строку не трогают. До тех пор —
-    заглушка, чтобы screens.py не падал между коммитами."""
-    return 0
-
-
 # --- JSON ---------------------------------------------------------------------
 
 def _iso(moment: datetime | None) -> str | None:

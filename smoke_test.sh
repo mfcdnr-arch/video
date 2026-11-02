@@ -750,9 +750,33 @@ req GET "/reports/fillers";        [ "$HTTP" = "200" ] && ok "отчёт по з
 # списком; старому агенту поставлена команда ticker_show; правка текста без срока — срок прежний,
 # запись «Бегущая строка изменена»; снятие и повторное снятие (404); старое тело запроса
 # (is_all=false, screen_ids, duration=60 → срок +60 с); ошибки по-русски (400); шаблон: создать,
-# найти, переписать, удалить. «Бежит» (confirm.running = 1) здесь пока не проверяем: сервер
-# ещё не сохраняет отчёт ticker_state из heartbeat — это шаг приёма отчёта от агента.
+# найти, переписать, удалить. Тестовый экран подаёт сигнал как агент 1.4.0 (ticker_state в heartbeat):
+# «бежит» (confirm.running = 1) считается по его отчёту. Лента экрана содержит строку; «Стоп» её не
+# снимает (она остаётся в обзоре и в ленте, экрану поставлены stop и ticker_hide, отчёт «остановлен»),
+# «Показ» возвращает ticker_show самой новой строки экрана.
 # Оставшиеся строки и шаблоны SMOKE снимаются в «Уборке».
+
+# drain_cmds — забрать и подтвердить ВСЕ команды тестового экрана (агент берёт по одной за пробуждение,
+# здесь нужен весь список); печатает JSON-список [{id, type, payload}] в порядке очереди
+drain_cmds(){
+  local out="[" sep="" i R cid c
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    R=$($DC curl -s "$API/command/poll/$SID" -H "X-Token: $SCR_TOKEN" 2>/dev/null)
+    cid=$(echo "$R" | python3 -c "import sys,json;c=json.load(sys.stdin).get('command');print(c['id'] if c else '')" 2>/dev/null)
+    [ -n "$cid" ] || break
+    c=$(echo "$R" | python3 -c "import sys,json;print(json.dumps(json.load(sys.stdin)['command']))" 2>/dev/null)
+    out="$out$sep$c"; sep=","
+    $DC curl -s -X POST "$API/command/ack/$cid" -H "X-Token: $SCR_TOKEN" >/dev/null 2>&1
+  done
+  echo "$out]"
+}
+# tk_heartbeat IDS STOPPED — heartbeat тестового экрана как у агента 1.4.0 (IDS — JSON-список id, STOPPED — true|false)
+tk_heartbeat(){
+  RESP=$($DC curl -s -w $'\n%{http_code}' -X POST "$API/heartbeat/$SID" -H "X-Token: $SCR_TOKEN" \
+        -H 'Content-Type: application/json' \
+        -d "{\"status\":\"online\",\"playing_file\":null,\"agent_version\":\"1.4.0\",\"ticker_state\":{\"ids\":$1,\"stopped\":$2,\"screen_off\":false}}" 2>/dev/null)
+  HTTP="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
+}
 step "Бегущая строка: запуск, правка, снятие (только тестовый экран)"
 TK_MSG="SMOKE_tk_$STAMP"; TK_ID=""; TK_OLD_ID=""; TPL_ID=""
 if [ -n "${SID:-}" ] && [ -n "${SCR_TOKEN:-}" ]; then
@@ -763,16 +787,13 @@ if [ -n "${SID:-}" ] && [ -n "${SCR_TOKEN:-}" ]; then
   if [ "$HTTP" = "200" ] && [ -n "$TK_ID" ]; then ok "строка запущена на тестовом экране на 15 минут (id=$TK_ID)"; else bad "запуск строки: HTTP $HTTP $BODY"; TK_ID=""; fi
 
   # экран подаёт сигнал как агент 1.4.0 и сообщает, что строка у него бежит
-  RESP=$($DC curl -s -w $'\n%{http_code}' -X POST "$API/heartbeat/$SID" -H "X-Token: $SCR_TOKEN" \
-        -H 'Content-Type: application/json' \
-        -d "{\"status\":\"online\",\"playing_file\":null,\"agent_version\":\"1.4.0\",\"ticker_state\":{\"ids\":[${TK_ID:-0}],\"stopped\":false,\"screen_off\":false}}" 2>/dev/null)
-  HTTP="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
+  tk_heartbeat "[${TK_ID:-0}]" false
   [ "$HTTP" = "200" ] && ok "heartbeat экрана (агент 1.4.0) принят" || bad "heartbeat: HTTP $HTTP"
 
   if [ -n "$TK_ID" ]; then
     req GET "/tickers/overview"
-    if [ "$HTTP" = "200" ] && body_has "any(t['id']==$TK_ID and t['message']=='$TK_MSG' and t['target']=='screens' and t['screen_ids']==[$SID] and t['screens_total']==1 and t['confirm']['total']==1 and t['confirm']['running']+len(t['confirm']['problems'])==1 and all(p['reason'] in ('offline','old_agent','stopped','screen_off','pending','not_confirmed') for p in t['confirm']['problems']) and 800 <= t['remaining_seconds'] <= 900 for t in r['tickers'])"; then
-      ok "обзор: строка на 1 экране, подтверждение посчитано, осталось ~15 минут"
+    if [ "$HTTP" = "200" ] && body_has "any(t['id']==$TK_ID and t['message']=='$TK_MSG' and t['target']=='screens' and t['screen_ids']==[$SID] and t['screens_total']==1 and t['confirm']['total']==1 and t['confirm']['running']==1 and not t['confirm']['problems'] and 800 <= t['remaining_seconds'] <= 900 for t in r['tickers'])"; then
+      ok "обзор: строка на 1 экране, по отчёту экрана она бежит, осталось ~15 минут"
     else
       bad "обзор: строки нет или она неверная, HTTP $HTTP: $(echo "$BODY" | python3 -c "import sys,json;print([(t['id'],t['screens_total'],t['confirm'],t['remaining_seconds']) for t in json.load(sys.stdin)['tickers'] if t['id']==$TK_ID])" 2>/dev/null)"
     fi
@@ -792,6 +813,54 @@ if [ -n "${SID:-}" ] && [ -n "${SCR_TOKEN:-}" ]; then
       ok "старому агенту поставлена команда ticker_show (с оставшимся сроком)"
     else
       bad "команда ticker_show экрану не поставлена, HTTP $HTTP: $BODY"
+    fi
+
+    # лента экрана — как её читает агент 1.4.0: строка с видом и сроком
+    dreq "/schedule/minipc/$SID"
+    if [ "$HTTP" = "200" ] && body_has "any(t['id']==$TK_ID and t['message']=='$TK_MSG' and t['color']=='#ffd34d' and t['speed']=='medium' and t['until_at'] for t in r['tickers'])"; then
+      ok "лента экрана: бегущая строка на месте, с видом и сроком"
+    else
+      bad "в ленте экрана нет строки или она неверная, HTTP $HTTP: $(echo "$BODY" | python3 -c "import sys,json;print(json.load(sys.stdin).get('tickers'))" 2>/dev/null)"
+    fi
+
+    # «Стоп» строку не снимает. Очередь команд экрана сначала разбираем (там ticker_show от запуска),
+    # чтобы дальше видеть только то, что поставят «Стоп» и «Показ»
+    drain_cmds >/dev/null
+    req POST "/command/stop/$SID"
+    [ "$HTTP" = "200" ] && ok "«Стоп» тестовому экрану принят" || bad "«Стоп»: HTTP $HTTP $BODY"
+    BODY=$(drain_cmds)
+    if body_has "[c['type'] for c in r]==['stop','ticker_hide']"; then
+      ok "«Стоп»: экрану поставлены stop и ticker_hide (строку гасят только на нём)"
+    else
+      bad "«Стоп»: ждали stop и ticker_hide, в очереди: $BODY"
+    fi
+    tk_heartbeat "[]" true          # агент 1.4.0 после «Стоп»: показ остановлен, строки не бегут
+    req GET "/tickers/overview"
+    if [ "$HTTP" = "200" ] && body_has "any(t['id']==$TK_ID and t['confirm']['running']==0 and [p['reason'] for p in t['confirm']['problems']]==['stopped'] for t in r['tickers'])"; then
+      ok "после «Стоп» строка из обзора не исчезла, на экране причина «остановлен»"
+    else
+      bad "после «Стоп» строка пропала из обзора или причина не «остановлен», HTTP $HTTP"
+    fi
+    dreq "/schedule/minipc/$SID"
+    if [ "$HTTP" = "200" ] && body_has "any(t['id']==$TK_ID for t in r['tickers'])"; then
+      ok "после «Стоп» строка осталась в ленте экрана"
+    else
+      bad "после «Стоп» строки нет в ленте экрана, HTTP $HTTP"
+    fi
+    req POST "/command/resume/$SID"
+    [ "$HTTP" = "200" ] && ok "«Показ» тестовому экрану принят" || bad "«Показ»: HTTP $HTTP $BODY"
+    BODY=$(drain_cmds)
+    if body_has "[c['type'] for c in r]==['resume','ticker_show'] and r[1]['payload']['message']=='$TK_MSG' and 800 <= r[1]['payload']['duration'] <= 900"; then
+      ok "«Показ»: экрану поставлены resume и ticker_show той же строки (с оставшимся сроком)"
+    else
+      bad "«Показ»: ждали resume и ticker_show, в очереди: $BODY"
+    fi
+    tk_heartbeat "[$TK_ID]" false   # показ возобновлён — строка снова бежит
+    req GET "/tickers/overview"
+    if [ "$HTTP" = "200" ] && body_has "any(t['id']==$TK_ID and t['confirm']['running']==1 and not t['confirm']['problems'] for t in r['tickers'])"; then
+      ok "после «Показ» строка снова бежит"
+    else
+      bad "после «Показ» строка не бежит по отчёту экрана, HTTP $HTTP"
     fi
 
     # правка: текст и вид новые, срок не присылаем — остаётся прежний

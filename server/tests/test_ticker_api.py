@@ -18,6 +18,7 @@ import sqlalchemy.orm
 from fastapi import HTTPException
 
 import placements_store
+import routers.screens as screens_router
 import routers.ticker as api
 import tasks
 import ticker_store
@@ -80,7 +81,14 @@ def clock(monkeypatch):
 
 
 def commands(db):
-    return [(p["sid"], p["t"], json.loads(p["p"])) for p in db.params("INSERT INTO commands")]
+    """Поставленные команды: [(экран, тип, payload)]. Тип — параметр :t или, как в /command/stop и /command/resume,
+    литерал в самом SQL."""
+    out = []
+    for sql, p in db.calls:
+        if "INSERT INTO commands" in sql:
+            cmd_type = p["t"] if "t" in p else re.search(r"VALUES \(:sid, '(\w+)'", sql).group(1)
+            out.append((p["sid"], cmd_type, json.loads(p["p"])))
+    return out
 
 
 def journal(db):
@@ -519,12 +527,212 @@ def test_delete_template_commits():
     assert db.commits == 1
 
 
-# --- прежний автоснятчик ---------------------------------------------------------
+# --- лента экрана, heartbeat, «Стоп» и «Показ» (routers/screens.py) ---------------
+# Бегущую строку больше не снимает ни «Стоп», ни смена плейлиста: она живёт до срока, а экран узнаёт
+# о ней из ленты (агент 1.4.0) или командами (старый агент). Сбой строк не должен ронять ни ленту,
+# ни heartbeat — на установке новый API стартует раньше, чем migrate.sh накатит миграцию 034.
 
-def test_auto_clear_tickers_is_a_stub_until_task_4():
+class TxDB(RoutedDB):
+    """RoutedDB с поведением Postgres: после ошибки запроса падает всё, пока не сделан rollback
+    (в том числе commit). commit и rollback пишутся в calls маркерами — видно, что раньше чего."""
+
+    def __init__(self, routes, fail_on=None):
+        super().__init__(routes, fail_on)
+        self.aborted = False
+
+    def execute(self, query, params=None):
+        if self.aborted:
+            raise RuntimeError("current transaction is aborted, commands ignored until end of transaction block")
+        try:
+            return super().execute(query, params)
+        except RuntimeError:
+            self.aborted = True
+            raise
+
+    def commit(self):
+        if self.aborted:
+            raise RuntimeError("Can't reconnect until invalid transaction is rolled back")
+        self.calls.append(("-- COMMIT", {}))
+        super().commit()
+
+    def rollback(self):
+        self.aborted = False
+        self.calls.append(("-- ROLLBACK", {}))
+        super().rollback()
+
+
+def at(db, needle):
+    """Номер первого вызова, в SQL которого есть needle (порядок запросов)."""
+    return next(i for i, (sql, _) in enumerate(db.calls) if needle in sql)
+
+
+@pytest.fixture
+def screens_clock(monkeypatch):
+    monkeypatch.setattr(screens_router, "now_msk", lambda: N)
+
+
+@pytest.fixture
+def spy_auto_clear(monkeypatch):
+    """Прежний автоснятчик: если его кто-то ещё зовёт, попадёт в список."""
+    called = []
+    monkeypatch.setattr(api, "auto_clear_tickers", lambda *a, **kw: called.append(a), raising=False)
+    return called
+
+
+def run_feed(db):
+    return screens_router.schedule_for_minipc(1, db=db, _screen=None)
+
+
+def test_auto_clear_tickers_is_gone():
+    assert not hasattr(api, "auto_clear_tickers")
+
+
+def test_feed_has_tickers(screens_clock):
+    live = [TK(id=11, message="Касса закрыта", until_at=N + timedelta(minutes=15)),
+            TK(id=12, message="Технический перерыв", target="all", started_at=N - timedelta(minutes=1))]
+    feed = run_feed(RoutedDB([("ORDER BY t.started_at", live)]))
+    # по порядку запуска; срок — ISO без пояса (наивное МСК), «до снятия» — null
+    assert feed["tickers"] == [
+        {"id": 11, "message": "Касса закрыта", "color": "#ffd34d", "speed": "medium", "until_at": "2026-11-02T14:45:00"},
+        {"id": 12, "message": "Технический перерыв", "color": "#ffd34d", "speed": "medium", "until_at": None}]
+    json.dumps(feed["tickers"])
+
+
+def test_feed_without_live_tickers_still_has_the_key(screens_clock):
+    # ключ есть всегда: по нему агент 1.4.0 узнаёт, что строки берутся из ленты, и убирает снятые
+    assert run_feed(RoutedDB([]))["tickers"] == []
+
+
+def test_feed_tickers_follow_screen_scope(screens_clock):
+    # лента экрана 1: его собственные строки и «на все», чужие — нет
+    live = [TK(id=11, target="screens", screen_ids=[1]), TK(id=12, target="screens", screen_ids=[2]), TK(id=13, target="all")]
+    feed = run_feed(RoutedDB([("ORDER BY t.started_at", live)]))
+    assert [t["id"] for t in feed["tickers"]] == [11, 13]
+
+
+def test_feed_tickers_failure_is_empty_list_not_500(screens_clock):
+    db = TxDB([("SELECT last_playlist_id", [5])], fail_on="FROM tickers")
+    feed = run_feed(db)
+    assert feed["tickers"] == []
+    assert db.rollbacks == 1 and not db.aborted
+    # остальная лента на месте
+    assert feed["active_source"] == "template" and feed["schedule"] == [] and feed["files"] == []
+    assert feed["fallback"] == [] and feed["power"] == {"on": None, "off": None}
+
+
+def test_feed_tickers_failure_keeps_the_playlist_memory(screens_clock):
+    # сменившийся плейлист запомнен и закоммичен ДО чтения строк: откат при сбое строк его не отменяет
+    db = TxDB([("SELECT last_playlist_id", [5])], fail_on="FROM tickers")
+    run_feed(db)
+    assert db.params("UPDATE screens SET last_playlist_id") == [{"p": None, "sid": 1}]
+    assert at(db, "UPDATE screens SET last_playlist_id") < at(db, "-- COMMIT") < at(db, "FROM tickers t") < at(db, "-- ROLLBACK")
+
+
+def test_playlist_change_does_not_touch_tickers(screens_clock, spy_auto_clear):
+    # слот кончился (плейлист 5 → ничего): раньше это снимало все строки сети
+    db = RoutedDB([("SELECT last_playlist_id", [5]),
+                   ("ORDER BY t.started_at", [TK(id=11, target="all")])])
+    feed = run_feed(db)
+    assert db.params("UPDATE screens SET last_playlist_id") == [{"p": None, "sid": 1}]   # смена запомнена
+    assert spy_auto_clear == []
+    assert not db.sqls("DELETE FROM tickers") and not db.sqls("UPDATE tickers")
+    assert not db.sqls("INSERT INTO commands") and not db.sqls("INSERT INTO audit_log")  # ни команд, ни записи в журнале
+    assert [t["id"] for t in feed["tickers"]] == [11]                                    # строка в ленте как была
+
+
+def test_stop_keeps_tickers_and_hides_on_that_screen(monkeypatch, spy_auto_clear):
     db = RoutedDB([])
-    assert api.auto_clear_tickers(db, "причина") == 0
-    assert not db.calls                                                   # ничего не снимает и не пишет
+    ws = FakeWS(connected=[5, 9], db=db)
+    monkeypatch.setattr(screens_router, "ws_manager", ws)
+    assert call(screens_router.command_stop_screen, 5, admin=ADMIN, db=db) == {"status": "ok", "ws_sent": True}
+    assert commands(db) == [(5, "stop", {}), (5, "ticker_hide", {})]      # старому агенту: гаси строку на этом экране
+    assert spy_auto_clear == []
+    assert not db.sqls("DELETE FROM tickers") and not db.sqls("UPDATE tickers")      # на сервере строки живы
+    assert not db.sqls("FROM tickers") and not journal(db)                           # и не тронуты, и в журнал не пишется
+    assert db.commits == 1
+    assert ws.sent == [(5, {"type": "new_command", "count": 1}, 1)]       # будильник только этому экрану, после commit
+
+
+def test_resume_shows_the_newest_live_ticker_again(screens_clock, monkeypatch):
+    live = [TK(id=11, message="Старая", target="all", started_at=N - timedelta(minutes=9)),
+            TK(id=12, message="Новая", target="screens", screen_ids=[5], until_at=N + timedelta(minutes=10),
+               started_at=N - timedelta(minutes=2)),
+            TK(id=13, message="Чужая", target="screens", screen_ids=[6], started_at=N - timedelta(minutes=1))]
+    db = RoutedDB([("ORDER BY t.started_at", live),
+                   ("SELECT id, group_id FROM screens", [Row(id=5, group_id=None), Row(id=6, group_id=None)])])
+    ws = FakeWS(connected=[5], db=db)
+    monkeypatch.setattr(screens_router, "ws_manager", ws)
+    assert call(screens_router.command_resume_screen, 5, admin=ADMIN, db=db) == {"status": "ok", "ws_sent": True}
+    assert commands(db) == [(5, "resume", {}),
+                            (5, "ticker_show", {"message": "Новая", "color": "#ffd34d", "speed": "medium", "duration": 600})]
+    assert db.commits == 1
+    assert ws.sent == [(5, {"type": "new_command", "count": 1}, 1)]
+
+
+def test_resume_without_live_tickers_queues_only_resume(screens_clock, monkeypatch):
+    # живых строк нет (срок вышел или не было): лишняя команда в очереди старого агента, которому по WS
+    # дают одну команду за пробуждение, только задержала бы следующий ticker_show
+    expired = [TK(id=11, target="all", until_at=N - timedelta(seconds=1))]
+    db = RoutedDB([("ORDER BY t.started_at", expired), ("SELECT id, group_id FROM screens", [Row(id=5, group_id=None)])])
+    monkeypatch.setattr(screens_router, "ws_manager", FakeWS())
+    call(screens_router.command_resume_screen, 5, admin=ADMIN, db=db)
+    assert commands(db) == [(5, "resume", {})]
+    assert db.commits == 1
+
+
+def heartbeat(db, body, screen_id=3):
+    return call(screens_router.heartbeat, screen_id, body, db=db, _screen=None)
+
+
+def report(db):
+    return db.params("SET ticker_ids")
+
+
+def test_heartbeat_records_ticker_state():
+    db = RoutedDB([])
+    out = heartbeat(db, {"status": "online", "agent_version": "1.4.0",
+                         "ticker_state": {"ids": [11, 12], "stopped": True, "screen_off": False}})
+    assert out["status"] == "ok"
+    assert report(db) == [{"sid": 3, "ids": [11, 12], "stopped": True, "off": False}]
+    assert len(db.params("SET last_seen")) == 1 and db.commits == 2        # сигнал и отчёт — каждый своим commit
+
+
+def test_heartbeat_without_ticker_state_leaves_columns():
+    db = RoutedDB([])
+    heartbeat(db, {"status": "online", "agent_version": "1.3.0", "playing_file": "a.mp4"})   # старый агент
+    assert report(db) == [] and not db.sqls("ticker_")
+    assert len(db.params("SET last_seen")) == 1 and db.commits == 1
+
+
+@pytest.mark.parametrize("raw", ["oops", ["ids"], 5, True, {}, {"stopped": True}, {"ids": "11,12"}, {"ids": None}, {"ids": 11}])
+def test_heartbeat_ignores_malformed_ticker_state(raw):
+    db = RoutedDB([])
+    assert heartbeat(db, {"status": "online", "ticker_state": raw})["status"] == "ok"
+    assert report(db) == [] and db.commits == 1                             # прежний отчёт не затёрт
+
+
+def test_heartbeat_keeps_only_real_ids():
+    db = RoutedDB([])
+    heartbeat(db, {"ticker_state": {"ids": [11, "12", None, True, 1.5, 0, -3, 2 ** 40, 13], "screen_off": 1}})
+    assert report(db) == [{"sid": 3, "ids": [11, 13], "stopped": False, "off": True}]
+
+
+def test_heartbeat_empty_ids_is_a_report_not_a_missing_one():
+    # экран остановлен или строк нет — пустой список: это отчёт «ничего не бежит», а не отсутствие отчёта
+    db = RoutedDB([])
+    heartbeat(db, {"ticker_state": {"ids": [], "stopped": True}})
+    assert report(db) == [{"sid": 3, "ids": [], "stopped": True, "off": False}]
+
+
+def test_heartbeat_survives_a_failing_ticker_report():
+    # на установке новый API стартует раньше миграции 034: колонок отчёта ещё нет. Сигнал экрана и история
+    # (last_seen, minipc_status) закоммичены ДО отчёта, а сбой отчёта heartbeat не роняет и транзакцию откатывает
+    db = TxDB([], fail_on="SET ticker_ids")
+    out = heartbeat(db, {"status": "online", "agent_version": "1.4.0", "ticker_state": {"ids": [11]}})
+    assert out["status"] == "ok" and "server_time" in out
+    assert at(db, "SET last_seen") < at(db, "INSERT INTO minipc_status") < at(db, "-- COMMIT") \
+        < at(db, "SET ticker_ids") < at(db, "-- ROLLBACK")
+    assert db.commits == 1 and db.rollbacks == 1 and not db.aborted
 
 
 # --- Celery: снятие по сроку ----------------------------------------------------

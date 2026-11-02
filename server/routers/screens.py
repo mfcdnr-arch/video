@@ -25,6 +25,7 @@ from placements_store import load_playlist_names, now_msk, resolve_placement_hou
 from playable_store import DEFAULT_VENUE, load_playable_items, playable_sql, venue_sql
 from playlist_rules import build_shared_hour, expand_repeats, interleave
 from screen_online import offline_for_sql, online_sql
+import ticker_store
 from ws_manager import ws_manager
 
 log = logging.getLogger(__name__)
@@ -183,12 +184,30 @@ def update_screen_settings(screen_id: int, body: dict = Body(...),
 
 # ─── Heartbeat от мини ПК ───────────────────────────────────────────────────
 
+_INTEGER_MAX = 2 ** 31 - 1      # id строк — INTEGER в БД
+
+
+def _ticker_report(raw) -> dict | None:
+    """Поле `ticker_state` из heartbeat агента 1.4.0 → вид для ticker_store.record_report; None — отчёта нет.
+
+    Heartbeat идёт с каждого экрана раз в 30 секунд, поэтому мусор вместо отчёта ничего не ломает и не затирает
+    прежний отчёт: не объект или `ids` не список — отчёта нет (как у старого агента); из `ids` берутся только
+    целые id в пределах INTEGER. Пустой `ids` — полноценный отчёт «ничего не бежит» (экран остановлен или выключен).
+    """
+    if not isinstance(raw, dict) or not isinstance(raw.get("ids"), list):
+        return None
+    ids = [i for i in raw["ids"] if isinstance(i, int) and not isinstance(i, bool) and 0 < i <= _INTEGER_MAX]
+    return {"ids": ids, "stopped": bool(raw.get("stopped")), "screen_off": bool(raw.get("screen_off"))}
+
+
 @router.post("/heartbeat/{screen_id}")
 async def heartbeat(screen_id: int, body: dict = Body(...), db: Session = Depends(get_db),
                      _screen=Depends(verify_device_token)):
     """
     Принять heartbeat от мини ПК.
     Тело: {"status":"online", "playing_file":"...", "disk_free_gb":10.5, "agent_version":"1.0.0"}
+    Агент 1.4.0 добавляет "ticker_state": {"ids": [int], "stopped": bool, "screen_off": bool} — какие строки у него
+    бегут (панель «Бегущая строка» верит этому отчёту); старый агент поля не шлёт.
     """
     now = datetime.now(timezone.utc)
     # Дрейф часов: агент шлёт своё время (UNIX UTC) — положительное значение
@@ -253,6 +272,17 @@ async def heartbeat(screen_id: int, body: dict = Body(...), db: Session = Depend
         "ip": body.get("ip_address")
     })
     db.commit()
+    # Отчёт о бегущей строке — отдельным шагом после commit: на установке новый API стартует раньше, чем
+    # migrate.sh добавит колонки отчёта, и сбой здесь не должен стоить экрану ни сигнала (last_seen), ни
+    # истории, ни ответа агенту. Сигнал уже закоммичен; ошибку откатываем и пишем в лог.
+    report = _ticker_report(body.get("ticker_state"))
+    if report is not None:
+        try:
+            ticker_store.record_report(db, screen_id, report)
+            db.commit()
+        except Exception:
+            log.exception("screen %s: отчёт о бегущей строке не записан", screen_id)
+            db.rollback()
     # Push обновления дашборду (если есть подключённые администраторы)
     if dashboard_ws_manager.client_count() > 0:
         asyncio.create_task(dashboard_ws_manager.broadcast({
@@ -625,13 +655,9 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
         "night_to": pw.night_to.strftime("%H:%M") if pw and pw.night_to else None,
     }
 
-    # ── Авто-снятие бегущей строки при окончании показа плейлиста ──────────
-    # Сервер запоминает, какой плейлист экран играет сейчас (last_playlist_id).
-    # Когда он меняется (кончился слот, включили другой плейлист/эфир) —
-    # активные бегущие строки снимаются автоматически: задание не «висит»
-    # после показа, при котором его запускали. Команда «Стоп» чистит строку
-    # отдельно (см. /command/stop). Первый запуск показа (NULL → плейлист)
-    # сменой не считается.
+    # Сервер запоминает, какой плейлист экран играет сейчас (last_playlist_id) —
+    # справочно. Бегущую строку смена плейлиста (слот, показ, общий эфир) больше
+    # не снимает: она живёт до своего срока или до ручного снятия (ticker_store).
     try:
         if active_playlist is not None:
             cur_pid = active_playlist.get("playlist_id")  # None при is_off
@@ -647,12 +673,21 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
             db.execute(text(
                 "UPDATE screens SET last_playlist_id = :p WHERE id = :sid"),
                 {"p": cur_pid, "sid": screen_id})
-            if prev_pid is not None:
-                from routers.ticker import auto_clear_tickers
-                auto_clear_tickers(db, "показ плейлиста завершён (смена расписания)")
             db.commit()
     except Exception:
         db.rollback()
+
+    # Бегущая строка: что экрану положено показывать сейчас (срок, «все / группы / экраны» и группа экрана
+    # решаются на момент now, ticker_store.for_screen). Агент 1.4.0 берёт строки отсюда и переживает с ними
+    # перезагрузку; старый агент поле не читает — ему идут команды ticker_show / ticker_hide. Читаем после
+    # commit запоминания плейлиста: откат при сбое (например, миграция 034 ещё не накатана) его не отменит.
+    # Ленту сбой строк не роняет: строк нет, остальное на месте.
+    try:
+        tickers = ticker_store.for_screen(db, screen_id, now)
+    except Exception:
+        log.exception("screen %s: бегущая строка не прочитана, лента без неё", screen_id)
+        db.rollback()
+        tickers = []
 
     return {
         "screen_id": screen_id,
@@ -670,6 +705,9 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
         "image_durations": image_durations,   # баннер → секунды показа
         "power": power,                       # окно работы монитора (МСК)
         "volume": volume,                     # громкость день/ночь (МСК)
+        # бегущие строки экрана по порядку запуска: [{id, message, color, speed, until_at}],
+        # until_at — ISO без пояса (наивное МСК) или null («до снятия»); ключ есть всегда
+        "tickers": tickers,
         "generated_at": datetime.now(timezone.utc).isoformat()
     }
 
@@ -834,6 +872,12 @@ async def command_resume_screen(
     db.execute(text(
         "INSERT INTO commands (screen_id, type, payload) VALUES (:sid, 'resume', CAST(:p AS jsonb))"
     ), {"sid": screen_id, "p": _json.dumps({})})
+    # Бегущая строка вернётся вместе с показом (она жива, пока не вышел срок): старому агенту — ticker_show
+    # самой новой из живых строк экрана. Нет живых — команду не ставим: лишняя команда в очереди старого агента
+    # (по WS ему дают одну за пробуждение) только задержала бы следующий ticker_show.
+    now = now_msk()
+    if ticker_store.for_screen(db, screen_id, now):
+        ticker_store.notify_screens(db, set(), {screen_id}, now)
     db.commit()
     connected = ws_manager.connected_screens()
     if screen_id in connected:
@@ -848,17 +892,17 @@ async def command_stop_screen(
     db: Session = Depends(get_db)
 ):
     """Отправить команду остановки показа на мини ПК (очередь команд + WS-будильник).
-    Разовая остановка: агент возобновит показ по расписанию на следующем цикле."""
+    Разовая остановка: агент возобновит показ по расписанию на следующем цикле.
+    Бегущую строку «Стоп» не снимает: на сервере она живёт до срока, на других экранах идёт дальше, а при
+    «Показ» возвращается. С этого экрана её убирает сам новый агент (показ остановлен), старому — ticker_hide."""
     import json as _json
     import asyncio as _asyncio
     db.execute(text(
         "INSERT INTO commands (screen_id, type, payload) VALUES (:sid, 'stop', CAST(:p AS jsonb))"
     ), {"sid": screen_id, "p": _json.dumps({})})
-    # Показ остановлен → активные бегущие строки снимаются автоматически
-    # (задание не должно «висеть» после окончания показа, при котором его
-    # запускали; при новом показе строку запускают заново)
-    from routers.ticker import auto_clear_tickers
-    auto_clear_tickers(db, "показ остановлен командой «Стоп»")
+    db.execute(text(
+        "INSERT INTO commands (screen_id, type, payload) VALUES (:sid, 'ticker_hide', CAST(:p AS jsonb))"
+    ), {"sid": screen_id, "p": _json.dumps({})})
     db.commit()
     connected = ws_manager.connected_screens()
     if screen_id in connected:
