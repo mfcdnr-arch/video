@@ -235,20 +235,47 @@ def test_remove_missing_is_lookup_error():
     assert not journal(db)
 
 
-def test_expire_due_journals_each_once():
-    db = RoutedDB([("DELETE FROM tickers", [Row(id=1, message="Первая"), Row(id=2, message="Вторая")])])
-    assert store.expire_due(db, N) == 2
-    assert db.params("DELETE FROM tickers") == [{"now": N}]
-    assert "until_at <= :now" in db.sqls("DELETE FROM tickers")[0]
+EXPIRE_SCREENS = [Row(id=1, group_id=7), Row(id=2, group_id=None), Row(id=3, group_id=7)]
+
+
+def test_expire_due_journals_each_once_and_returns_targets():
+    due = [TK(id=1, message="Первая", target="screens", screen_ids=[2], until_at=N - timedelta(seconds=1)),
+           TK(id=2, message="Вторая", target="groups", group_ids=[7], until_at=N)]
+    db = RoutedDB([("FOR UPDATE", due), ("SELECT id, group_id FROM screens", EXPIRE_SCREENS)])
+    out = store.expire_due(db, N)
+    assert out == [{"id": 1, "message": "Первая", "targets": [2]},
+                   {"id": 2, "message": "Вторая", "targets": [1, 3]}]    # экраны на момент снятия
+    assert db.params("FOR UPDATE") == [{"now": N}]
+    assert "until_at <= :now" in db.sqls("FOR UPDATE")[0]
+    assert db.params("DELETE FROM tickers") == [{"ids": [1, 2]}]
     assert journal(db) == [("Бегущая строка снята по сроку", "Первая", "система"),
                            ("Бегущая строка снята по сроку", "Вторая", "система")]
     assert db.commits == 0
 
 
+def test_expire_due_reads_targets_before_deleting():
+    # связи с группами и экранами уходят вместе со строкой (CASCADE) — читать их надо до DELETE
+    due = [TK(id=1, target="groups", group_ids=[7], until_at=N)]
+    db = RoutedDB([("FOR UPDATE", due), ("SELECT id, group_id FROM screens", EXPIRE_SCREENS)])
+    store.expire_due(db, N)
+    order = [sql for sql, _ in db.calls]
+    first_delete = next(i for i, sql in enumerate(order) if sql.startswith("DELETE FROM tickers"))
+    assert any("FOR UPDATE" in sql for sql in order[:first_delete])
+    assert any(sql.startswith("SELECT id, group_id FROM screens") for sql in order[:first_delete])
+    assert "NOW()" not in " ".join(order).upper()
+
+
+def test_expire_due_deleted_group_means_no_targets():
+    due = [TK(id=1, target="groups", group_ids=[99], until_at=N)]
+    db = RoutedDB([("FOR UPDATE", due), ("SELECT id, group_id FROM screens", EXPIRE_SCREENS)])
+    assert store.expire_due(db, N) == [{"id": 1, "message": "Касса закрыта", "targets": []}]
+
+
 def test_expire_due_nothing_due_writes_nothing():
     db = RoutedDB([])
-    assert store.expire_due(db, N) == 0
-    assert not journal(db)
+    assert store.expire_due(db, N) == []
+    assert not journal(db) and not db.params("DELETE FROM tickers")
+    assert not db.sqls("FROM screens")                                    # экраны не читаем зря
 
 
 # --- чтение -------------------------------------------------------------------
@@ -292,6 +319,13 @@ def test_screens_brief_shape_and_uses_the_one_online_rule():
                       "offline_for_seconds": 12, "agent_version": "1.4.0", "ticker_ids": [5],
                       "ticker_stopped": False, "ticker_screen_off": None}
     assert out[1]["online"] is False and out[1]["ticker_ids"] is None and out[1]["group_id"] is None
+    assert db.commits == 0
+
+
+def test_groups_brief_counts_screens():
+    db = RoutedDB([("FROM sync_groups g", [Row(id=7, name="Зал 1", screen_count=2), Row(id=8, name="Склад", screen_count=0)])])
+    assert store.groups_brief(db) == [{"id": 7, "name": "Зал 1", "screen_count": 2},
+                                      {"id": 8, "name": "Склад", "screen_count": 0}]
     assert db.commits == 0
 
 

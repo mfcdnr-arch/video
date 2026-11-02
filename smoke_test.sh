@@ -4,7 +4,7 @@
 # Проверяет: все контейнеры живы, вход, здоровье API, полный цикл
 # «экран → медиа → плейлист → расписание», показ по датам, что экран играет и
 # качает (лента и список файлов глазами агента), «в сети» по последнему сигналу,
-# отчёты, биллинг, уведомления.
+# бегущая строка (только на тестовом экране), отчёты, биллинг, уведомления.
 # Все тестовые данные создаются с префиксом SMOKE_ и удаляются в конце.
 #
 # Использование:   bash smoke_test.sh
@@ -742,6 +742,159 @@ req GET "/media/folders-all";      [ "$HTTP" = "200" ] && ok "список па�
 req GET "/reports/fillers";        [ "$HTTP" = "200" ] && ok "отчёт по заглушкам" || bad "отчёт заглушек: HTTP $HTTP"
 [ -n "${SID:-}" ] && { req GET "/minipc/$SID/diagnostics"; [ "$HTTP" = "200" ] && ok "диагностика экрана (список)" || bad "диагностика: HTTP $HTTP"; }
 
+# ── 5б. Бегущая строка: запуск, правка, снятие (только тестовый экран) ────────
+# Строки и шаблоны создаются ТОЛЬКО на SMOKE-экране (target "screens", его id): smoke идёт и на
+# боевом сервере, а строка «на все экраны» засветила бы тест у посетителей. Что проверяем: запуск
+# на 15 минут (срок считается по МСК: осталось ~900 с); обзор GET /tickers/overview (строка «на
+# 1 экране», подтверждение, у экрана live_count = 1, группы, шаблоны); GET /tickers остаётся
+# списком; старому агенту поставлена команда ticker_show; правка текста без срока — срок прежний,
+# запись «Бегущая строка изменена»; снятие и повторное снятие (404); старое тело запроса
+# (is_all=false, screen_ids, duration=60 → срок +60 с); ошибки по-русски (400); шаблон: создать,
+# найти, переписать, удалить. «Бежит» (confirm.running = 1) здесь пока не проверяем: сервер
+# ещё не сохраняет отчёт ticker_state из heartbeat — это шаг приёма отчёта от агента.
+# Оставшиеся строки и шаблоны SMOKE снимаются в «Уборке».
+step "Бегущая строка: запуск, правка, снятие (только тестовый экран)"
+TK_MSG="SMOKE_tk_$STAMP"; TK_ID=""; TK_OLD_ID=""; TPL_ID=""
+if [ -n "${SID:-}" ] && [ -n "${SCR_TOKEN:-}" ]; then
+  JSON_T='Content-Type: application/json'
+  req POST "/tickers" -H "$JSON_T" \
+      -d "{\"message\": \"$TK_MSG\", \"color\": \"#ffd34d\", \"speed\": \"medium\", \"target\": \"screens\", \"screen_ids\": [$SID], \"term\": {\"kind\": \"minutes\", \"minutes\": 15}}"
+  TK_ID=$(body_get id)
+  if [ "$HTTP" = "200" ] && [ -n "$TK_ID" ]; then ok "строка запущена на тестовом экране на 15 минут (id=$TK_ID)"; else bad "запуск строки: HTTP $HTTP $BODY"; TK_ID=""; fi
+
+  # экран подаёт сигнал как агент 1.4.0 и сообщает, что строка у него бежит
+  RESP=$($DC curl -s -w $'\n%{http_code}' -X POST "$API/heartbeat/$SID" -H "X-Token: $SCR_TOKEN" \
+        -H 'Content-Type: application/json' \
+        -d "{\"status\":\"online\",\"playing_file\":null,\"agent_version\":\"1.4.0\",\"ticker_state\":{\"ids\":[${TK_ID:-0}],\"stopped\":false,\"screen_off\":false}}" 2>/dev/null)
+  HTTP="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
+  [ "$HTTP" = "200" ] && ok "heartbeat экрана (агент 1.4.0) принят" || bad "heartbeat: HTTP $HTTP"
+
+  if [ -n "$TK_ID" ]; then
+    req GET "/tickers/overview"
+    if [ "$HTTP" = "200" ] && body_has "any(t['id']==$TK_ID and t['message']=='$TK_MSG' and t['target']=='screens' and t['screen_ids']==[$SID] and t['screens_total']==1 and t['confirm']['total']==1 and t['confirm']['running']+len(t['confirm']['problems'])==1 and all(p['reason'] in ('offline','old_agent','stopped','screen_off','pending','not_confirmed') for p in t['confirm']['problems']) and 800 <= t['remaining_seconds'] <= 900 for t in r['tickers'])"; then
+      ok "обзор: строка на 1 экране, подтверждение посчитано, осталось ~15 минут"
+    else
+      bad "обзор: строки нет или она неверная, HTTP $HTTP: $(echo "$BODY" | python3 -c "import sys,json;print([(t['id'],t['screens_total'],t['confirm'],t['remaining_seconds']) for t in json.load(sys.stdin)['tickers'] if t['id']==$TK_ID])" 2>/dev/null)"
+    fi
+    if body_has "any(x['id']==$SID and x['live_count']==1 for x in r['screens']) and isinstance(r['groups'], list) and isinstance(r['templates'], list) and r['generated_at']"; then
+      ok "обзор: у тестового экрана одна живая строка, группы и шаблоны на месте"
+    else
+      bad "обзор: у экрана нет live_count=1 или нет групп/шаблонов"
+    fi
+    req GET "/tickers"
+    if [ "$HTTP" = "200" ] && body_has "isinstance(r, list) and any(t['id']==$TK_ID and t['is_all'] is False and t['target']=='screens' and t['until_at'] and t['started_by'] for t in r)"; then
+      ok "GET /tickers — по-прежнему список, строка в нём с target и сроком"
+    else
+      bad "GET /tickers: HTTP $HTTP"
+    fi
+    dreq "/command/poll/$SID"
+    if [ "$HTTP" = "200" ] && body_has "(r['command'] or {}).get('type')=='ticker_show' and r['command']['payload'].get('message')=='$TK_MSG' and 800 <= r['command']['payload'].get('duration', 0) <= 900"; then
+      ok "старому агенту поставлена команда ticker_show (с оставшимся сроком)"
+    else
+      bad "команда ticker_show экрану не поставлена, HTTP $HTTP: $BODY"
+    fi
+
+    # правка: текст и вид новые, срок не присылаем — остаётся прежний
+    req PUT "/tickers/$TK_ID" -H "$JSON_T" \
+        -d "{\"message\": \"${TK_MSG}_edit\", \"color\": \"#ff6b5e\", \"speed\": \"fast\", \"target\": \"screens\", \"screen_ids\": [$SID]}"
+    [ "$HTTP" = "200" ] && ok "строка изменена" || bad "правка строки: HTTP $HTTP $BODY"
+    req GET "/tickers/overview"
+    if [ "$HTTP" = "200" ] && body_has "any(t['id']==$TK_ID and t['message']=='${TK_MSG}_edit' and t['color']=='#ff6b5e' and t['speed']=='fast' and t['changed_by'] and 780 <= t['remaining_seconds'] <= 900 for t in r['tickers'])"; then
+      ok "после правки: новый текст и вид, срок прежний"
+    else
+      bad "после правки обзор неверный, HTTP $HTTP"
+    fi
+    req GET "/audit?limit=40"
+    if [ "$HTTP" = "200" ] && body_has "any(x['event_type']=='ticker' and x['title']=='Бегущая строка изменена' and '${TK_MSG}_edit' in (x['detail'] or '') for x in r)"; then
+      ok "в журнале: «Бегущая строка изменена»"
+    else
+      bad "в журнале нет записи об изменении строки"
+    fi
+    if body_has "any(x['event_type']=='ticker' and x['title']=='Бегущая строка запущена' and '$TK_MSG' in (x['detail'] or '') for x in r)"; then
+      ok "в журнале: «Бегущая строка запущена»"
+    else
+      bad "в журнале нет записи о запуске строки"
+    fi
+
+    # снятие
+    req DELETE "/tickers/$TK_ID"
+    [ "$HTTP" = "200" ] && ok "строка снята" || bad "снятие строки: HTTP $HTTP $BODY"
+    req GET "/tickers/overview"
+    if [ "$HTTP" = "200" ] && body_has "not any(t['id']==$TK_ID for t in r['tickers']) and all(x['live_count']==0 for x in r['screens'] if x['id']==$SID)"; then
+      ok "после снятия строки в обзоре нет, у тестового экрана 0 строк"
+    else
+      bad "после снятия строка осталась в обзоре, HTTP $HTTP"
+    fi
+    req GET "/audit?limit=40"
+    if [ "$HTTP" = "200" ] && body_has "any(x['event_type']=='ticker' and x['title']=='Бегущая строка снята' and '${TK_MSG}_edit' in (x['detail'] or '') for x in r)"; then
+      ok "в журнале: «Бегущая строка снята»"
+    else
+      bad "в журнале нет записи о снятии строки"
+    fi
+    req DELETE "/tickers/$TK_ID"
+    if [ "$HTTP" = "404" ] && body_has "r['detail']=='Бегущая строка не найдена'"; then ok "повторное снятие — 404 «Бегущая строка не найдена»"; else bad "повторное снятие: ждали 404, HTTP $HTTP $BODY"; fi
+    req PUT "/tickers/$TK_ID" -H "$JSON_T" -d "{\"message\": \"${TK_MSG}_late\"}"
+    [ "$HTTP" = "404" ] && ok "правка снятой строки — 404" || bad "правка снятой строки: ждали 404, HTTP $HTTP"
+    TK_ID=""
+  fi
+
+  # старое тело запроса: is_all=false, screen_ids, duration=60 (секунды) → срок +60 с
+  req POST "/tickers" -H "$JSON_T" \
+      -d "{\"message\": \"${TK_MSG}_old\", \"is_all\": false, \"screen_ids\": [$SID], \"duration\": 60}"
+  TK_OLD_ID=$(body_get id)
+  if [ "$HTTP" = "200" ] && [ -n "$TK_OLD_ID" ]; then
+    req GET "/tickers/overview"
+    if [ "$HTTP" = "200" ] && body_has "any(t['id']==$TK_OLD_ID and t['target']=='screens' and t['screen_ids']==[$SID] and 1 <= t['remaining_seconds'] <= 60 and abs((__import__('datetime').datetime.fromisoformat(t['until_at']) - __import__('datetime').datetime.fromisoformat(t['started_at'])).total_seconds() - 60) < 1 for t in r['tickers'])"; then
+      ok "старое тело (is_all=false, duration=60): срок — запуск + 60 с"
+    else
+      bad "старое тело: срок не запуск + 60 с, HTTP $HTTP"
+    fi
+    req DELETE "/tickers/$TK_OLD_ID"
+    if [ "$HTTP" = "200" ]; then ok "строка по старому телу снята"; TK_OLD_ID=""; else bad "снятие строки по старому телу: HTTP $HTTP"; fi
+  else
+    bad "старое тело запроса не принято: HTTP $HTTP $BODY"; TK_OLD_ID=""
+  fi
+
+  # ошибки — 400 по-русски
+  req POST "/tickers" -H "$JSON_T" -d "{\"message\": \"   \", \"target\": \"screens\", \"screen_ids\": [$SID]}"
+  if [ "$HTTP" = "400" ] && body_has "any('А' <= c <= 'я' for c in r['detail'])"; then ok "пустой текст — 400 с русским пояснением"; else bad "пустой текст: ждали 400, HTTP $HTTP $BODY"; fi
+  req POST "/tickers" -H "$JSON_T" -d "{\"message\": \"$TK_MSG\", \"target\": \"screens\", \"screen_ids\": [$SID], \"term\": {\"kind\": \"minutes\", \"minutes\": 0}}"
+  if [ "$HTTP" = "400" ]; then ok "срок «0 минут» — 400"; else bad "срок 0 минут: ждали 400, HTTP $HTTP $BODY"; fi
+  req POST "/tickers" -H "$JSON_T" -d "{\"message\": \"$TK_MSG\", \"target\": \"screens\", \"screen_ids\": [2000000000]}"
+  if [ "$HTTP" = "400" ] && body_has "'обновите страницу' in r['detail']"; then ok "несуществующий экран — 400 «обновите страницу», не 500"; else bad "несуществующий экран: ждали 400, HTTP $HTTP $BODY"; fi
+
+  # шаблоны
+  req POST "/ticker-templates" -H "$JSON_T" \
+      -d "{\"message\": \"SMOKE_tpl_$STAMP\", \"color\": \"#ffffff\", \"speed\": \"slow\", \"term\": {\"kind\": \"minutes\", \"minutes\": 30}}"
+  TPL_ID=$(body_get id)
+  if [ "$HTTP" = "200" ] && [ -n "$TPL_ID" ]; then ok "шаблон создан (id=$TPL_ID)"; else bad "создание шаблона: HTTP $HTTP $BODY"; TPL_ID=""; fi
+  if [ -n "$TPL_ID" ]; then
+    req GET "/ticker-templates"
+    if [ "$HTTP" = "200" ] && body_has "any(t['id']==$TPL_ID and t['message']=='SMOKE_tpl_$STAMP' and t['color']=='#ffffff' and t['speed']=='slow' and t['term']=={'kind':'minutes','minutes':30} for t in r)"; then
+      ok "шаблон найден в списке: текст, вид и срок на месте"
+    else
+      bad "шаблона нет в списке или он неверный, HTTP $HTTP"
+    fi
+    req PUT "/ticker-templates/$TPL_ID" -H "$JSON_T" -d "{\"message\": \"SMOKE_tpl_$STAMP\", \"term\": {\"kind\": \"hour\", \"hour\": 24}}"
+    [ "$HTTP" = "200" ] && ok "шаблон переписан (до 24:00)" || bad "правка шаблона: HTTP $HTTP $BODY"
+    req GET "/tickers/overview"
+    if [ "$HTTP" = "200" ] && body_has "any(t['id']==$TPL_ID and t['term']=={'kind':'hour','hour':24} and t['color']=='#ffd34d' for t in r['templates'])"; then
+      ok "обзор отдаёт шаблон с новым сроком"
+    else
+      bad "обзор: шаблон не найден или срок не тот, HTTP $HTTP"
+    fi
+    req DELETE "/ticker-templates/$TPL_ID"
+    [ "$HTTP" = "200" ] && ok "шаблон удалён" || bad "удаление шаблона: HTTP $HTTP"
+    req GET "/ticker-templates"
+    if [ "$HTTP" = "200" ] && body_has "not any(t['id']==$TPL_ID for t in r)"; then ok "удалённого шаблона в списке нет"; else bad "шаблон остался в списке"; fi
+    req DELETE "/ticker-templates/$TPL_ID"
+    [ "$HTTP" = "404" ] && ok "повторное удаление шаблона — 404" || bad "повторное удаление шаблона: ждали 404, HTTP $HTTP"
+    TPL_ID=""
+  fi
+else
+  bad "нет экрана или его токена — проверку бегущей строки провести не на чем"
+fi
+
 # ── 6. Уборка тестовых данных ────────────────────────────────────────────────
 step "Уборка"
 # Запланированный показ ($PLC) отменяем сам; остановленный ($PLC2) уходит
@@ -782,6 +935,17 @@ if [ -n "${MD5_MID:-}" ]; then
   [ "$(media_files "SMOKE_dup_$STAMP")" = "0" ] && ok "файлов дублей на диске не осталось" || bad "на диске остались файлы дублей"
   [ "$(media_files "smoke_u_$STAMP")" = "0" ] && ok "файла уникального ролика на диске не осталось" || bad "на диске остался файл уникального ролика"
 fi
+# Бегущие строки и шаблоны SMOKE — по тексту (на случай, если проверка выше оборвалась на полпути)
+req GET "/tickers"
+for LEFT_ID in $(echo "$BODY" | python3 -c "import sys,json;print(' '.join(str(t['id']) for t in json.load(sys.stdin) if t['message'].startswith('SMOKE_tk_$STAMP')))" 2>/dev/null); do
+  req DELETE "/tickers/$LEFT_ID"
+  [ "$HTTP" = "200" ] && ok "бегущая строка проверки снята (id=$LEFT_ID)" || bad "снятие строки $LEFT_ID: HTTP $HTTP"
+done
+req GET "/ticker-templates"
+for LEFT_ID in $(echo "$BODY" | python3 -c "import sys,json;print(' '.join(str(t['id']) for t in json.load(sys.stdin) if t['message'].startswith('SMOKE_tpl_$STAMP')))" 2>/dev/null); do
+  req DELETE "/ticker-templates/$LEFT_ID"
+  [ "$HTTP" = "200" ] && ok "шаблон проверки удалён (id=$LEFT_ID)" || bad "удаление шаблона $LEFT_ID: HTTP $HTTP"
+done
 [ -n "${SID:-}" ] && req DELETE "/minipc/$SID"     && ok "экран удалён"
 $DC rm -f /tmp/smoke.mp4 /tmp/smoke_u_$STAMP.mp4 2>/dev/null
 

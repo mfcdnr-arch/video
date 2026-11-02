@@ -54,6 +54,10 @@ celery_app.conf.update(
             "task": "expire_broadcast",
             "schedule": 60.0,   # каждую минуту: общий эфир «до ЧЧ:00» заканчивается сам
         },
+        "expire-tickers": {
+            "task": "expire_tickers",
+            "schedule": 60.0,   # каждую минуту: бегущие строки со сроком снимаются сами
+        },
     },
 )
 
@@ -242,6 +246,48 @@ def expire_broadcast():
     if expired:
         log.info("[broadcast] Общий эфир завершён по времени")
     return {"expired": expired}
+
+
+@celery_app.task(name="expire_tickers")
+def expire_tickers():
+    """
+    Раз в минуту: снять бегущие строки, у которых вышел срок.
+
+    Экраны с агентом 1.4.0 снимают строку сами по сроку из ленты; задача убирает её из БД и пишет в
+    журнал «Бегущая строка снята по сроку» (от имени системы, по разу на строку). Старому агенту
+    (< 1.4.0) строка одна, поэтому экранам снятых строк заново ставится команда о САМОЙ НОВОЙ из
+    оставшихся (ticker_show) или ticker_hide, если не осталось ничего. Всё — одной транзакцией, один
+    commit. WS-будильника у воркера нет (реестр соединений живёт в процессе API): старый агент
+    заберёт команду при ближайшем опросе. Срок и момент сравнения — наивное МСК.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session as OrmSession
+
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        log.error("[ticker] DATABASE_URL не задан")
+        return "error: DATABASE_URL is not set"
+
+    import ticker_store
+    from placements_store import now_msk
+
+    engine = create_engine(database_url, pool_pre_ping=True)
+    try:
+        with OrmSession(engine) as db:
+            now = now_msk()
+            expired = ticker_store.expire_due(db, now)
+            targets = {sid for t in expired for sid in t["targets"]}
+            ticker_store.notify_screens(db, targets, set(), now)
+            db.commit()
+    except Exception as e:
+        log.error(f"[ticker] Не удалось снять бегущие строки по сроку: {e}")
+        return {"error": str(e)}
+    finally:
+        engine.dispose()
+
+    if expired:
+        log.info(f"[ticker] Бегущих строк снято по сроку: {len(expired)}")
+    return {"expired": len(expired)}
 
 
 @celery_app.task(name="archive_play_log")

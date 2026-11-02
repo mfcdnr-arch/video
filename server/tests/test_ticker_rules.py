@@ -12,7 +12,7 @@ import ticker_rules as rules
 from routers.broadcast import STALE_WINDOW_TEXT
 from ticker_rules import (
     CONFIRM_VERSION, MAX_LEN, MAX_MINUTES, PENDING_SECONDS, REASON_TEXT, REASONS, SPEEDS, TARGETS,
-    parse_term, parse_ticker_body, resolve_screens, screen_reason, summarize, ticker_live,
+    parse_template_body, parse_term, parse_ticker_body, resolve_screens, screen_reason, summarize, ticker_live,
     tickers_for_screen, version_tuple,
 )
 
@@ -220,6 +220,62 @@ def test_keep_term_when_given():
     assert out["until_at"] == N + timedelta(minutes=10)
     out = parse_ticker_body(body(term={"kind": "cancel"}), N, keep_term=True)
     assert (out["term_given"], out["until_at"]) == (True, None)
+
+
+# --- тело шаблона ---------------------------------------------------------------
+
+def tpl(**kw):
+    return {"message": "Касса закрыта", **kw}
+
+
+def test_template_body_term_kinds():
+    base = {"message": "Касса закрыта", "color": "#ffd34d", "speed": "medium"}
+    assert parse_template_body(tpl(term={"kind": "minutes", "minutes": 15})) == {**base, "term_kind": "minutes", "term_value": 15}
+    assert parse_template_body(tpl(term={"kind": "hour", "hour": 18})) == {**base, "term_kind": "hour", "term_value": 18}
+    assert parse_template_body(tpl(term={"kind": "cancel"})) == {**base, "term_kind": "cancel", "term_value": None}
+
+
+def test_template_body_defaults_and_no_term_is_cancel():
+    assert parse_template_body(tpl()) == {"message": "Касса закрыта", "color": "#ffd34d", "speed": "medium",
+                                          "term_kind": "cancel", "term_value": None}
+    assert parse_template_body(tpl(term=None))["term_kind"] == "cancel"
+
+
+def test_template_body_normalizes_like_a_ticker():
+    out = parse_template_body({"message": "  Две\nстроки ", "color": "#FFAA00", "speed": "fast"})
+    assert (out["message"], out["color"], out["speed"]) == ("Две строки", "#ffaa00", "fast")
+
+
+def test_template_hour_is_not_checked_against_the_clock():
+    # час хранится «на потом»: проверка «позже текущего» — при запуске, а не при сохранении
+    assert parse_template_body(tpl(term={"kind": "hour", "hour": 1}))["term_value"] == 1
+    assert parse_template_body(tpl(term={"kind": "hour", "hour": 24}))["term_value"] == 24
+
+
+def test_template_on_date_is_ignored():
+    out = parse_template_body(tpl(term={"kind": "hour", "hour": 18, "on_date": "2020-01-01"}))
+    assert (out["term_kind"], out["term_value"]) == ("hour", 18)
+
+
+@pytest.mark.parametrize("raw, match", [
+    ([], "JSON-объект"),
+    ({"message": "  "}, "не может быть пустым"),
+    ({"message": "x" * (MAX_LEN + 1)}, "не длиннее"),
+    (tpl(color="red"), "Цвет"),
+    (tpl(speed="turbo"), "Скорость"),
+    (tpl(term={"kind": "minutes", "minutes": 0}), "Минут"),
+    (tpl(term={"kind": "minutes", "minutes": MAX_MINUTES + 1}), "Минут"),
+    (tpl(term={"kind": "minutes"}), "Минут"),
+    (tpl(term={"kind": "hour", "hour": 0}), "Час окончания"),
+    (tpl(term={"kind": "hour", "hour": 25}), "Час окончания"),
+    (tpl(term={"kind": "hour", "hour": "18"}), "Час окончания"),
+    (tpl(term={"kind": "hour"}), "Час окончания"),
+    (tpl(term={"kind": "forever"}), "Срок"),
+    (tpl(term="cancel"), "Срок"),
+])
+def test_template_body_rejects(raw, match):
+    with pytest.raises(ValueError, match=match):
+        parse_template_body(raw)
 
 
 # --- живая ли строка ------------------------------------------------------------

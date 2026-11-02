@@ -85,10 +85,7 @@ def parse_term(term: dict | None, now: datetime) -> datetime | None:
     if kind == "cancel":
         return None
     if kind == "minutes":
-        minutes = term.get("minutes")
-        if isinstance(minutes, bool) or not isinstance(minutes, int) or not 1 <= minutes <= MAX_MINUTES:
-            raise ValueError(f"Минут — целое от 1 до {MAX_MINUTES}")
-        return now + timedelta(minutes=minutes)
+        return now + timedelta(minutes=_check_minutes(term.get("minutes")))
     if kind == "hour":
         if term.get("on_date") is not None and _parse_on_date(term["on_date"]) != now.date():
             raise ValueError(STALE_WINDOW_TEXT)
@@ -96,6 +93,13 @@ def parse_term(term: dict | None, now: datetime) -> datetime | None:
             raise ValueError(_HOUR_TEXT)            # parse_until_hour(None) — это «до отмены», тут нельзя
         return parse_until_hour(term["hour"], now)
     raise ValueError(_TERM_TEXT)
+
+
+def _check_minutes(minutes) -> int:
+    """«На N минут»: целое от 1 до 1440 (bool, дроби и строки — не минуты)."""
+    if isinstance(minutes, bool) or not isinstance(minutes, int) or not 1 <= minutes <= MAX_MINUTES:
+        raise ValueError(f"Минут — целое от 1 до {MAX_MINUTES}")
+    return minutes
 
 
 def _legacy_until(duration, now: datetime) -> datetime | None:
@@ -122,6 +126,24 @@ def _message(value) -> str:
     if len(text) > MAX_LEN:
         raise ValueError(f"Текст строки — не длиннее {MAX_LEN} символов")
     return text
+
+
+def _color(value) -> str:
+    """Цвет #RRGGBB в нижнем регистре; нет цвета — жёлтый по умолчанию."""
+    if value is None:
+        return DEFAULT_COLOR
+    if not isinstance(value, str) or not _COLOR.fullmatch(value):
+        raise ValueError("Цвет — в виде #RRGGBB")
+    return value.lower()
+
+
+def _speed(value) -> str:
+    """Скорость slow | medium | fast; нет скорости — medium."""
+    if value is None:
+        return DEFAULT_SPEED
+    if value not in SPEEDS:
+        raise ValueError("Скорость — slow, medium или fast")
+    return value
 
 
 def _id_list(value, empty_text: str, bad_text: str) -> list[int]:
@@ -157,16 +179,8 @@ def parse_ticker_body(body: dict, now: datetime, keep_term: bool = False) -> dic
         raise ValueError("Ожидается JSON-объект со строкой")
     message = _message(body.get("message"))
 
-    color = body.get("color")
-    if color is None:
-        color = DEFAULT_COLOR
-    elif not isinstance(color, str) or not _COLOR.fullmatch(color):
-        raise ValueError("Цвет — в виде #RRGGBB")
-    speed = body.get("speed")
-    if speed is None:
-        speed = DEFAULT_SPEED
-    elif speed not in SPEEDS:
-        raise ValueError("Скорость — slow, medium или fast")
+    color = _color(body.get("color"))
+    speed = _speed(body.get("speed"))
 
     target = body.get("target")
     if target is None:
@@ -187,8 +201,38 @@ def parse_ticker_body(body: dict, now: datetime, keep_term: bool = False) -> dic
     else:
         until_at, term_given = None, not keep_term
 
-    return {"message": message, "color": color.lower(), "speed": speed, "target": target,
+    return {"message": message, "color": color, "speed": speed, "target": target,
             "group_ids": group_ids, "screen_ids": screen_ids, "until_at": until_at, "term_given": term_given}
+
+
+def parse_template_body(body: dict) -> dict:
+    """Тело POST/PUT /ticker-templates → {message, color, speed, term_kind, term_value}.
+
+    Текст, цвет и скорость проверяются как у строки. Срок — `{"kind": "cancel"}` (или без срока),
+    `{"kind": "minutes", "minutes": N}` (1…1440) или `{"kind": "hour", "hour": H}` (целое 1…24): term_kind
+    `cancel | minutes | hour`, term_value — N, H или None. Час хранится «на потом», поэтому его не
+    сверяют с часами: «позже текущего» проверит запуск строки по шаблону. `on_date` у шаблона не
+    хранится и игнорируется. Всё неверное — ValueError с русским текстом.
+    """
+    if not isinstance(body, dict):
+        raise ValueError("Ожидается JSON-объект с шаблоном")
+    out = {"message": _message(body.get("message")), "color": _color(body.get("color")), "speed": _speed(body.get("speed"))}
+    term = body.get("term")
+    if term is None:
+        return {**out, "term_kind": "cancel", "term_value": None}
+    if not isinstance(term, dict):
+        raise ValueError(_TERM_TEXT)
+    kind = term.get("kind")
+    if kind == "cancel":
+        return {**out, "term_kind": "cancel", "term_value": None}
+    if kind == "minutes":
+        return {**out, "term_kind": "minutes", "term_value": _check_minutes(term.get("minutes"))}
+    if kind == "hour":
+        hour = term.get("hour")
+        if isinstance(hour, bool) or not isinstance(hour, int) or not 1 <= hour <= 24:
+            raise ValueError(_HOUR_TEXT)
+        return {**out, "term_kind": "hour", "term_value": hour}
+    raise ValueError(_TERM_TEXT)
 
 
 # --- «где» → экраны, строки экрана --------------------------------------------

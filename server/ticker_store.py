@@ -7,7 +7,8 @@
 Все отметки времени — наивное МСК. Пишем и сравниваем их из Python (`now` приходит снаружи),
 а не NOW() Postgres: контейнер БД живёт в UTC, и «до 15:00» поехало бы на три часа. Срок
 `until_at = NULL` — «до снятия». Строка со сроком живёт строго до `until_at`; истёкшую строку
-правка уже не находит (LookupError), а Celery-задача снимает её через expire_due.
+правка уже не находит (LookupError), а Celery-задача снимает её через expire_due
+(и сообщает старым агентам, что у них осталось).
 
 Эти же функции читает лента экрана, поэтому «кто что видит» живёт в одном месте
 (tickers_for_screen), а «в сети» — только в screen_online.
@@ -104,6 +105,16 @@ def screens_brief(db) -> list[dict]:
              "ticker_ids": None if r.ticker_ids is None else list(r.ticker_ids),
              "ticker_stopped": r.ticker_stopped, "ticker_screen_off": r.ticker_screen_off}
             for r in rows]
+
+
+def groups_brief(db) -> list[dict]:
+    """Группы экранов для выбора «где»: `[{id, name, screen_count}]` по имени; пустая группа — 0 экранов."""
+    rows = db.execute(text("""
+        SELECT g.id, g.name, (SELECT COUNT(*) FROM screens s WHERE s.group_id = g.id) AS screen_count
+        FROM sync_groups g
+        ORDER BY g.name, g.id
+    """)).fetchall()
+    return [{"id": r.id, "name": r.name, "screen_count": int(r.screen_count)} for r in rows]
 
 
 def for_screen(db, screen_id: int, now: datetime) -> list[dict]:
@@ -217,16 +228,35 @@ def remove(db, ticker_id: int, actor: str, now: datetime) -> None:
     _audit(db, TITLE_OFF, r.message, actor)
 
 
-def expire_due(db, now: datetime) -> int:
-    """Снять строки, у которых срок вышел (until_at <= now); «до снятия» не трогаем. Возвращает число.
+def expire_due(db, now: datetime) -> list[dict]:
+    """Снять строки, у которых срок вышел (until_at <= now); «до снятия» не трогаем.
 
-    По каждой снятой строке — одна запись «снята по сроку» от имени системы. Экранам сообщать не нужно:
-    агент знает срок и снимает строку сам.
+    Возвращает снятые строки: `[{id, message, targets}]`, `targets` — экраны строки на момент снятия
+    (список id). Их нужно прочитать ДО удаления: связи с группами и экранами уходят вместе со строкой.
+    Строки блокируются `FOR UPDATE`, поэтому правка, успевшая продлить срок, не потеряется: снятие
+    дождётся её и увидит новый срок. По каждой снятой строке — одна запись «снята по сроку» от имени системы.
+
+    Агент знает срок и снимает строку сам, но у старого агента (< 1.4.0) строка одна: если вышел срок
+    самой новой, а другая ещё живёт, ему нужен ticker_show этой другой — для этого вызывающий передаёт
+    `targets` в notify_screens (before = эти экраны, after = пусто).
     """
-    rows = db.execute(text("DELETE FROM tickers WHERE until_at <= :now RETURNING id, message"), {"now": now}).fetchall()
+    rows = db.execute(text(_SELECT_TICKERS + """
+        WHERE t.until_at <= :now
+        ORDER BY t.id
+        FOR UPDATE OF t
+    """), {"now": now}).fetchall()
+    if not rows:
+        return []
+    screens = _all_screens(db)
+    expired = []
     for r in rows:
-        _audit(db, TITLE_EXPIRED, r.message, SYSTEM_ACTOR)
-    return len(rows)
+        t = _ticker(r)
+        expired.append({"id": t["id"], "message": t["message"],
+                        "targets": resolve_screens(t["target"], t["group_ids"], t["screen_ids"], screens)})
+    db.execute(text("DELETE FROM tickers WHERE id = ANY(:ids)"), {"ids": [t["id"] for t in expired]})
+    for t in expired:
+        _audit(db, TITLE_EXPIRED, t["message"], SYSTEM_ACTOR)
+    return expired
 
 
 # --- отчёт экрана -------------------------------------------------------------
