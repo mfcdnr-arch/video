@@ -681,13 +681,14 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
     # решаются на момент now, ticker_store.for_screen). Агент 1.4.0 берёт строки отсюда и переживает с ними
     # перезагрузку; старый агент поле не читает — ему идут команды ticker_show / ticker_hide. Читаем после
     # commit запоминания плейлиста: откат при сбое (например, миграция 034 ещё не накатана) его не отменит.
-    # Ленту сбой строк не роняет: строк нет, остальное на месте.
+    # Ленту сбой строк не роняет, но и «строк нет» не говорит: ключ tickers в ответ не кладём — агент 1.4.0
+    # без ключа оставляет у себя прежний список, а пустой список снял бы живые объявления из-за сбоя БД.
+    feed_tickers = {}
     try:
-        tickers = ticker_store.for_screen(db, screen_id, now)
+        feed_tickers["tickers"] = ticker_store.for_screen(db, screen_id, now)
     except Exception:
-        log.exception("screen %s: бегущая строка не прочитана, лента без неё", screen_id)
+        log.exception("screen %s: бегущая строка не прочитана, лента без ключа tickers", screen_id)
         db.rollback()
-        tickers = []
 
     return {
         "screen_id": screen_id,
@@ -706,8 +707,9 @@ def schedule_for_minipc(screen_id: int, db: Session = Depends(get_db),
         "power": power,                       # окно работы монитора (МСК)
         "volume": volume,                     # громкость день/ночь (МСК)
         # бегущие строки экрана по порядку запуска: [{id, message, color, speed, until_at}],
-        # until_at — ISO без пояса (наивное МСК) или null («до снятия»); ключ есть всегда
-        "tickers": tickers,
+        # until_at — ISO без пояса (наивное МСК) или null («до снятия»). Ключ есть всегда, кроме сбоя
+        # чтения строк: нет ключа — «ничего не менять», пустой список — «строк нет»
+        **feed_tickers,
         "generated_at": datetime.now(timezone.utc).isoformat()
     }
 
@@ -724,7 +726,7 @@ def poll_commands(screen_id: int, db: Session = Depends(get_db),
     row = db.execute(text("""
         SELECT id, type, payload FROM commands
         WHERE screen_id = :sid AND executed_at IS NULL
-        ORDER BY created_at LIMIT 1
+        ORDER BY created_at, id LIMIT 1
     """), {"sid": screen_id}).fetchone()
     if not row:
         return {"command": None}
@@ -872,13 +874,19 @@ async def command_resume_screen(
     db.execute(text(
         "INSERT INTO commands (screen_id, type, payload) VALUES (:sid, 'resume', CAST(:p AS jsonb))"
     ), {"sid": screen_id, "p": _json.dumps({})})
+    db.commit()      # «Показ» не зависит от бегущей строки: команда закоммичена до неё
     # Бегущая строка вернётся вместе с показом (она жива, пока не вышел срок): старому агенту — ticker_show
     # самой новой из живых строк экрана. Нет живых — команду не ставим: лишняя команда в очереди старого агента
-    # (по WS ему дают одну за пробуждение) только задержала бы следующий ticker_show.
-    now = now_msk()
-    if ticker_store.for_screen(db, screen_id, now):
-        ticker_store.notify_screens(db, set(), {screen_id}, now)
-    db.commit()
+    # (по WS ему дают одну за пробуждение) только задержала бы следующий ticker_show. Сбой строк (на установке
+    # новый API стартует раньше миграции 034) «Показ» не роняет: команда уже в очереди, ошибку откатываем.
+    try:
+        now = now_msk()
+        if ticker_store.for_screen(db, screen_id, now):
+            ticker_store.notify_screens(db, set(), {screen_id}, now)
+            db.commit()
+    except Exception:
+        log.exception("screen %s: ticker_show после «Показ» не поставлен", screen_id)
+        db.rollback()
     connected = ws_manager.connected_screens()
     if screen_id in connected:
         _asyncio.create_task(ws_manager.send(screen_id, {"type": "new_command", "count": 1}))
@@ -894,16 +902,25 @@ async def command_stop_screen(
     """Отправить команду остановки показа на мини ПК (очередь команд + WS-будильник).
     Разовая остановка: агент возобновит показ по расписанию на следующем цикле.
     Бегущую строку «Стоп» не снимает: на сервере она живёт до срока, на других экранах идёт дальше, а при
-    «Показ» возвращается. С этого экрана её убирает сам новый агент (показ остановлен), старому — ticker_hide."""
+    «Показ» возвращается. С этого экрана её убирает сам новый агент (показ остановлен), старому — ticker_hide,
+    но только если у экрана есть живые строки (иначе лишняя команда в очереди задержала бы его следующую)."""
     import json as _json
     import asyncio as _asyncio
     db.execute(text(
         "INSERT INTO commands (screen_id, type, payload) VALUES (:sid, 'stop', CAST(:p AS jsonb))"
     ), {"sid": screen_id, "p": _json.dumps({})})
-    db.execute(text(
-        "INSERT INTO commands (screen_id, type, payload) VALUES (:sid, 'ticker_hide', CAST(:p AS jsonb))"
-    ), {"sid": screen_id, "p": _json.dumps({})})
-    db.commit()
+    db.commit()      # «Стоп» не зависит от бегущей строки: команда закоммичена до неё
+    # Старому агенту — ticker_hide, но только когда у экрана есть живые строки. Сбой строк (на установке новый
+    # API стартует раньше миграции 034) «Стоп» не роняет: команда уже в очереди, ошибку откатываем.
+    try:
+        if ticker_store.for_screen(db, screen_id, now_msk()):
+            db.execute(text(
+                "INSERT INTO commands (screen_id, type, payload) VALUES (:sid, 'ticker_hide', CAST(:p AS jsonb))"
+            ), {"sid": screen_id, "p": _json.dumps({})})
+            db.commit()
+    except Exception:
+        log.exception("screen %s: ticker_hide после «Стоп» не поставлен", screen_id)
+        db.rollback()
     connected = ws_manager.connected_screens()
     if screen_id in connected:
         _asyncio.create_task(ws_manager.send(screen_id, {"type": "new_command", "count": 1}))

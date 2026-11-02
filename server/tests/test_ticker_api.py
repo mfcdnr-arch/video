@@ -610,10 +610,11 @@ def test_feed_tickers_follow_screen_scope(screens_clock):
     assert [t["id"] for t in feed["tickers"]] == [11, 13]
 
 
-def test_feed_tickers_failure_is_empty_list_not_500(screens_clock):
+def test_feed_tickers_failure_omits_the_key_not_500(screens_clock):
+    # нет ключа — «ничего не менять» для агента 1.4.0; пустой список снял бы живые объявления из-за сбоя БД
     db = TxDB([("SELECT last_playlist_id", [5])], fail_on="FROM tickers")
     feed = run_feed(db)
-    assert feed["tickers"] == []
+    assert "tickers" not in feed
     assert db.rollbacks == 1 and not db.aborted
     # остальная лента на месте
     assert feed["active_source"] == "template" and feed["schedule"] == [] and feed["files"] == []
@@ -640,17 +641,47 @@ def test_playlist_change_does_not_touch_tickers(screens_clock, spy_auto_clear):
     assert [t["id"] for t in feed["tickers"]] == [11]                                    # строка в ленте как была
 
 
+def stop_db(live=(), fail_on=None):
+    return TxDB([("ORDER BY t.started_at", list(live))], fail_on=fail_on)
+
+
 def test_stop_keeps_tickers_and_hides_on_that_screen(monkeypatch, spy_auto_clear):
-    db = RoutedDB([])
+    live = [TK(id=11, target="all"), TK(id=12, target="screens", screen_ids=[6])]       # на экране 5 живёт одна
+    db = stop_db(live)
     ws = FakeWS(connected=[5, 9], db=db)
     monkeypatch.setattr(screens_router, "ws_manager", ws)
+    monkeypatch.setattr(screens_router, "now_msk", lambda: N)
     assert call(screens_router.command_stop_screen, 5, admin=ADMIN, db=db) == {"status": "ok", "ws_sent": True}
     assert commands(db) == [(5, "stop", {}), (5, "ticker_hide", {})]      # старому агенту: гаси строку на этом экране
     assert spy_auto_clear == []
     assert not db.sqls("DELETE FROM tickers") and not db.sqls("UPDATE tickers")      # на сервере строки живы
-    assert not db.sqls("FROM tickers") and not journal(db)                           # и не тронуты, и в журнал не пишется
+    assert not journal(db)                                                            # в журнал ничего не пишется
+    assert db.commits == 2                                                            # stop и ticker_hide
+    assert ws.sent == [(5, {"type": "new_command", "count": 1}, 2)]       # будильник только этому экрану, после commit
+
+
+def test_stop_without_live_tickers_queues_only_stop(monkeypatch):
+    # живых строк у экрана нет: лишний ticker_hide остался бы в очереди старого агента (по WS — одна команда
+    # за пробуждение) и задержал бы следующий «Показ» или ticker_show
+    db = stop_db([TK(id=11, target="screens", screen_ids=[6]), TK(id=12, until_at=N - timedelta(seconds=1))])
+    monkeypatch.setattr(screens_router, "ws_manager", FakeWS())
+    monkeypatch.setattr(screens_router, "now_msk", lambda: N)
+    call(screens_router.command_stop_screen, 5, admin=ADMIN, db=db)
+    assert commands(db) == [(5, "stop", {})]
     assert db.commits == 1
-    assert ws.sent == [(5, {"type": "new_command", "count": 1}, 1)]       # будильник только этому экрану, после commit
+
+
+def test_stop_survives_a_failing_ticker_part(monkeypatch):
+    # на установке новый API стартует раньше миграции 034: чтение строк падает. «Стоп» уже закоммичен и уходит
+    db = stop_db(fail_on="FROM tickers")
+    ws = FakeWS(connected=[5], db=db)
+    monkeypatch.setattr(screens_router, "ws_manager", ws)
+    monkeypatch.setattr(screens_router, "now_msk", lambda: N)
+    assert call(screens_router.command_stop_screen, 5, admin=ADMIN, db=db) == {"status": "ok", "ws_sent": True}
+    assert commands(db) == [(5, "stop", {})]
+    assert at(db, "INSERT INTO commands") < at(db, "-- COMMIT") < at(db, "FROM tickers t") < at(db, "-- ROLLBACK")
+    assert db.commits == 1 and db.rollbacks == 1 and not db.aborted
+    assert ws.sent == [(5, {"type": "new_command", "count": 1}, 1)]       # будильник всё равно, после commit
 
 
 def test_resume_shows_the_newest_live_ticker_again(screens_clock, monkeypatch):
@@ -665,8 +696,8 @@ def test_resume_shows_the_newest_live_ticker_again(screens_clock, monkeypatch):
     assert call(screens_router.command_resume_screen, 5, admin=ADMIN, db=db) == {"status": "ok", "ws_sent": True}
     assert commands(db) == [(5, "resume", {}),
                             (5, "ticker_show", {"message": "Новая", "color": "#ffd34d", "speed": "medium", "duration": 600})]
-    assert db.commits == 1
-    assert ws.sent == [(5, {"type": "new_command", "count": 1}, 1)]
+    assert db.commits == 2                                                 # «Показ», потом ticker_show
+    assert ws.sent == [(5, {"type": "new_command", "count": 1}, 2)]
 
 
 def test_resume_without_live_tickers_queues_only_resume(screens_clock, monkeypatch):
@@ -678,6 +709,29 @@ def test_resume_without_live_tickers_queues_only_resume(screens_clock, monkeypat
     call(screens_router.command_resume_screen, 5, admin=ADMIN, db=db)
     assert commands(db) == [(5, "resume", {})]
     assert db.commits == 1
+
+
+def test_resume_survives_a_failing_ticker_part(screens_clock, monkeypatch):
+    # на установке новый API стартует раньше миграции 034: чтение строк падает. Команда «Показ» уже
+    # закоммичена и не теряется, а ответ — ok
+    db = TxDB([], fail_on="FROM tickers")
+    ws = FakeWS(connected=[5], db=db)
+    monkeypatch.setattr(screens_router, "ws_manager", ws)
+    assert call(screens_router.command_resume_screen, 5, admin=ADMIN, db=db) == {"status": "ok", "ws_sent": True}
+    assert commands(db) == [(5, "resume", {})]
+    assert at(db, "INSERT INTO commands") < at(db, "-- COMMIT") < at(db, "FROM tickers t") < at(db, "-- ROLLBACK")
+    assert db.commits == 1 and db.rollbacks == 1 and not db.aborted
+    assert ws.sent == [(5, {"type": "new_command", "count": 1}, 1)]
+
+
+def test_poll_takes_commands_in_a_stable_order():
+    # команды одной транзакции (stop + ticker_hide, resume + ticker_show) имеют один created_at:
+    # без id порядок при равенстве не определён
+    db = RoutedDB([("FROM commands", [Row(id=7, type="stop", payload={})])])
+    out = screens_router.poll_commands(5, db=db, _screen=None)
+    assert out == {"command": {"id": 7, "type": "stop", "payload": {}}}
+    (sql,) = db.sqls("FROM commands")
+    assert "ORDER BY created_at, id LIMIT 1" in sql
 
 
 def heartbeat(db, body, screen_id=3):
