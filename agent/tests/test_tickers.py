@@ -47,6 +47,7 @@ def player(tmp_path):
     p.sent = []
     p.send_ok = True
     p.clock = [NOW]
+    p.mono = [100.0]                # монотонные часы агента (давность последнего кадра)
 
     def fake_send(command):
         if p.send_ok:
@@ -55,10 +56,12 @@ def player(tmp_path):
 
     p._tk_send = fake_send
     p._ticker_clock = lambda: p.clock[0]
+    p._ticker_mono = lambda: p.mono[0]
     return p
 
 
 def step(p, mono):
+    p.mono[0] = mono                # шаг идёт в момент mono: «сейчас» агента совпадает с его временем
     return p._ticker_step(mono, p.clock[0])
 
 
@@ -156,6 +159,7 @@ def test_ticker_state_screen_off_reports_flag(player):
 def test_ticker_state_running_reports_live_ids(player):
     player.set_tickers([tk(1, until="2026-11-02T14:10:00"), tk(2), tk(3, until="2026-11-02T13:00:00")])
     player.set_tickers_paused(False, False, False)
+    step(player, 100.0)                                        # кадр дошёл до mpv
     assert player.ticker_state() == {"ids": [1, 2], "stopped": False, "screen_off": False}
     player.clock[0] = datetime(2026, 11, 2, 14, 10, 0)         # срок первой вышел по часам агента
     assert player.ticker_state()["ids"] == [2]
@@ -169,7 +173,89 @@ def test_resume_after_pause_reports_ids_again(player):
     player.set_tickers([tk(1)])
     player.set_tickers_paused(True, True, False)
     player.set_tickers_paused(False, False, False)
+    step(player, 100.0)
     assert player.ticker_state()["ids"] == [1]
+
+
+# --- «бежит» — только если кадр дошёл до mpv (спека §4.6, антицель №1) -------------------
+
+def running(p, mono=100.0):
+    """Очередь работает: строки заданы, пауза снята, один шаг выполнен в момент mono."""
+    p.set_tickers_paused(False, False, False)
+    step(p, mono)
+
+
+def test_ticker_state_before_any_frame_reports_no_ids(player):
+    player.set_tickers([tk(7)])
+    player.set_tickers_paused(False, False, False)
+    assert player.ticker_state()["ids"] == []                  # очередь знает про строку, но ни один кадр не нарисован
+
+
+def test_ticker_state_with_failing_mpv_reports_no_ids(player):
+    """Каждая отправка кадра неудачна (mpv лежит): строка «живая по часам», но на экране её нет."""
+    player.send_ok = False
+    player.set_tickers([tk(7)])
+    for i in range(10):
+        running(player, 100.0 + i * 0.4)
+    assert player.sent == []
+    assert player.ticker_state() == {"ids": [], "stopped": False, "screen_off": False}
+
+
+def test_ticker_state_reports_ids_after_successful_frames(player):
+    player.set_tickers([tk(7), tk(8)])
+    running(player, 100.0)
+    step(player, 100.03)
+    player.mono[0] = 100.5
+    assert player.ticker_state()["ids"] == [7, 8]
+
+
+def test_ticker_state_goes_stale_two_seconds_after_the_last_frame(player):
+    player.set_tickers([tk(7)])
+    running(player, 100.0)
+    player.mono[0] = 102.0                                     # ровно 2 с — ещё в окне
+    assert player.ticker_state()["ids"] == [7]
+    player.mono[0] = 102.01                                    # старше 2 с — кадров нет (поток очереди умер или завис)
+    assert player.ticker_state()["ids"] == []
+
+
+def test_failed_frames_do_not_refresh_the_last_drawn_moment(player):
+    player.set_tickers([tk(7)])
+    running(player, 100.0)
+    player.send_ok = False
+    for t in (100.4, 100.8, 101.2, 101.6, 102.0, 102.4):
+        step(player, t)                                        # mpv перезапускается: попытки неудачны
+    assert player.ticker_state()["ids"] == []                  # давность считается от последнего УДАЧНОГО кадра
+
+
+def test_ticker_state_recovers_with_the_next_successful_frame(player):
+    player.set_tickers([tk(7)])
+    running(player, 100.0)
+    player.send_ok = False
+    step(player, 103.0)
+    assert player.ticker_state()["ids"] == []
+    player.send_ok = True
+    step(player, 103.4)
+    assert player.ticker_state()["ids"] == [7]
+
+
+def test_ticker_state_stale_keeps_the_flags(player):
+    player.set_tickers([tk(7)])
+    running(player, 100.0)
+    player.set_tickers_paused(False, False, False)
+    player.mono[0] = 110.0
+    assert player.ticker_state() == {"ids": [], "stopped": False, "screen_off": False}
+    player.set_tickers_paused(True, True, False)
+    assert player.ticker_state() == {"ids": [], "stopped": True, "screen_off": False}
+    player.set_tickers_paused(True, False, True)
+    assert player.ticker_state() == {"ids": [], "stopped": False, "screen_off": True}
+
+
+def test_ticker_state_without_live_tickers_after_frames_is_empty(player):
+    player.set_tickers([tk(7)])
+    running(player, 100.0)
+    player.set_tickers([])
+    step(player, 100.03)
+    assert player.ticker_state()["ids"] == []
 
 
 # --- лента: ключ tickers и режим «из ленты» (правило R6) ----------------------------
@@ -178,11 +264,13 @@ def test_feed_key_replaces_list_and_enters_feed_mode(player):
     assert player.tickers_from_feed is False
     assert player.apply_feed_tickers({"files": [], "tickers": [tk(1), tk(2)]}) is True
     assert player.tickers_from_feed is True
+    step(player, 100.0)
     assert player.ticker_state()["ids"] == [1, 2]
 
 
 def test_feed_without_key_keeps_list(player):
     player.apply_feed_tickers({"tickers": [tk(1)]})
+    step(player, 100.0)
     assert player.apply_feed_tickers({"files": []}) is False
     assert player.ticker_state()["ids"] == [1]
 
@@ -207,6 +295,7 @@ def test_feed_without_key_never_enters_feed_mode(player):
 @pytest.mark.parametrize("bad", [None, "x", 5, {"id": 1}])
 def test_feed_key_not_a_list_is_ignored(player, bad):
     player.apply_feed_tickers({"tickers": [tk(1)]})
+    step(player, 100.0)
     assert player.apply_feed_tickers({"tickers": bad}) is False
     assert player.ticker_state()["ids"] == [1]
     fresh = VLCPlayer(media_dir=str(player.media_dir))
@@ -496,6 +585,49 @@ def test_sync_ticker_hide_legacy_without_feed():
     assert pl.calls == [("clear_marquee",)]
     assert h.refresh_requested is False
     assert h.acked == [8]
+
+
+# --- просьба «перечитай ленту»: флаг живёт до удачной загрузки -----------------------------
+
+def test_feed_refresh_not_due_without_request():
+    h = make_sync(FakePlayer(True))
+    assert h.feed_refresh_due(100.0) is False
+
+
+def test_feed_refresh_first_attempt_is_immediate_and_flag_survives_a_failure():
+    h = make_sync(FakePlayer(True))
+    h.refresh_requested = True
+    assert h.feed_refresh_due(100.0) is True            # первая попытка — сразу
+    # загрузка не удалась: feed_loaded не зовут, просьба остаётся
+    assert h.refresh_requested is True
+
+
+def test_feed_refresh_retries_at_most_every_five_seconds():
+    h = make_sync(FakePlayer(True))
+    h.refresh_requested = True
+    assert h.feed_refresh_due(100.0) is True
+    assert h.feed_refresh_due(101.0) is False
+    assert h.feed_refresh_due(104.9) is False
+    assert h.feed_refresh_due(105.0) is True            # ровно 5 с — пора снова
+    assert h.feed_refresh_due(106.0) is False
+    assert h.refresh_requested is True
+
+
+def test_feed_loaded_clears_the_request_and_the_throttle():
+    h = make_sync(FakePlayer(True))
+    h.refresh_requested = True
+    h.feed_refresh_due(100.0)
+    h.feed_loaded()
+    assert h.refresh_requested is False
+    h.refresh_requested = True                          # следующая команда строки сразу после удачной загрузки
+    assert h.feed_refresh_due(101.0) is True            # не ждёт 5 с
+
+
+def test_feed_refresh_survives_a_backwards_clock_jump():
+    h = make_sync(FakePlayer(True))
+    h.refresh_requested = True
+    h.feed_refresh_due(1000.0)
+    assert h.feed_refresh_due(10.0) is True             # chrony отмотал часы назад — не ждём «вечно»
 
 
 # --- heartbeat -----------------------------------------------------------------------------

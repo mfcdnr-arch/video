@@ -14,6 +14,9 @@ _PROCESS_ENDING = ("restart_agent", "reboot", "update_agent")
 # Сколько команд разбирается за один проход главного цикла.
 DRAIN_MAX = 10
 
+# Пока просьба «перечитай ленту» (ticker_show / ticker_hide) не выполнена, пробуем не чаще раза в столько секунд.
+FEED_RETRY = 5
+
 
 def need_poll(ws_triggered, ws_connected, since_last_poll, cmd_poll, backlog):
     """Пора ли спрашивать у сервера команды в этом проходе главного цикла.
@@ -82,6 +85,27 @@ class SyncHandler:
         # Команда ticker_show / ticker_hide в режиме «строки из ленты» только
         # поднимает флаг; главный цикл сразу перечитывает ленту и сбрасывает его.
         self.refresh_requested = False
+
+    # Просьба «перечитай ленту» живёт, пока лента не прочитана: флаг снимает feed_loaded() после УДАЧНОЙ
+    # загрузки, а не главный цикл перед попыткой — иначе один неудачный GET откладывал срочную правку
+    # до очередного опроса через минуту. Пока флаг поднят, пробуем не чаще FEED_RETRY секунд.
+    _refresh_tried_at = 0.0
+
+    def feed_refresh_due(self, now):
+        """Пора ли читать ленту по просьбе бегущей строки: флаг поднят и с прошлой попытки прошло не меньше
+        FEED_RETRY секунд (первая попытка — сразу). `now` — time.time() главного цикла; часы отмотали
+        назад (синхронизация времени) — не ждём «вечно», пробуем сразу. Одна попытка за проход цикла."""
+        if not self.refresh_requested:
+            return False
+        if now < self._refresh_tried_at or now - self._refresh_tried_at >= FEED_RETRY:
+            self._refresh_tried_at = now
+            return True
+        return False
+
+    def feed_loaded(self):
+        """Лента прочитана: просьба выполнена, ограничение частоты снято (следующая команда строки не ждёт)."""
+        self.refresh_requested = False
+        self._refresh_tried_at = 0.0
 
     def _url(self, path):
         return self.server + path

@@ -68,6 +68,7 @@ _MSK = timezone(timedelta(hours=3))     # у Москвы нет сезонно�
 TICKER_FRAME = 0.03     # пауза между кадрами прокрутки (~33 кадра/с)
 TICKER_IDLE = 0.25      # очередь пуста или пауза: состояние проверяем 4 раза в секунду
 TICKER_RETRY = 0.4      # mpv не отвечает (перезапуск): пауза перед новой попыткой
+TICKER_DRAWN_WINDOW = 2.0   # «бежит» в отчёте, только если кадр дошёл до mpv не позже, чем эти секунды назад
 
 
 def _msk_now() -> datetime:
@@ -217,6 +218,8 @@ class VLCPlayer:
         self._tk_stopped = False
         self._tk_screen_off = False
         self._ticker_clock = _msk_now   # часы агента (наивное МСК); в тестах подменяются
+        self._ticker_mono = time.monotonic   # монотонные часы: давность последнего кадра; в тестах подменяются
+        self._tk_drawn_at = None        # monotonic последней УДАЧНОЙ отправки кадра в mpv (None — ещё не было)
         self._tk_thread = None
         self._tk_sock = None            # постоянное соединение с mpv для кадров
         self._tk_cur = None             # проход, который идёт сейчас (только поток очереди)
@@ -724,11 +727,19 @@ class VLCPlayer:
     def ticker_state(self) -> dict:
         """Отчёт для heartbeat: какие строки у экрана бегут сейчас (id живых по
         часам агента), остановлен ли показ, погашен ли монитор. На паузе
-        бежать нечему: ids пуст, причина — в флагах."""
+        бежать нечему: ids пуст, причина — в флагах.
+
+        «Бежит» — это «нарисовано», а не «живая по часам»: если последний
+        удачный кадр ушёл в mpv раньше TICKER_DRAWN_WINDOW секунд назад (mpv
+        лежит или перезапускается, поток очереди умер или завис) либо кадров ещё
+        не было, ids пуст — панель покажет «не подтвердил», а не ложное «бежит».
+        """
         with self._tk_lock:
             items = self._tk_items
             paused, stopped, screen_off = self._tk_paused, self._tk_stopped, self._tk_screen_off
-        ids = [] if paused else [t["id"] for t in live_tickers(items, self._ticker_clock())]
+            drawn_at = self._tk_drawn_at
+        drawing = drawn_at is not None and self._ticker_mono() - drawn_at <= TICKER_DRAWN_WINDOW
+        ids = [] if paused or not drawing else [t["id"] for t in live_tickers(items, self._ticker_clock())]
         return {"ids": ids, "stopped": stopped, "screen_off": screen_off}
 
     def start_ticker_queue(self) -> None:
@@ -744,7 +755,7 @@ class VLCPlayer:
     def _ticker_loop(self):
         while True:
             try:
-                delay = self._ticker_step(time.monotonic(), self._ticker_clock())
+                delay = self._ticker_step(self._ticker_mono(), self._ticker_clock())
             except Exception:
                 log.exception("Очередь бегущих строк: сбой шага")
                 delay = 1.0
@@ -823,4 +834,6 @@ class VLCPlayer:
         if not self._tk_send(self._marquee_overlay_cmd(x, cur["ass_color"], cur["text"])):
             return TICKER_RETRY
         self._tk_shown = True
+        with self._tk_lock:
+            self._tk_drawn_at = mono                          # кадр дошёл до mpv: на это опирается отчёт «бежит»
         return TICKER_FRAME

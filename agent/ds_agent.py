@@ -365,13 +365,16 @@ def main():
         # опрашиваем, не дожидаясь POLL_INTERVAL: многочасовой показ получит
         # новый час без провала в шаблон (см. ds_player.repoll_after_expiry).
         # Команда ticker_show / ticker_hide (агент в режиме «строки из ленты»)
-        # поднимает sync_hdl.refresh_requested — тогда ленту читаем сразу.
-        refresh_feed = sync_hdl.refresh_requested
-        sync_hdl.refresh_requested = False
+        # поднимает sync_hdl.refresh_requested — тогда ленту читаем сразу. Флаг
+        # снимается только после удачной загрузки (feed_loaded); пока он поднят,
+        # пробуем не чаще раза в 5 с и не больше одной попытки за проход цикла
+        # (GET ленты ждёт до 15 с, а у systemd WatchdogSec=30).
+        refresh_feed = sync_hdl.feed_refresh_due(now)
         if refresh_feed or now - last_schedule_poll >= POLL_INTERVAL or (
                 schedule and repoll_after_expiry(schedule, datetime.now(MSK), now - last_schedule_poll)):
             new_schedule = load_schedule_online(screen_id, sess)
             if new_schedule:
+                sync_hdl.feed_loaded()
                 schedule = new_schedule
                 # строки — до скачивания файлов: оно может быть долгим
                 player.apply_feed_tickers(schedule)
@@ -385,6 +388,10 @@ def main():
                     player.apply_feed_tickers(schedule)
                     log.warning("Используем кешированное расписание")
             last_schedule_poll = now
+            if refresh_feed and sync_hdl.refresh_requested:
+                # попытка не удалась и могла занять до 15 с: цикл жив, просто ждал сеть
+                _sd_notify("WATCHDOG=1")
+                last_watchdog = time.time()
 
         # ── Watchdog плеера (mpv) ──
         player.watchdog(current_playing)
