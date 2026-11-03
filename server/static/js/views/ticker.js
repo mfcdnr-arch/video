@@ -33,6 +33,10 @@
   const TZ = 'Europe/Moscow';
   const STALE_TEXT = 'Время изменилось — проверьте час окончания';   // тот же текст отдаёт сервер (400 по on_date)
   const SAMPLE = 'Внимание: пример бегущей строки';
+  // Точные тексты 404 сервера (ticker_store._NOT_FOUND / _TEMPLATE_NOT_FOUND). Сравнение именно точное: 400 «Группа не найдена —
+  // обновите страницу» тоже содержит «не найдена», но это не «строку сняли».
+  const TICKER_GONE = 'Бегущая строка не найдена';
+  const TEMPLATE_GONE = 'Шаблон не найден';
   const COLORS = [['#ffd34d', 'Жёлтый'], ['#ffffff', 'Белый'], ['#ff6b5e', 'Красный'], ['#7fe3c4', 'Бирюзовый']];
   const SPEEDS = [['slow', 'Медленно', 80], ['medium', 'Средне', 140], ['fast', 'Быстро', 220]];   // px/с на кадре 1280 (как в агенте)
   const FRAME_W = 1280, FONT_PX = 42, BOTTOM_PX = 12;      // кадр, шрифт и отступ снизу в агенте (_marquee_overlay_cmd)
@@ -214,10 +218,12 @@
       }
     }
     const y = window.scrollY;
+    const picks = Array.from(box.querySelectorAll('.tk-pick')).map(el => el.scrollTop);   // свой скролл у списков групп / экранов
     st.html[id] = html;
     st.box[id] = box;
     box.innerHTML = html;
     if(window.scrollY !== y) window.scrollTo(0, y);
+    box.querySelectorAll('.tk-pick').forEach((el, i) => { if(picks[i]) el.scrollTop = picks[i]; });   // «не в сети N мин» меняется раз в минуту — список не прыгает наверх
     if(sel){
       const el = box.querySelector(sel);
       if(el && !el.disabled) el.focus({preventScroll: true});
@@ -253,7 +259,8 @@
 
   function reasonLine(p, d){
     if(p.reason !== 'offline') return p.text;
-    const sc = d.screens.find(s => s.name === p.screen && !s.online);
+    // экран — по id (имена могут повторяться); у ответа без screen_id — по имени, как раньше
+    const sc = d.screens.find(s => (p.screen_id != null ? s.id === p.screen_id : s.name === p.screen) && !s.online);
     return (sc ? fmtOfflineFor(sc.offline_for_seconds) : p.text) + ' — получит при подключении';
   }
 
@@ -640,9 +647,9 @@
       if(String(e && e.message) === 'unauthorized') return;
       if(!alive(st)) return;
       const msg = errText(e);
-      if(id != null && /не найдена/i.test(msg)){      // строку сняли, пока правили
+      if(id != null && msg === TICKER_GONE){          // строку сняли, пока правили
         setBusy(st, false);
-        toast('Бегущая строка не найдена');
+        toast(TICKER_GONE);
         leaveEdit(st, true);
         refresh(st);
         return;
@@ -728,7 +735,7 @@
       if(String(e && e.message) === 'unauthorized') return;
       if(!alive(st)) return;
       const msg = errText(e);
-      if(/не найден/i.test(msg)){ st.tplId = null; toast('Шаблон не найден — список обновлён'); }   // его удалили в другом месте
+      if(msg === TEMPLATE_GONE){ st.tplId = null; toast(TEMPLATE_GONE + ' — список обновлён'); }   // его удалили в другом месте
       else st.err = msg;
     }
     st.busy = false;
@@ -831,9 +838,11 @@
       }
     });
 
+    // Ввод не зависит от «занято»: act() / «Обновить шаблон» ставят busy без inert, поле остаётся живым, и пропущенные
+    // нажатия оставили бы st.form короче видимого текста. Во время отправки форма inert — события не приходят.
     document.addEventListener('input', e => {
       const st = S, t = e.target;
-      if(!st || !alive(st) || !t || st.busy) return;
+      if(!st || !alive(st) || !t) return;
       if(t.id === 'tk-msg'){
         st.form.message = t.value;
         touch(st);
@@ -848,7 +857,7 @@
 
     document.addEventListener('change', e => {
       const st = S, t = e.target;
-      if(!st || !alive(st) || !t || t.id !== 'tk-hour' || st.busy) return;
+      if(!st || !alive(st) || !t || t.id !== 'tk-hour') return;
       st.form.hour = t.value ? Number(t.value) : null;
       if(st.form.hour != null) st.form.hourMissing = false;
       touch(st);

@@ -1376,6 +1376,33 @@ async function restoreBroadcast(page, fx) {
         ? ok('выбран только свой экран, срок «на 30 минут», кнопка «▶ Запустить на 1 экране»')
         : bad(`перед запуском: экран ${ready.on}, кнопка «${ready.start}», неактивна=${ready.off}, минут «${ready.mins}»`);
 
+      // ── список экранов в «Где» не прыгает наверх при перерисовке (put() хранит scrollTop у .tk-pick) ──
+      step = 'бегущая строка: прокрутка списка экранов';
+      const keep = await page.evaluate(() => {
+        const clip = document.createElement('style');            // искусственно сужаем список: на стенде экранов мало
+        clip.id = 'e2e-pick-clip';
+        clip.textContent = '.tk-pick{max-height:8px!important;overflow:auto!important}';
+        document.head.appendChild(clip);
+        try {
+          const box = document.querySelector('.tk-pick');
+          if (!box) return { err: 'списка экранов нет' };
+          box.scrollTop = 1e6;
+          const before = box.scrollTop;
+          const opts = box.querySelectorAll('[data-action="ticker-toggle-screen"]');
+          if (!opts.length) return { err: 'в списке нет экранов' };
+          const last = opts[opts.length - 1];
+          last.click();                                          // меняет выбор → блок «Где» перерисован
+          const mid = document.querySelector('.tk-pick').scrollTop;
+          document.querySelector('.tk-pick').querySelectorAll('[data-action="ticker-toggle-screen"]')[opts.length - 1].click();   // вернуть выбор
+          return { before, mid, after: document.querySelector('.tk-pick').scrollTop };
+        } finally { clip.remove(); }
+      });
+      (!keep.err && keep.before > 0 && keep.mid === keep.before && keep.after === keep.before)
+        ? ok(`список экранов при перерисовке остаётся прокрученным (scrollTop ${keep.before})`)
+        : bad(`прокрутка списка экранов сбросилась или не проверена: ${JSON.stringify(keep)}`);
+      const stillSel = await page.$eval(scrSel, el => el.getAttribute('aria-pressed'));
+      stillSel === 'true' ? ok('выбор экранов после проверки прокрутки прежний') : bad('проверка прокрутки сбила выбор экранов');
+
       step = 'бегущая строка: запуск';
       await page.click('#tk-start');
       const started = await tkWaitCard(c => !!c);
@@ -1393,6 +1420,8 @@ async function restoreBroadcast(page, fx) {
         ? ok(`карточка: «${c1.meta}»`) : bad(`карточка не та: «${c1.text}» / «${c1.meta}»`);
       (/бежит на 0 из 1/.test(c1.conf) && /ждём подтверждения/.test(c1.conf))
         ? ok('сразу после запуска: «бежит на 0 из 1 — ждём подтверждения»') : bad(`подтверждение сразу после запуска: «${c1.conf}»`);
+      (tk.confirm && tk.confirm.problems.length === 1 && tk.confirm.problems[0].screen_id === fx.screenId)
+        ? ok('в обзоре у «ждём подтверждения» есть id экрана (screen_id)') : bad(`в problems нет screen_id тестового экрана: ${JSON.stringify(tk.confirm)}`);
       const cleared = await formState();
       (cleared.msg === '' && cleared.target === 'all' && cleared.term === 'cancel')
         ? ok('конструктор очистился после запуска') : bad(`конструктор не очистился: ${JSON.stringify(cleared)}`);
