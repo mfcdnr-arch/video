@@ -83,7 +83,7 @@ log = logging.getLogger("ds_agent")
 sys.path.insert(0, str(Path(__file__).parent))
 from ds_downloader import Downloader
 from ds_player    import VLCPlayer, build_playable, active_expired, repoll_after_expiry, is_new_play
-from ds_sync      import SyncHandler, drain_commands
+from ds_sync      import SyncHandler, command_pass
 from ds_heartbeat import Heartbeat, AGENT_VERSION
 from ds_cleanup   import Cleanup
 from ds_ws_client import WSClient
@@ -327,6 +327,7 @@ def main():
     last_schedule_poll = 0
     last_heartbeat     = 0
     last_cmd_poll      = 0
+    cmd_backlog        = False   # прошлый разбор команд упёрся в лимит — в очереди может быть ещё
     last_cleanup       = 0
     last_watchdog      = 0    # systemd watchdog: как давно слали WATCHDOG=1
     last_awake         = 0    # как давно отключали гашение экрана (xset)
@@ -394,11 +395,13 @@ def main():
         ws_triggered = _ws_triggered.is_set()
         if ws_triggered:
             _ws_triggered.clear()
-        if ws_triggered or (not ws_client.is_connected and now - last_cmd_poll >= CMD_POLL):
-            # Сервер отдаёт по одной команде за запрос, а «Стоп» / «Показ»
-            # приходят вместе с ticker_hide / ticker_show — разбираем пачку
-            # (не больше 10 за проход), см. ds_sync.drain_commands.
-            drain_commands(sync_hdl)
+        # Сервер отдаёт по одной команде за запрос, а «Стоп» / «Показ» приходят
+        # вместе с ticker_hide / ticker_show — разбираем пачку (не больше 10 за
+        # проход); если упёрлись в лимит, следующий проход опросит снова, не
+        # дожидаясь WS-сигнала (см. ds_sync.command_pass).
+        polled, cmd_backlog = command_pass(sync_hdl, ws_triggered, ws_client.is_connected,
+                                           now - last_cmd_poll, CMD_POLL, cmd_backlog)
+        if polled:
             last_cmd_poll = now
 
         # ── Питание экрана (окно работы, МСК) ──

@@ -26,7 +26,8 @@ except ImportError:
 
 import ds_heartbeat                                          # noqa: E402
 from ds_player import VLCPlayer, live_tickers, next_ticker_index   # noqa: E402
-from ds_sync import SyncHandler, drain_commands              # noqa: E402
+from ds_sync import (DRAIN_MAX, SyncHandler, command_pass, drain_commands,   # noqa: E402
+                     need_poll)
 
 NOW = datetime(2026, 11, 2, 14, 0, 0)          # наивное МСК
 
@@ -552,8 +553,10 @@ class FakeQueue:
         self.cmds = list(cmds)
         self.handled = []
         self.ack = ack
+        self.polls = 0
 
     def poll_command(self):
+        self.polls += 1
         return {"command": self.cmds[0] if self.cmds else None}
 
     def handle(self, cmd):
@@ -606,3 +609,69 @@ def test_drain_survives_failed_poll():
             return None
 
     assert drain_commands(Broken()) == 0
+
+
+# --- остаток пачки не теряется при подключённом WS (правка к R7) ---------------------------------
+# События WS сливаются в один флаг, а долгая загрузка файлов может задержать цикл на минуты: за это
+# время накопится больше 10 команд. Остальные должны разобраться в следующих проходах сами, а не
+# ждать нового push (он может и не прийти, а в хвосте обычно финальный «Показ»).
+
+@pytest.mark.parametrize("ws_triggered, ws_connected, since, backlog, expected", [
+    (True, True, 0.0, False, True),        # пришёл push
+    (False, True, 100.0, False, False),    # WS подключён, push нет — не опрашиваем
+    (False, False, 4.9, False, False),     # WS нет, интервал не вышел
+    (False, False, 5.0, False, True),      # WS нет, интервал вышел
+    (False, True, 0.1, True, True),        # прошлый проход упёрся в лимит — ещё раз
+    (False, False, 0.1, True, True),
+])
+def test_need_poll(ws_triggered, ws_connected, since, backlog, expected):
+    assert need_poll(ws_triggered, ws_connected, since, 5, backlog) is expected
+
+
+def test_command_pass_ws_connected_without_push_does_not_poll():
+    q = FakeQueue([cmd(1)])
+    assert command_pass(q, False, True, 60.0, 5, False) == (False, False)
+    assert q.polls == 0 and q.handled == []
+
+
+def test_command_pass_leftover_is_polled_without_new_push():
+    """25 команд накопились, push был один: три прохода выбирают всё, четвёртый молчит."""
+    q = FakeQueue([cmd(i) for i in range(1, 26)])
+    polled, backlog = command_pass(q, True, True, 0.0, 5, False)       # единственный push
+    assert (polled, backlog) == (True, True) and len(q.handled) == DRAIN_MAX
+    polled, backlog = command_pass(q, False, True, 1.0, 5, backlog)    # push нет, остаток есть
+    assert (polled, backlog) == (True, True) and len(q.handled) == 2 * DRAIN_MAX
+    polled, backlog = command_pass(q, False, True, 2.0, 5, backlog)
+    assert (polled, backlog) == (True, False) and q.handled == list(range(1, 26))
+    polls = q.polls
+    assert command_pass(q, False, True, 3.0, 5, backlog) == (False, False)
+    assert q.polls == polls                                            # дальше WS-режим снова тих
+
+
+def test_command_pass_exactly_cap_polls_once_more_then_stops():
+    q = FakeQueue([cmd(i) for i in range(1, DRAIN_MAX + 1)])
+    _, backlog = command_pass(q, True, True, 0.0, 5, False)
+    assert backlog is True                                             # ровно лимит — остаток возможен
+    polled, backlog = command_pass(q, False, True, 1.0, 5, backlog)
+    assert (polled, backlog) == (True, False) and len(q.handled) == DRAIN_MAX
+
+
+def test_command_pass_unacked_command_does_not_loop_forever():
+    q = FakeQueue([cmd(7, "play")], ack=False)                         # сервер отдаёт её снова и снова
+    _, backlog = command_pass(q, True, True, 0.0, 5, False)
+    assert backlog is False
+    assert command_pass(q, False, True, 1.0, 5, backlog) == (False, False)
+    assert q.handled == [7]
+
+
+@pytest.mark.parametrize("ctype", ["restart_agent", "reboot", "update_agent"])
+def test_command_pass_process_ending_command_leaves_no_backlog(ctype):
+    q = FakeQueue([cmd(1, ctype)] + [cmd(i) for i in range(2, 20)])
+    _, backlog = command_pass(q, True, True, 0.0, 5, False)
+    assert backlog is False and q.handled == [1]
+
+
+def test_command_pass_polling_mode_updates_interval_flag():
+    q = FakeQueue([])
+    assert command_pass(q, False, False, 5.0, 5, False) == (True, False)
+    assert q.polls == 1
