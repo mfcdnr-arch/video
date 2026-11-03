@@ -3,7 +3,7 @@ ds_player.py — управление mpv через IPC Unix-сокет (JSON �
 """
 from __future__ import annotations
 import socket, json, time, threading, subprocess, logging, os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -57,6 +57,85 @@ def build_playable(files: list[str], broken: set[str],
     круги заглушек), выкидываются только нерабочие и отсутствующие локально файлы.
     Логирование отсутствующих делает вызывающий код."""
     return [f for f in files if f not in broken and exists(f)]
+
+
+# ── Очередь бегущих строк (агент 1.4.0) ──────────────────────────────────────
+# Сервер отдаёт в ленте экрана `tickers` (по порядку запуска); агент сам знает
+# срок каждой (`until_at`, наивное МСК) и крутит живые по очереди.
+
+_MSK = timezone(timedelta(hours=3))     # у Москвы нет сезонного перевода часов
+
+TICKER_FRAME = 0.03     # пауза между кадрами прокрутки (~33 кадра/с)
+TICKER_IDLE = 0.25      # очередь пуста или пауза: состояние проверяем 4 раза в секунду
+TICKER_RETRY = 0.4      # mpv не отвечает (перезапуск): пауза перед новой попыткой
+
+
+def _msk_now() -> datetime:
+    """Часы агента для сроков строк: наивное МСК."""
+    return datetime.now(_MSK).replace(tzinfo=None)
+
+
+def _ticker_text(message) -> str:
+    """Текст строки одной линией; пустая строка — показывать нечего."""
+    if not isinstance(message, str):
+        return ""
+    return message.replace("\r", " ").replace("\n", " ").strip()
+
+
+def live_tickers(items, now: datetime) -> list:
+    """Живые строки из ленты: `until_at` (наивное МСК) ещё не наступил по часам
+    агента `now` (aware-время тоже годится: tzinfo отбрасывается, как в
+    active_expired). Порядок сохраняется. Битые элементы — не словарь, id не
+    целое, пустой текст, неразборный или нестроковый `until_at` — молча
+    пропускаются: лента приходит по сети, цикл из-за мусора падать не должен.
+    """
+    if not isinstance(items, (list, tuple)):
+        return []
+    now = now.replace(tzinfo=None)
+    live = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        tid = item.get("id")
+        if not isinstance(tid, int) or isinstance(tid, bool):
+            continue
+        if not _ticker_text(item.get("message")):
+            continue
+        raw = item.get("until_at")
+        if raw is not None:
+            if not isinstance(raw, str):
+                continue
+            try:
+                until = datetime.fromisoformat(raw).replace(tzinfo=None)
+            except ValueError:
+                continue
+            if now >= until:
+                continue
+        live.append(item)
+    return live
+
+
+def next_ticker_index(live: list, last_id, last_pos: int):
+    """Номер строки в `live`, чей проход следующий; None — очередь пуста.
+
+    Идём по кругу после только что прошедшей строки `last_id` (стояла на месте
+    `last_pos`). Не было ни одной (`last_id` None) — первая. Прошедшую строку
+    сняли или у неё вышел срок — следом идёт та, что встала на её место: снятие
+    не сбрасывает круг к началу и не пропускает преемницу.
+    """
+    if not live:
+        return None
+    if last_id is None:
+        return 0
+    for i, item in enumerate(live):
+        if item.get("id") == last_id:
+            return (i + 1) % len(live)
+    return last_pos % len(live)
+
+
+def _ticker_look(item) -> tuple:
+    """Всё, что меняет вид строки на экране: правка любого поля = новый проход."""
+    return (_ticker_text(item.get("message")), str(item.get("color")), str(item.get("speed")))
 
 
 # Отмотка time-pos назад больше чем на столько секунд — новый круг
@@ -127,6 +206,22 @@ class VLCPlayer:
         # Пока True — главный цикл не возобновляет показ по расписанию. Снимается
         # явной командой play/sync_play или перезапуском агента (кнопка «Показ»).
         self.user_stopped = False
+        # Очередь бегущих строк из ленты (агент 1.4.0). tickers_from_feed
+        # включается, когда лента впервые принесла ключ `tickers`, и больше не
+        # сбрасывается: с этого момента ticker_show / ticker_hide означают
+        # «обнови ленту», а не «покажи / убери этот текст».
+        self.tickers_from_feed = False
+        self._tk_lock = threading.Lock()
+        self._tk_items = []             # последний список из ленты (как пришёл)
+        self._tk_paused = False         # «Стоп» или монитор погашен: строку не рисуем
+        self._tk_stopped = False
+        self._tk_screen_off = False
+        self._ticker_clock = _msk_now   # часы агента (наивное МСК); в тестах подменяются
+        self._tk_thread = None
+        self._tk_sock = None            # постоянное соединение с mpv для кадров
+        self._tk_cur = None             # проход, который идёт сейчас (только поток очереди)
+        self._tk_last = (None, 0)       # (id, место) последней прошедшей строки
+        self._tk_shown = False          # нарисован ли оверлей строки
 
     def _mpv_cmd(self, command: list):
         """Отправить JSON команду mpv через IPC-сокет."""
@@ -461,15 +556,31 @@ class VLCPlayer:
         sock.settimeout(2)
         sock.sendall((json.dumps({"command": command}) + "\n").encode())
 
+    MARQUEE_FONT_SIZE = 42
+
+    @classmethod
+    def _marquee_span(cls, safe):
+        """Полный путь одного прохода (пиксели): от правого края кадра до
+        полного ухода строки за левый. `safe` — уже обезвреженный текст."""
+        text_w = int(len(safe) * cls.MARQUEE_FONT_SIZE * 0.6) + 80    # грубая ширина строки
+        return cls.MARQUEE_RES_X + text_w
+
+    def _marquee_overlay_cmd(self, x, ass_color, safe):
+        """Команда mpv: кадр строки в позиции x. Один вид для старой строки
+        (set_marquee) и очереди из ленты: ASS-оверлей у нижнего края (an1 =
+        низ-лево), шрифт 42 на 1280×720, чёрная обводка."""
+        y = self.MARQUEE_RES_Y - 12
+        tags = ("{\\an1\\pos(%.1f,%d)\\fs%d\\c%s\\bord2\\3c&H000000&\\shad1}"
+                % (x, y, self.MARQUEE_FONT_SIZE, ass_color))
+        return ["osd-overlay", self.MARQUEE_OVERLAY_ID, "ass-events", tags + safe,
+                self.MARQUEE_RES_X, self.MARQUEE_RES_Y]
+
     def _marquee_loop(self, text, ass_color, speed, duration):
-        RES_X, RES_Y = self.MARQUEE_RES_X, self.MARQUEE_RES_Y
-        fs = 42                       # размер шрифта
-        y = RES_Y - 12                # почти у нижнего края (an1 = низ-лево)
+        RES_X = self.MARQUEE_RES_X
         pps = self._speed_to_pps(speed)             # пикселей в секунду
         interval = 0.03               # ~33 кадра/сек
         safe = self._ass_escape(text)
-        text_w = int(len(safe) * fs * 0.6) + 80     # грубая ширина строки
-        span = RES_X + text_w                        # полный путь одного прохода
+        span = self._marquee_span(safe)              # полный путь одного прохода
         stop = self._marquee_stop
         start = time.monotonic()
         sock = None
@@ -487,10 +598,7 @@ class VLCPlayer:
                     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                     sock.settimeout(2)
                     sock.connect(MPV_SOCKET)
-                tags = ("{\\an1\\pos(%.1f,%d)\\fs%d\\c%s\\bord2\\3c&H000000&\\shad1}"
-                        % (x, y, fs, ass_color))
-                self._marquee_send(sock, ["osd-overlay", self.MARQUEE_OVERLAY_ID,
-                                          "ass-events", tags + safe, RES_X, RES_Y])
+                self._marquee_send(sock, self._marquee_overlay_cmd(x, ass_color, safe))
             except Exception:
                 # соединение отвалилось (mpv перезапущен) — переподключимся
                 try:
@@ -561,3 +669,158 @@ class VLCPlayer:
         self._marquee_current = None
         # подстраховка: убрать оверлей, даже если поток уже мёртв
         self._mpv_send_quick(["osd-overlay", self.MARQUEE_OVERLAY_ID, "none", ""])
+
+    # ── Очередь бегущих строк из ленты (агент 1.4.0) ────────────────────────
+    # Лента экрана несёт список строк (`tickers`), агент крутит живые по очереди:
+    # по одному полному проходу каждой её цветом и скоростью, в порядке запуска,
+    # и так по кругу. Вид — тот же ASS-оверлей, что у set_marquee. Срок агент
+    # проверяет сам по своим часам (live_tickers), поэтому строка выпадает и без
+    # связи с сервером; на «Стопе» и при погашенном мониторе оверлей убран.
+    #
+    # Поток только вызывает _ticker_step() в цикле. Шаг получает время аргументами
+    # и рисует через _tk_send, поэтому очередь проверяется тестами без mpv.
+
+    def apply_feed_tickers(self, schedule) -> bool:
+        """Принять строки из загруженной ленты. True — ключ `tickers` был в ленте.
+
+        Есть ключ со списком (даже пустым) — он заменяет очередь и включает режим
+        «из ленты» насовсем. Нет ключа (сервер не прочитал строки или он старый) —
+        очередь остаётся как есть: пустой список снял бы живые объявления из-за
+        сбоя, а возврат к командам — вернул бы режим, где строка не переживает
+        перезагрузку.
+        """
+        if not isinstance(schedule, dict) or not isinstance(schedule.get("tickers"), list):
+            return False
+        if not self.tickers_from_feed:
+            # строка от прежней команды ticker_show делит оверлей с очередью — снять
+            if self._marquee_thread is not None:
+                self.clear_marquee()
+            self.tickers_from_feed = True
+            log.info("Бегущие строки: режим «из ленты»")
+        self.set_tickers(schedule["tickers"])
+        return True
+
+    def set_tickers(self, items) -> None:
+        """Заменить список строк. Тот же список (лента перечитывается каждую
+        минуту) ничего не трогает — прокрутка не перезапускается."""
+        items = [dict(t) if isinstance(t, dict) else t for t in items] \
+            if isinstance(items, (list, tuple)) else []
+        with self._tk_lock:
+            if items == self._tk_items:
+                return
+            self._tk_items = items
+        log.info("Бегущие строки из ленты: {}".format(
+            [t.get("id") for t in items if isinstance(t, dict)]))
+
+    def set_tickers_paused(self, paused: bool, stopped: bool, screen_off: bool) -> None:
+        """Пауза показа строк: «Стоп» (stopped) или погашенный монитор (screen_off).
+        Вызывается каждый проход главного цикла. Строки остаются в очереди и
+        побегут снова сами, как только пауза снимется."""
+        with self._tk_lock:
+            self._tk_paused = bool(paused)
+            self._tk_stopped = bool(stopped)
+            self._tk_screen_off = bool(screen_off)
+
+    def ticker_state(self) -> dict:
+        """Отчёт для heartbeat: какие строки у экрана бегут сейчас (id живых по
+        часам агента), остановлен ли показ, погашен ли монитор. На паузе
+        бежать нечему: ids пуст, причина — в флагах."""
+        with self._tk_lock:
+            items = self._tk_items
+            paused, stopped, screen_off = self._tk_paused, self._tk_stopped, self._tk_screen_off
+        ids = [] if paused else [t["id"] for t in live_tickers(items, self._ticker_clock())]
+        return {"ids": ids, "stopped": stopped, "screen_off": screen_off}
+
+    def start_ticker_queue(self) -> None:
+        """Запустить поток очереди (один на плеер; повторный вызов ничего не делает).
+        Пока лента строк не принесла, поток оверлея не трогает — старые
+        ticker_show / set_marquee работают как раньше."""
+        if self._tk_thread is not None and self._tk_thread.is_alive():
+            return
+        self._tk_thread = threading.Thread(
+            target=self._ticker_loop, name="ticker-queue", daemon=True)
+        self._tk_thread.start()
+
+    def _ticker_loop(self):
+        while True:
+            try:
+                delay = self._ticker_step(time.monotonic(), self._ticker_clock())
+            except Exception:
+                log.exception("Очередь бегущих строк: сбой шага")
+                delay = 1.0
+            time.sleep(delay)
+
+    def _tk_send(self, command) -> bool:
+        """Отправить команду mpv по постоянному соединению потока очереди.
+        Сбой (mpv перезапущен) закрывает соединение — следующая попытка
+        подключится заново."""
+        try:
+            if self._tk_sock is None:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                sock.connect(MPV_SOCKET)
+                self._tk_sock = sock
+            self._marquee_send(self._tk_sock, command)
+            return True
+        except Exception:
+            try:
+                if self._tk_sock:
+                    self._tk_sock.close()
+            except Exception:
+                pass
+            self._tk_sock = None
+            return False
+
+    def _ticker_hide(self) -> float:
+        """Убрать оверлей очереди, если он нарисован. Возвращает паузу до
+        следующего шага. Не получилось (mpv недоступен) — пробуем снова."""
+        if not self._tk_shown:
+            return TICKER_IDLE
+        if self._tk_send(["osd-overlay", self.MARQUEE_OVERLAY_ID, "none", ""]):
+            self._tk_shown = False
+            return TICKER_IDLE
+        return TICKER_RETRY
+
+    def _ticker_pass(self, item, pos, mono):
+        """Начать проход строки `item` (стоит на месте `pos` среди живых) в момент `mono`."""
+        safe = self._ass_escape(_ticker_text(item.get("message")))
+        return {"id": item["id"], "pos": pos, "look": _ticker_look(item), "start": mono,
+                "ass_color": self._hex_to_ass(str(item.get("color") or "")), "text": safe,
+                "pps": self._speed_to_pps(item.get("speed")), "span": self._marquee_span(safe)}
+
+    def _ticker_step(self, mono, wall) -> float:
+        """Один шаг очереди: что сейчас на экране, нарисовать кадр. Возвращает
+        паузу до следующего шага. mono — монотонное время (прокрутка), wall —
+        часы агента, наивное МСК (сроки). Правка и снятие подхватываются уже на
+        следующем шаге, то есть за доли секунды."""
+        with self._tk_lock:
+            items, paused = self._tk_items, self._tk_paused
+        if paused:
+            self._tk_cur = None
+            return self._ticker_hide()
+        live = live_tickers(items, wall)
+        cur = self._tk_cur
+        if cur is not None:
+            idx = next((i for i, t in enumerate(live) if t["id"] == cur["id"]), None)
+            if idx is None:                                   # снята или вышел срок
+                self._tk_last = (cur["id"], cur["pos"])
+                cur = None
+            elif _ticker_look(live[idx]) != cur["look"]:      # изменена: заново с правого края
+                cur = self._ticker_pass(live[idx], idx, mono)
+            else:
+                cur["pos"] = idx
+        if cur is not None and (mono - cur["start"]) * cur["pps"] >= cur["span"]:
+            self._tk_last = (cur["id"], cur["pos"])           # проход закончен
+            cur = None
+        if cur is None:
+            nxt = next_ticker_index(live, *self._tk_last)
+            if nxt is None:
+                self._tk_cur = None
+                return self._ticker_hide()
+            cur = self._ticker_pass(live[nxt], nxt, mono)
+        self._tk_cur = cur
+        x = self.MARQUEE_RES_X - (mono - cur["start"]) * cur["pps"]
+        if not self._tk_send(self._marquee_overlay_cmd(x, cur["ass_color"], cur["text"])):
+            return TICKER_RETRY
+        self._tk_shown = True
+        return TICKER_FRAME

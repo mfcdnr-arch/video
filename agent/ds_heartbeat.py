@@ -8,7 +8,7 @@ log = logging.getLogger(__name__)
 # Единственное место, где живёт версия агента: её шлёт heartbeat и отчёт
 # о перезапуске (ds_agent.py импортирует отсюда). Панель сравнивает её с
 # целевой версией и по ней же решают, доступна ли функция при приёмке.
-AGENT_VERSION = "1.3.0"
+AGENT_VERSION = "1.4.0"
 
 # Каталог, где ядро публикует состояние видеовыходов (DRM-коннекторы).
 DRM_PATH = "/sys/class/drm"
@@ -117,7 +117,11 @@ class Heartbeat:
         usage = shutil.disk_usage(self.media_dir)
         return round(usage.total / (1024 ** 3), 2)
 
-    def send(self, status: str = "online", playing_file: str = None) -> bool:
+    def send(self, status: str = "online", playing_file: str = None,
+             ticker_state: dict = None) -> bool:
+        """ticker_state — отчёт очереди бегущих строк (VLCPlayer.ticker_state():
+        {"ids", "stopped", "screen_off"}); панель по нему считает «бежит на X из N».
+        None — поле в тело не кладём."""
         display_connected, display_outputs = read_display_status()
         if display_connected != self._last_display:
             log.info("Видеовыход: {} ({})".format(
@@ -139,6 +143,8 @@ class Heartbeat:
             # дрейф часов; уплывшие часы ломают окна питания и синхропоказ.
             "agent_time": time.time(),
         }
+        if ticker_state is not None:
+            payload["ticker_state"] = ticker_state
         try:
             r = self.session.post(
                 f"{self.server}/api/heartbeat/{self.screen_id}",

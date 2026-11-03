@@ -83,7 +83,7 @@ log = logging.getLogger("ds_agent")
 sys.path.insert(0, str(Path(__file__).parent))
 from ds_downloader import Downloader
 from ds_player    import VLCPlayer, build_playable, active_expired, repoll_after_expiry, is_new_play
-from ds_sync      import SyncHandler
+from ds_sync      import SyncHandler, drain_commands
 from ds_heartbeat import Heartbeat, AGENT_VERSION
 from ds_cleanup   import Cleanup
 from ds_ws_client import WSClient
@@ -298,6 +298,8 @@ def main():
     cleanup    = Cleanup(downloader, screen_id, MEDIA_DIR)
 
     player.start_vlc()
+    # Очередь бегущих строк из ленты (до первой ленты с ключом tickers молчит)
+    player.start_ticker_queue()
 
     # ── WebSocket push-соединение (замена polling команд) ──
     _ws_triggered = threading.Event()
@@ -361,11 +363,17 @@ def main():
         # Сразу после active_until (конец часа показа, полночь переопределения)
         # опрашиваем, не дожидаясь POLL_INTERVAL: многочасовой показ получит
         # новый час без провала в шаблон (см. ds_player.repoll_after_expiry).
-        if now - last_schedule_poll >= POLL_INTERVAL or (
+        # Команда ticker_show / ticker_hide (агент в режиме «строки из ленты»)
+        # поднимает sync_hdl.refresh_requested — тогда ленту читаем сразу.
+        refresh_feed = sync_hdl.refresh_requested
+        sync_hdl.refresh_requested = False
+        if refresh_feed or now - last_schedule_poll >= POLL_INTERVAL or (
                 schedule and repoll_after_expiry(schedule, datetime.now(MSK), now - last_schedule_poll)):
             new_schedule = load_schedule_online(screen_id, sess)
             if new_schedule:
                 schedule = new_schedule
+                # строки — до скачивания файлов: оно может быть долгим
+                player.apply_feed_tickers(schedule)
                 log.info("Расписание обновлено")
                 dl, fail = downloader.sync_files(screen_id)
                 if dl:
@@ -373,6 +381,7 @@ def main():
             elif schedule is None:
                 schedule = load_schedule_cache()
                 if schedule:
+                    player.apply_feed_tickers(schedule)
                     log.warning("Используем кешированное расписание")
             last_schedule_poll = now
 
@@ -386,12 +395,10 @@ def main():
         if ws_triggered:
             _ws_triggered.clear()
         if ws_triggered or (not ws_client.is_connected and now - last_cmd_poll >= CMD_POLL):
-            resp = sync_hdl.poll_command()
-            # ИСПРАВЛЕНО: poll_command возвращает {"command": {...}} или {"command": None}
-            cmd = resp.get("command") if resp else None
-            if cmd:
-                log.info("Получена команда: {} (id={})".format(cmd.get("type"), cmd.get("id")))
-                sync_hdl.handle(cmd)
+            # Сервер отдаёт по одной команде за запрос, а «Стоп» / «Показ»
+            # приходят вместе с ticker_hide / ticker_show — разбираем пачку
+            # (не больше 10 за проход), см. ds_sync.drain_commands.
+            drain_commands(sync_hdl)
             last_cmd_poll = now
 
         # ── Питание экрана (окно работы, МСК) ──
@@ -408,6 +415,11 @@ def main():
                 current_list = []
                 current_playing = None
                 last_play_state = None
+
+        # ── Бегущая строка: пауза на «Стоп» и при погашенном мониторе ──
+        # Каждый проход: «Стоп» мог прийти командой выше, окно питания — только что.
+        player.set_tickers_paused(player.user_stopped or not display_on,
+                                  player.user_stopped, not display_on)
 
         # ── Воспроизведение по расписанию ──
         if player.user_stopped:
@@ -477,7 +489,8 @@ def main():
 
         # ── Heartbeat ──
         if now - last_heartbeat >= HB_INTERVAL:
-            hb.send(status="online", playing_file=current_playing)
+            hb.send(status="online", playing_file=current_playing,
+                    ticker_state=player.ticker_state())
             last_heartbeat = now
 
         # ── Очистка устаревших файлов (раз в сутки) ──

@@ -6,6 +6,39 @@ from ds_player import VLCPlayer
 
 log = logging.getLogger(__name__)
 
+# Команды, после которых процесс агента (или весь мини-ПК) перезапускается:
+# следующую команду забирает уже новый процесс.
+_PROCESS_ENDING = ("restart_agent", "reboot", "update_agent")
+
+
+def drain_commands(sync_hdl, max_n=10):
+    """Обработать все ожидающие команды за одно пробуждение (WS-будильник или
+    тик опроса). Сервер отдаёт по одной команде за запрос, а «Стоп» и «Показ»
+    приходят парой с ticker_hide / ticker_show — одной команды за пробуждение
+    мало. Не больше max_n за проход: остальное — на следующем.
+
+    Останавливаемся, когда команд нет; когда сервер вернул ту же команду, что
+    уже разбирали (её не удалось подтвердить — иначе будем разбирать вечно); и
+    после restart_agent / reboot / update_agent, которые заканчивают процесс.
+    Возвращает, сколько команд разобрано.
+    """
+    handled, seen = 0, set()
+    while handled < max_n:
+        resp = sync_hdl.poll_command()
+        cmd = resp.get("command") if resp else None
+        if not cmd:
+            break
+        cmd_id = cmd.get("id")
+        if cmd_id is not None and cmd_id in seen:
+            break
+        seen.add(cmd_id)
+        log.info("Получена команда: {} (id={})".format(cmd.get("type"), cmd_id))
+        sync_hdl.handle(cmd)
+        handled += 1
+        if cmd.get("type") in _PROCESS_ENDING:
+            break
+    return handled
+
 
 class SyncHandler:
     def __init__(self, server, token, player, screen_id):
@@ -15,6 +48,9 @@ class SyncHandler:
         self.screen_id = screen_id
         self.session = requests.Session()
         self.session.headers["X-Token"] = token
+        # Команда ticker_show / ticker_hide в режиме «строки из ленты» только
+        # поднимает флаг; главный цикл сразу перечитывает ленту и сбрасывает его.
+        self.refresh_requested = False
 
     def _url(self, path):
         return self.server + path
@@ -107,6 +143,13 @@ class SyncHandler:
                 return True
 
         elif cmd_type == "ticker_show":
+            if self.player.tickers_from_feed:
+                # Агент 1.4.0 берёт строки из ленты: команда лишь «обнови сейчас».
+                # Текст из payload не показываем — лента точнее (срок, очередь).
+                log.info("Команда: TICKER_SHOW — обновляю строки из ленты")
+                self.refresh_requested = True
+                self.ack_command(cmd_id)
+                return True
             message  = payload.get("message", "")
             color    = payload.get("color", "#ffd34d")
             speed    = payload.get("speed")
@@ -120,6 +163,11 @@ class SyncHandler:
             return True
 
         elif cmd_type == "ticker_hide":
+            if self.player.tickers_from_feed:
+                log.info("Команда: TICKER_HIDE — обновляю строки из ленты")
+                self.refresh_requested = True
+                self.ack_command(cmd_id)
+                return True
             log.info("Команда: TICKER_HIDE")
             try:
                 self.player.clear_marquee()
