@@ -65,7 +65,12 @@ def create_backup(current_admin: dict = Depends(require_write), db: Session = De
 
 
 @router.get("/backups/{backup_id}/download")
-def download_backup(backup_id: int, db: Session = Depends(get_db)):
+def download_backup(backup_id: int, current_admin: dict = Depends(require_write),
+                    db: Session = Depends(get_db)):
+    """Отдать дамп. Только пишущему админу: внутри вся БД — хеши паролей,
+    X-Token каждого экрана, рекламодатели, счета. Номера бэкапов идут подряд,
+    так что без проверки любой в сети забрал бы дамп перебором id. Панель
+    скачивает через fetch с заголовком Authorization (apiDownload в api.js)."""
     row = db.execute(text("SELECT filename FROM backups WHERE id = :id"), {"id": backup_id}).fetchone()
     if not row:
         raise HTTPException(404, "Бэкап не найден")

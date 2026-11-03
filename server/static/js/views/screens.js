@@ -61,6 +61,9 @@ function initScreensViewActions(){
         case 'screen-refresh-diag':
           return showScreenDiagList(Number(btn.dataset.screenId));
 
+        case 'screen-download-diag':
+          return downloadScreenDiag(Number(btn.dataset.diagId), btn.dataset.filename || '');
+
         case 'delete-screen':
           return delScreen(Number(btn.dataset.screenId), btn.dataset.screenName || '');
 
@@ -501,13 +504,24 @@ async function showScreenDiagList(id){
         h += `<div style="display:flex;align-items:center;gap:10px;font-size:12px;margin-bottom:4px;">
           <span>🧾 ${fmtServerTS(r.created_at)}</span>
           <span class="muted">${(r.size_bytes/1024).toFixed(0)} КБ</span>
-          <a class="btn" style="padding:2px 10px;font-size:11px;margin-left:auto;" href="${API}/diagnostics/${r.id}/download">⤓ Скачать</a>
+          <button class="btn" style="padding:2px 10px;font-size:11px;margin-left:auto;"
+            data-action="screen-download-diag" data-diag-id="${r.id}"
+            data-filename="${esc(r.filename)}">⤓ Скачать</button>
         </div>`;
       });
     }
     el.innerHTML = h + '</div>';
   }catch(e){
     el.innerHTML = `<div class="muted" style="font-size:12px;">Диагностика: ${esc(e.message)}</div>`;
+  }
+}
+
+async function downloadScreenDiag(diagId, filename){
+  try{
+    toast('Скачивается архив…');
+    await apiDownload('/diagnostics/' + diagId + '/download', filename || 'diagnostics.tar.gz');
+  }catch(e){
+    if(e.message !== 'unauthorized') toast('Не удалось скачать: ' + e.message);
   }
 }
 

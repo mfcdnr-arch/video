@@ -1027,9 +1027,11 @@ async def upload_diagnostics(screen_id: int, file: UploadFile = File(...),
 
 
 @router.get("/diagnostics/{diag_id}/download")
-def download_diagnostics(diag_id: int, db: Session = Depends(get_db)):
-    # Как и у бэкапов/медиа: скачивание по непрозрачному id без заголовка
-    # авторизации (панель открывает ссылку в новой вкладке; наружу порт закрыт)
+def download_diagnostics(diag_id: int, admin: dict = Depends(get_current_admin),
+                         db: Session = Depends(get_db)):
+    # Только вошедшему в панель: в архиве логи и конфиг мини-ПК, а номера
+    # архивов идут подряд — открытая ссылка отдавала бы их перебором id.
+    # Панель скачивает через fetch с заголовком Authorization (apiDownload).
     from fastapi.responses import FileResponse
     row = db.execute(text("SELECT filename FROM screen_diagnostics WHERE id=:id"),
                      {"id": diag_id}).fetchone()

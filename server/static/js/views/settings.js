@@ -325,6 +325,9 @@ function initSettingsViewActions(){
         return delUser(id, username);
       }
 
+      case 'settings-download-backup':
+        return downloadBackup(Number(el.dataset.backupId), el.dataset.filename || '');
+
       case 'settings-delete-backup': {
         const id = Number(el.dataset.backupId);
         const filename = el.dataset.filename || '';
@@ -615,7 +618,10 @@ async function loadBackups(){
         <td class="muted" style="font-size:12px;white-space:nowrap;">${b.created_at ? fmtServerTS(b.created_at) : '—'}</td>
         <td class="muted" style="font-size:12px;">${b.size_bytes ? Math.round(b.size_bytes / 1024 / 1024 * 10) / 10 + ' МБ' : '—'}</td>
         <td style="text-align:right;white-space:nowrap;">
-          <a class="btn" style="padding:4px 8px;font-size:12px;text-decoration:none;" href="/api/backups/${b.id}/download" download>&#10515; Скачать</a>
+          <button class="btn" style="padding:4px 8px;font-size:12px;"
+            data-action="settings-download-backup"
+            data-backup-id="${b.id}"
+            data-filename="${esc(b.filename)}">&#10515; Скачать</button>
           <button class="btn danger" style="padding:4px 8px;font-size:12px;"
             data-action="settings-delete-backup"
             data-backup-id="${b.id}"
@@ -624,6 +630,15 @@ async function loadBackups(){
       </tr>`).join('') + '</table>';
   }catch(e){
     el.innerHTML = '<div class="muted">Ошибка загрузки бэкапов</div>';
+  }
+}
+
+async function downloadBackup(id, filename){
+  try{
+    toast('Скачивается бэкап…');
+    await apiDownload('/backups/' + id + '/download', filename);
+  }catch(e){
+    if(e.message !== 'unauthorized') toast('Не удалось скачать: ' + e.message);
   }
 }
 
