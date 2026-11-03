@@ -200,6 +200,33 @@ def _ticker_report(raw) -> dict | None:
     return {"ids": ids, "stopped": bool(raw.get("stopped")), "screen_off": bool(raw.get("screen_off"))}
 
 
+_STUCK_COMMAND_SECONDS = 10     # команда в очереди дольше этого, а экран подключён по WS, — будильник потерян
+
+
+def _wake_if_commands_stuck(db: Session, screen_id: int) -> None:
+    """Heartbeat будит экран, подключённый по WS, если в его очереди давно ждёт команда.
+
+    Агент < 1.4.0 по WS берёт ОДНУ команду за будильник `new_command`, а пара «stop + ticker_hide» или команды,
+    поставленные Celery (без WS-будильника: реестр соединений живёт в процессе API), иначе ждали бы следующего
+    события. Раз в 30 с (heartbeat) шлём один будильник; свежие команды (моложе 10 с) не трогаем — их
+    обычно будит само место постановки. Экран не на WS опрашивает команды сам, поэтому для него ни запроса,
+    ни будильника. Сбой (старая схема, БД) heartbeat не роняет: сигнал экрана уже закоммичен, ошибку откатываем.
+    """
+    try:
+        if screen_id not in ws_manager.connected_screens():
+            return
+        stuck = db.execute(text(f"""
+            SELECT COUNT(*) FROM commands
+            WHERE screen_id = :sid AND executed_at IS NULL
+              AND created_at < NOW() - INTERVAL '{_STUCK_COMMAND_SECONDS} seconds'
+        """), {"sid": screen_id}).scalar()
+        if stuck:
+            asyncio.create_task(ws_manager.send(screen_id, {"type": "new_command", "count": 1}))
+    except Exception:
+        log.exception("screen %s: проверка застрявших команд не удалась", screen_id)
+        db.rollback()
+
+
 @router.post("/heartbeat/{screen_id}")
 async def heartbeat(screen_id: int, body: dict = Body(...), db: Session = Depends(get_db),
                      _screen=Depends(verify_device_token)):
@@ -283,6 +310,7 @@ async def heartbeat(screen_id: int, body: dict = Body(...), db: Session = Depend
         except Exception:
             log.exception("screen %s: отчёт о бегущей строке не записан", screen_id)
             db.rollback()
+    _wake_if_commands_stuck(db, screen_id)
     # Push обновления дашборду (если есть подключённые администраторы)
     if dashboard_ws_manager.client_count() > 0:
         asyncio.create_task(dashboard_ws_manager.broadcast({
@@ -914,9 +942,8 @@ async def command_stop_screen(
     # API стартует раньше миграции 034) «Стоп» не роняет: команда уже в очереди, ошибку откатываем.
     try:
         if ticker_store.for_screen(db, screen_id, now_msk()):
-            db.execute(text(
-                "INSERT INTO commands (screen_id, type, payload) VALUES (:sid, 'ticker_hide', CAST(:p AS jsonb))"
-            ), {"sid": screen_id, "p": _json.dumps({})})
+            # прежние ожидающие ticker_show / ticker_hide гасятся: команды строки — состояние, а не события
+            ticker_store.queue_ticker_command(db, screen_id, "ticker_hide", {})
             db.commit()
     except Exception:
         log.exception("screen %s: ticker_hide после «Стоп» не поставлен", screen_id)

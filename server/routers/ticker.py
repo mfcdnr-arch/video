@@ -69,7 +69,8 @@ def overview_json(live: list[dict], screens: list[dict], groups: list[dict], tem
     """Всё для раздела «Бегущая строка» одним ответом.
 
     `tickers` — живые строки в порядке запуска: ticker_json плюс `screens_total` (на скольких экранах строка
-    сейчас) и `confirm` — «бежит на X из N» по отчётам экранов (ticker_rules.screen_reason / summarize);
+    сейчас) и `confirm` — «бежит на X из N» по отчётам экранов (ticker_rules.screen_reason / summarize;
+    у каждого экрана в `problems` есть `screen_id`, имена экранов могут повторяться);
     `screens` — экраны как их отдаёт screens_brief плюс `live_count` (сколько живых строк у экрана);
     `groups` и `templates` — для конструктора. Строка на удалённую группу — «0 экранов», не ошибка.
     """
@@ -83,7 +84,8 @@ def overview_json(live: list[dict], screens: list[dict], groups: list[dict], tem
         for sid in ids:
             live_count[sid] += 1
         changed_at = _changed_at(t, now)
-        confirm = summarize([(by_id[sid]["name"], screen_reason(t["id"], by_id[sid], changed_at, now)) for sid in ids])
+        confirm = summarize([(sid, by_id[sid]["name"], screen_reason(t["id"], by_id[sid], changed_at, now))
+                             for sid in ids])
         tickers.append({**ticker_json(t, now), "screens_total": len(ids), "confirm": confirm})
     return {"generated_at": now.isoformat(), "tickers": tickers,
             "screens": [{**s, "live_count": live_count[s["id"]]} for s in screens],
@@ -95,7 +97,8 @@ def overview_json(live: list[dict], screens: list[dict], groups: list[dict], tem
 
 def _wake_agents(screen_ids: list[int]) -> None:
     """WS-будильник new_command подключённым агентам (как в /command/stop): команда уже лежит в очереди,
-    push лишь ускоряет опрос; не дошёл — агент заберёт команду при ближайшем опросе. Звать после commit."""
+    push лишь ускоряет опрос. Не дошёл — команду заберёт опрос (агент без WS) или следующий heartbeat:
+    он будит подключённый по WS экран, у которого команда ждёт дольше ~10 с (routers/screens.py). Звать после commit."""
     connected = ws_manager.connected_screens()
     for sid in screen_ids:
         if sid in connected:

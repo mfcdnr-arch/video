@@ -476,6 +476,86 @@ def test_notify_nothing_affected_touches_nothing():
     assert db.calls == []
 
 
+class QueueDB(RoutedDB):
+    """Очередь команд в памяти: UPDATE commands ... type IN (...) гасит ожидающие команды экрана тех типов,
+    что названы в самом SQL; INSERT INTO commands добавляет ожидающую. Видно, что остаётся в очереди."""
+
+    def __init__(self, routes, pending=()):
+        super().__init__(routes)
+        self.queue = [{"sid": sid, "type": kind, "done": False} for sid, kind in pending]
+
+    def execute(self, query, params=None):
+        out = super().execute(query, params)
+        sql = " ".join(str(query).split())
+        if "UPDATE commands" in sql:
+            kinds = set(re.findall(r"'([a-z_]+)'", sql.split(" type IN ")[1]))
+            for c in self.queue:
+                if c["sid"] == params["sid"] and not c["done"] and c["type"] in kinds and "executed_at IS NULL" in sql:
+                    c["done"] = True
+        elif "INSERT INTO commands" in sql:
+            self.queue.append({"sid": params["sid"], "type": params["t"], "done": False})
+        return out
+
+    def waiting(self, sid):
+        return [c["type"] for c in self.queue if c["sid"] == sid and not c["done"]]
+
+
+def queue_db(live, pending=()):
+    return QueueDB([("FROM tickers t", live), ("SELECT id, group_id FROM screens", SCREENS)], pending)
+
+
+def test_notify_retires_pending_ticker_commands_before_each_insert():
+    """Команды тикера — состояние, а не события: старый агент берёт одну команду за будильник, и забытая
+    ticker_show съела бы чужой. Перед новой командой экрана прежние ожидающие гасятся."""
+    db = notify_db([TK()])
+    store.notify_screens(db, {1, 2}, set(), N)
+    steps = [("retire" if "UPDATE commands" in sql else "insert", p["sid"]) for sql, p in db.calls
+             if "UPDATE commands" in sql or "INSERT INTO commands" in sql]
+    assert steps == [("retire", 1), ("insert", 1), ("retire", 2), ("insert", 2)]
+    sql = db.sqls("UPDATE commands")[0]
+    assert "executed_at IS NULL" in sql and "screen_id = :sid" in sql
+    assert "type IN ('ticker_show', 'ticker_hide')" in sql
+    assert "DELETE" not in sql.upper()                                  # строки очереди остаются, подтверждение не рвётся
+    assert db.commits == 0
+
+
+def test_two_notifications_leave_one_pending_ticker_command_per_screen():
+    db = queue_db([TK(id=11, message="Первая"), TK(id=12, message="Вторая", started_at=N)], pending=[(1, "ticker_show")])
+    store.notify_screens(db, set(), {1}, N)                             # в очереди уже лежит ticker_show от запуска
+    assert db.waiting(1) == ["ticker_show"]
+    assert [c["done"] for c in db.queue] == [True, False]               # старая погашена, новая ждёт
+
+
+def test_show_then_hide_leaves_only_the_hide():
+    db = queue_db([], pending=[(1, "ticker_show"), (1, "ticker_show")])
+    store.notify_screens(db, {1}, set(), N)
+    assert db.waiting(1) == ["ticker_hide"]
+
+
+def test_non_ticker_and_other_screen_commands_are_untouched():
+    pending = [(1, "stop"), (1, "resume"), (1, "restart_agent"), (1, "collect_diag"), (1, "ticker_show"), (2, "ticker_show")]
+    db = queue_db([TK()], pending)
+    store.notify_screens(db, set(), {1}, N)
+    assert db.waiting(1) == ["stop", "resume", "restart_agent", "collect_diag", "ticker_show"]   # только новая show
+    assert db.waiting(2) == ["ticker_show"]                                                      # чужой экран не тронут
+
+
+def test_queue_ticker_command_retires_then_inserts():
+    """Публичный вход для «Стоп»: прежние ticker_* гасятся, потом ставится новая команда."""
+    db = queue_db([], pending=[(5, "ticker_show"), (5, "stop")])
+    store.queue_ticker_command(db, 5, "ticker_hide", {})
+    assert db.waiting(5) == ["stop", "ticker_hide"]
+    assert commands(db) == [(5, "ticker_hide", {})]
+
+
+def test_queue_ticker_command_refuses_other_types():
+    """Гасится только ticker_*, поэтому и ставить через эту функцию можно только их."""
+    db = queue_db([])
+    with pytest.raises(ValueError):
+        store.queue_ticker_command(db, 5, "stop", {})
+    assert db.calls == []
+
+
 # --- шаблоны ------------------------------------------------------------------
 
 TPL = {"message": "Перерыв", "color": "#ff6b5e", "speed": "slow", "term_kind": "minutes", "term_value": 15}

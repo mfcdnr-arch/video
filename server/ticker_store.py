@@ -15,7 +15,9 @@
 
 Старые агенты (< 1.4.0) строку из ленты не берут, им сервер шлёт команды `ticker_show` /
 `ticker_hide` (notify_screens): всегда о самой новой живой строке экрана, потому что у такого
-агента строка одна, и скрытие одной из нескольких не должно гасить остальные.
+агента строка одна, и скрытие одной из нескольких не должно гасить остальные. Это состояние, а не
+события: перед новой командой ожидающие ticker_* этого экрана гасятся (queue_ticker_command), чтобы
+в очереди оставалась одна — иначе устаревшая команда съест WS-будильник следующей.
 
 Функции не делают commit — транзакцией управляет вызывающий (роутер или задача). Журнал
 (`audit_log`) пишется в той же транзакции, что и изменение.
@@ -279,7 +281,27 @@ def record_report(db, screen_id: int, state: dict | None) -> None:
 
 # --- команды старым агентам ---------------------------------------------------
 
-def _command(db, screen_id: int, cmd_type: str, payload: dict) -> None:
+TICKER_COMMANDS = ("ticker_show", "ticker_hide")
+
+
+def queue_ticker_command(db, screen_id: int, cmd_type: str, payload: dict) -> None:
+    """Поставить старому агенту ticker_show / ticker_hide, предварительно погасив его ожидающие ticker_*.
+
+    Команды строки — состояние («что на экране сейчас»), а не события: важна только последняя. Старый
+    агент (< 1.4.0) по WS берёт ОДНУ команду за будильник, поэтому забытая ticker_show (срок вышел, пока
+    экран был не в сети, или «Стоп» поставил ticker_hide и ничего не разбудило) съела бы будильник
+    следующего запуска или «Показа», а при разборе дала бы устаревшие `duration` и текст. Поэтому
+    в очереди экрана остаётся не больше одной команды строки — самая новая. Прочие команды (stop,
+    resume, restart_agent, …) не трогаются. Погашенная команда помечается выполненной (executed_at), а не
+    удаляется: если агент как раз получил её, его подтверждение всё ещё находит строку. Метка — часы БД,
+    как у подтверждения агента (ack_command) и created_at; это учёт очереди, а не момент строки.
+    """
+    if cmd_type not in TICKER_COMMANDS:
+        raise ValueError(f"Не команда бегущей строки: {cmd_type}")
+    db.execute(text("""
+        UPDATE commands SET executed_at = NOW()
+        WHERE screen_id = :sid AND executed_at IS NULL AND type IN ('ticker_show', 'ticker_hide')
+    """), {"sid": screen_id})
     db.execute(text("INSERT INTO commands (screen_id, type, payload) VALUES (:sid, :t, CAST(:p AS jsonb))"),
                {"sid": screen_id, "t": cmd_type, "p": json.dumps(payload)})
 
@@ -298,6 +320,8 @@ def notify_screens(db, before: set[int], after: set[int], now: datetime) -> list
     правка: оба). Каждому экрану из объединения: если у него есть живые строки — `ticker_show` самой
     новой (снятие одной из нескольких не гасит остальные), иначе `ticker_hide`. Вызывать после изменения,
     в той же транзакции. Исчезнувшие экраны пропускаются. Возвращённые id нужны для WS-будильника.
+    Прежние ожидающие ticker_show / ticker_hide экрана гасятся (queue_ticker_command): в очереди остаётся
+    одна, актуальная команда строки на экран.
     """
     affected = sorted(before | after)
     if not affected:
@@ -310,9 +334,9 @@ def notify_screens(db, before: set[int], after: set[int], now: datetime) -> list
             continue
         mine = tickers_for_screen(live, sid, group_of[sid], now)
         if mine:
-            _command(db, sid, "ticker_show", _show_payload(mine[-1], now))
+            queue_ticker_command(db, sid, "ticker_show", _show_payload(mine[-1], now))
         else:
-            _command(db, sid, "ticker_hide", {})
+            queue_ticker_command(db, sid, "ticker_hide", {})
         notified.append(sid)
     return notified
 

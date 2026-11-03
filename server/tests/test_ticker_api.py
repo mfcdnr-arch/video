@@ -109,8 +109,16 @@ def test_overview_counts_and_reasons():
     (t,) = out["tickers"]
     assert t["screens_total"] == 3
     assert t["confirm"] == {"total": 3, "running": 1, "problems": [
-        {"screen": "Касса", "reason": "offline", "text": REASON_TEXT["offline"]},
-        {"screen": "Склад", "reason": "old_agent", "text": REASON_TEXT["old_agent"]}]}
+        {"screen_id": 2, "screen": "Касса", "reason": "offline", "text": REASON_TEXT["offline"]},
+        {"screen_id": 3, "screen": "Склад", "reason": "old_agent", "text": REASON_TEXT["old_agent"]}]}
+
+
+def test_overview_problems_carry_screen_id_for_duplicate_names():
+    """Два экрана с одним именем: панель находит нужный по screen_id, а не по имени."""
+    screens = [scr(1, "Касса", online=False), scr(2, "Касса", online=False, ids=[]), scr(3, "Касса", ids=[11])]
+    out = api.overview_json([tk(id=11, target="all", started_at=N - timedelta(minutes=5))], screens, [], [], N)
+    problems = out["tickers"][0]["confirm"]["problems"]
+    assert [(p["screen_id"], p["reason"]) for p in problems] == [(1, "offline"), (2, "offline")]
 
 
 def test_overview_other_ids_do_not_confirm():
@@ -365,20 +373,20 @@ def test_put_tells_screens_before_and_after_the_change(clock, monkeypatch):
 def test_put_without_term_keeps_the_old_one(clock, monkeypatch):
     db = put_db(TK(), TK())
     monkeypatch.setattr(api, "ws_manager", FakeWS())
-    call(api.update_ticker, 11, body={"message": "Правка", "term": None}, db=db, current_admin=ADMIN)
+    call(api.update_ticker, 11, body={"message": "Правка", "target": "all", "term": None}, db=db, current_admin=ADMIN)
     (p,) = db.params("UPDATE tickers")
     assert p["until"] is None and "until_at = :until" in db.sqls("UPDATE tickers")[0]
     # прежний срок строки в БД (row.until_at) — а не «до снятия» из тела
     db = RoutedDB([("FOR UPDATE", [Row(id=11, until_at=N + timedelta(minutes=7))]),
                    ("WHERE t.id = :id", [TK()]), ("ORDER BY t.started_at", [TK()]),
                    ("SELECT id, group_id FROM screens", [Row(id=1, group_id=None)])])
-    call(api.update_ticker, 11, body={"message": "Правка"}, db=db, current_admin=ADMIN)
+    call(api.update_ticker, 11, body={"message": "Правка", "target": "all"}, db=db, current_admin=ADMIN)
     assert db.params("UPDATE tickers")[0]["until"] == N + timedelta(minutes=7)
 
 
 def test_update_missing_ticker_404(clock):
     db = RoutedDB([])
-    err = http_error(api.update_ticker, 99, body={"message": "x"}, db=db, current_admin=ADMIN)
+    err = http_error(api.update_ticker, 99, body={"message": "x", "target": "all"}, db=db, current_admin=ADMIN)
     assert err.status_code == 404
     assert err.detail == "Бегущая строка не найдена"
     assert db.commits == 0 and not db.params("INSERT INTO commands")
@@ -386,7 +394,7 @@ def test_update_missing_ticker_404(clock):
 
 def test_update_expired_ticker_404(clock):
     db = RoutedDB([("FOR UPDATE", [Row(id=11, until_at=N)])])           # срок вышел в этот самый момент
-    err = http_error(api.update_ticker, 11, body={"message": "x"}, db=db, current_admin=ADMIN)
+    err = http_error(api.update_ticker, 11, body={"message": "x", "target": "all"}, db=db, current_admin=ADMIN)
     assert err.status_code == 404 and err.detail == "Бегущая строка не найдена"
 
 
@@ -398,6 +406,30 @@ def test_put_bad_body_and_vanished_group_are_400(clock):
     err = http_error(api.update_ticker, 11, body={"message": "x", "target": "groups", "group_ids": [99]},
                      db=db, current_admin=ADMIN)
     assert err.status_code == 400 and "обновите страницу" in err.detail and db.commits == 0
+
+
+def test_put_without_target_is_400_and_writes_nothing(clock):
+    """Правка без «где» молча сделала бы строку «на все экраны» — это 400, а не расширение охвата."""
+    for body in ({"message": "Правка"}, {"message": "Правка", "term": {"kind": "cancel"}}):
+        db = put_db(TK(target="screens", screen_ids=[1]), TK())
+        err = http_error(api.update_ticker, 11, body=body, db=db, current_admin=ADMIN)
+        assert err.status_code == 400 and err.detail == "Укажите, где показывать строку"
+        assert not db.sqls("UPDATE tickers") and not db.params("INSERT INTO commands") and db.commits == 0
+
+
+def test_put_with_legacy_is_all_still_works(clock, monkeypatch):
+    db = put_db(TK(), TK())
+    monkeypatch.setattr(api, "ws_manager", FakeWS())
+    assert call(api.update_ticker, 11, body={"message": "Правка", "is_all": True}, db=db, current_admin=ADMIN) == {"status": "ok"}
+    assert db.params("UPDATE tickers")[0]["target"] == "all"
+
+
+def test_post_without_target_is_still_all(clock, monkeypatch):
+    db = RoutedDB([("INSERT INTO tickers", [Row(id=11)]), ("WHERE t.id = :id", [TK()]),
+                   ("ORDER BY t.started_at", [TK()]), ("SELECT id, group_id FROM screens", [Row(id=1, group_id=None)])])
+    monkeypatch.setattr(api, "ws_manager", FakeWS())
+    assert call(api.create_ticker, body={"message": "Привет"}, db=db, current_admin=ADMIN)["id"] == 11
+    assert db.params("INSERT INTO tickers")[0]["target"] == "all"
 
 
 # --- DELETE ---------------------------------------------------------------------
@@ -660,6 +692,23 @@ def test_stop_keeps_tickers_and_hides_on_that_screen(monkeypatch, spy_auto_clear
     assert ws.sent == [(5, {"type": "new_command", "count": 1}, 2)]       # будильник только этому экрану, после commit
 
 
+def test_stop_retires_pending_ticker_commands_before_ticker_hide(monkeypatch):
+    # ticker_show от запуска ещё лежит в очереди: у старого агента (одна команда за будильник) он съел бы
+    # будильник следующего «Показа». ticker_hide ставится в паре с «stop», но прежняя команда строки гасится
+    db = stop_db([TK(id=11, target="all")])
+    monkeypatch.setattr(screens_router, "ws_manager", FakeWS())
+    monkeypatch.setattr(screens_router, "now_msk", lambda: N)
+    call(screens_router.command_stop_screen, 5, admin=ADMIN, db=db)
+    (sql,) = db.sqls("UPDATE commands")
+    assert "type IN ('ticker_show', 'ticker_hide')" in sql and "executed_at IS NULL" in sql
+    assert "'stop'" not in sql                                                       # сам «stop» не тронут
+    assert db.params("UPDATE commands") == [{"sid": 5}]
+    assert at(db, "INSERT INTO commands") < at(db, "UPDATE commands")
+    kinds = [("retire" if "UPDATE commands" in q else p.get("t", "stop")) for q, p in db.calls   # у «stop» тип — литерал в SQL
+             if "UPDATE commands" in q or "INSERT INTO commands" in q]
+    assert kinds == ["stop", "retire", "ticker_hide"]
+
+
 def test_stop_without_live_tickers_queues_only_stop(monkeypatch):
     # живых строк у экрана нет: лишний ticker_hide остался бы в очереди старого агента (по WS — одна команда
     # за пробуждение) и задержал бы следующий «Показ» или ticker_show
@@ -668,6 +717,7 @@ def test_stop_without_live_tickers_queues_only_stop(monkeypatch):
     monkeypatch.setattr(screens_router, "now_msk", lambda: N)
     call(screens_router.command_stop_screen, 5, admin=ADMIN, db=db)
     assert commands(db) == [(5, "stop", {})]
+    assert not db.sqls("UPDATE commands")                                     # без новой команды строки прежние не трогаем
     assert db.commits == 1
 
 
@@ -787,6 +837,63 @@ def test_heartbeat_survives_a_failing_ticker_report():
     assert at(db, "SET last_seen") < at(db, "INSERT INTO minipc_status") < at(db, "-- COMMIT") \
         < at(db, "SET ticker_ids") < at(db, "-- ROLLBACK")
     assert db.commits == 1 and db.rollbacks == 1 and not db.aborted
+
+
+# --- heartbeat будит экран, у которого команды застряли ---------------------------
+# Агент < 1.4.0 по WS берёт ОДНУ команду за будильник; остальные ждали бы следующего события. Heartbeat
+# идёт раз в 30 с: если экран подключён по WS, а в очереди есть команда старше ~10 с, шлём один будильник.
+
+WAKE = {"type": "new_command", "count": 1}
+
+
+def test_heartbeat_wakes_a_connected_screen_with_stale_pending_commands(monkeypatch):
+    db = RoutedDB([("FROM commands", [2])])
+    ws = FakeWS(connected=[3, 9], db=db)
+    monkeypatch.setattr(screens_router, "ws_manager", ws)
+    assert heartbeat(db, {"status": "online"})["status"] == "ok"
+    assert ws.sent == [(3, WAKE, 1)]                                        # один будильник, этому экрану, после commit
+    (sql,) = db.sqls("FROM commands")
+    assert "COUNT(*)" in sql and "screen_id = :sid" in sql and "executed_at IS NULL" in sql
+    assert "created_at < NOW() - INTERVAL '10 seconds'" in sql              # свежие команды ждут обычного пути
+    assert db.params("FROM commands") == [{"sid": 3}]
+
+
+def test_heartbeat_does_not_wake_without_stale_pending_commands(monkeypatch):
+    db = RoutedDB([("FROM commands", [0])])
+    ws = FakeWS(connected=[3], db=db)
+    monkeypatch.setattr(screens_router, "ws_manager", ws)
+    heartbeat(db, {"status": "online"})
+    assert ws.sent == []
+
+
+def test_heartbeat_does_not_even_ask_when_the_screen_is_not_on_ws(monkeypatch):
+    # экран без WS опрашивает команды сам по таймеру: ни запроса, ни будильника
+    db = RoutedDB([("FROM commands", [5])])
+    ws = FakeWS(connected=[9], db=db)
+    monkeypatch.setattr(screens_router, "ws_manager", ws)
+    assert heartbeat(db, {"status": "online"})["status"] == "ok"
+    assert ws.sent == [] and not db.sqls("FROM commands")
+
+
+def test_heartbeat_survives_a_failing_wake_check(monkeypatch):
+    # сбой проверки очереди не должен стоить экрану сигнала: last_seen закоммичен до неё, ответ — ok
+    db = TxDB([], fail_on="FROM commands")
+    ws = FakeWS(connected=[3], db=db)
+    monkeypatch.setattr(screens_router, "ws_manager", ws)
+    out = heartbeat(db, {"status": "online", "agent_version": "1.4.0"})
+    assert out["status"] == "ok" and "server_time" in out
+    assert at(db, "SET last_seen") < at(db, "-- COMMIT") < at(db, "FROM commands") < at(db, "-- ROLLBACK")
+    assert db.commits == 1 and db.rollbacks == 1 and not db.aborted
+    assert ws.sent == []
+
+
+def test_heartbeat_wake_does_not_depend_on_the_ticker_report(monkeypatch):
+    # отчёт строки упал (колонок ещё нет), а очередь команд при этом проверяется и экран будится
+    db = TxDB([("FROM commands", [1])], fail_on="SET ticker_ids")
+    ws = FakeWS(connected=[3], db=db)
+    monkeypatch.setattr(screens_router, "ws_manager", ws)
+    assert heartbeat(db, {"status": "online", "ticker_state": {"ids": [11]}})["status"] == "ok"
+    assert [m for _, m, _ in ws.sent] == [WAKE]
 
 
 # --- Celery: снятие по сроку ----------------------------------------------------

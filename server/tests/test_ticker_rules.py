@@ -3,6 +3,7 @@
 Чистая логика (ticker_rules) без БД и без fastapi; все моменты — наивное МСК.
 SQL строк — test_ticker_store, API — test_ticker_api.
 """
+import re
 from datetime import datetime, timedelta
 
 import pytest
@@ -164,6 +165,37 @@ def test_message_newlines_become_spaces():
     assert parse_ticker_body(body(message="a\r\nb\n\nc\n"), N)["message"] == "a b c"
 
 
+@pytest.mark.parametrize("sep", ["\r", "\n", "\t", "\v", "\f", "\x85", "\u2028", "\u2029", "\r\n", "\t\u2028\n\u2029"])
+def test_message_line_breaks_and_tabs_become_one_space(sep):
+    """Любой перевод строки, табуляция и разделитель абзацев → один пробел (иначе ASS-кадр порвётся)."""
+    assert parse_ticker_body(body(message="a" + sep + "b"), N)["message"] == "a b"
+
+
+def test_message_edge_separators_are_stripped():
+    assert parse_ticker_body(body(message="\u2028 hi \u2029\t"), N)["message"] == "hi"
+
+
+@pytest.mark.parametrize("bad", ["a\x00b", "a\x01b", "a\x08b", "a\x1bb", "a\x7fb", "a\x80b", "a\x9fb",
+                                 "a\ud800b", "\udfffa"])
+def test_message_rejects_control_characters_and_lone_surrogates(bad):
+    """NUL и прочие управляющие символы, одинокие суррогаты не пройдут: Postgres упал бы 500."""
+    with pytest.raises(ValueError, match="недопустим") as e:
+        parse_ticker_body(body(message=bad), N)
+    assert re.search("[А-Яа-яЁё]", str(e.value))
+    with pytest.raises(ValueError, match="недопустим"):
+        parse_template_body({"message": bad})             # шаблон проверяет текст так же
+
+
+def test_message_astral_characters_kept():
+    assert parse_ticker_body(body(message="Скидка \U0001F381"), N)["message"] == "Скидка \U0001F381"
+
+
+def test_rules_source_has_no_invisible_separators():
+    """В регулярках — escape-последовательности, а не невидимые U+2028 / U+2029 прямо в коде."""
+    src = open(rules.__file__, encoding="utf-8").read()
+    assert "\u2028" not in src and "\u2029" not in src
+
+
 def test_message_special_characters_kept():
     """Спецсимволы ASS экранирует агент, а панель — через esc(); сервер текст не портит."""
     text = '<b>{\\an8}"x"</b>'
@@ -212,6 +244,24 @@ def test_keep_term_when_absent():
     out = parse_ticker_body({"message": "x", "target": "all"}, N, keep_term=True)
     assert out["term_given"] is False
     assert out["until_at"] is None
+
+
+def test_keep_term_without_target_is_error():
+    """Правка без «где» не должна тихо расширять строку до «все экраны»."""
+    with pytest.raises(ValueError, match="Укажите, где показывать строку"):
+        parse_ticker_body({"message": "x"}, N, keep_term=True)
+    with pytest.raises(ValueError, match="Укажите, где показывать строку"):
+        parse_ticker_body({"message": "x", "is_all": None}, N, keep_term=True)
+
+
+def test_keep_term_legacy_is_all_is_still_a_target():
+    assert parse_ticker_body({"message": "x", "is_all": True}, N, keep_term=True)["target"] == "all"
+    out = parse_ticker_body({"message": "x", "is_all": False, "screen_ids": [2]}, N, keep_term=True)
+    assert (out["target"], out["screen_ids"]) == ("screens", [2])
+
+
+def test_post_without_target_keeps_the_legacy_default():
+    assert parse_ticker_body({"message": "x"}, N)["target"] == "all"
 
 
 def test_keep_term_when_given():
@@ -418,13 +468,20 @@ def test_reason_texts_verbatim():
 # --- сводка ---------------------------------------------------------------------
 
 def test_summarize():
-    out = summarize([("A", "running"), ("B", "offline"), ("C", "running")])
+    out = summarize([(1, "A", "running"), (2, "B", "offline"), (3, "C", "running")])
     assert out == {"total": 3, "running": 2,
-                   "problems": [{"screen": "B", "reason": "offline", "text": "не в сети"}]}
+                   "problems": [{"screen_id": 2, "screen": "B", "reason": "offline", "text": "не в сети"}]}
 
 
 def test_summarize_empty_and_order():
     assert summarize([]) == {"total": 0, "running": 0, "problems": []}
-    out = summarize([("Z", "pending"), ("A", "stopped")])
+    out = summarize([(9, "Z", "pending"), (4, "A", "stopped")])
     assert [p["screen"] for p in out["problems"]] == ["Z", "A"]
+    assert [p["screen_id"] for p in out["problems"]] == [9, 4]
     assert out["running"] == 0
+
+
+def test_summarize_keeps_duplicate_names_apart_by_id():
+    """Два экрана с одним именем: панель различает их по screen_id, а не по имени."""
+    out = summarize([(1, "Касса", "offline"), (2, "Касса", "pending")])
+    assert [(p["screen_id"], p["reason"]) for p in out["problems"]] == [(1, "offline"), (2, "pending")]

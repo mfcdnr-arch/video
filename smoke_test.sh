@@ -837,8 +837,8 @@ if [ -n "${SID:-}" ] && [ -n "${SCR_TOKEN:-}" ]; then
     fi
     tk_heartbeat "[]" true          # агент 1.4.0 после «Стоп»: показ остановлен, строки не бегут
     req GET "/tickers/overview"
-    if [ "$HTTP" = "200" ] && body_has "any(t['id']==$TK_ID and t['confirm']['running']==0 and [p['reason'] for p in t['confirm']['problems']]==['stopped'] for t in r['tickers'])"; then
-      ok "после «Стоп» строка из обзора не исчезла, на экране причина «остановлен»"
+    if [ "$HTTP" = "200" ] && body_has "any(t['id']==$TK_ID and t['confirm']['running']==0 and [p['reason'] for p in t['confirm']['problems']]==['stopped'] and t['confirm']['problems'][0]['screen_id']==$SID for t in r['tickers'])"; then
+      ok "после «Стоп» строка из обзора не исчезла, на экране причина «остановлен» (с id экрана)"
     else
       bad "после «Стоп» строка пропала из обзора или причина не «остановлен», HTTP $HTTP"
     fi
@@ -874,6 +874,17 @@ if [ -n "${SID:-}" ] && [ -n "${SCR_TOKEN:-}" ]; then
     else
       bad "после правки обзор неверный, HTTP $HTTP"
     fi
+    # команды строки — состояние, а не события: вторая правка гасит ожидающий ticker_show первой, в очереди остаётся одна
+    # (иначе старый агент по WS тратил бы на устаревшую команду будильник следующей)
+    req PUT "/tickers/$TK_ID" -H "$JSON_T" \
+        -d "{\"message\": \"${TK_MSG}_edit\", \"color\": \"#ff6b5e\", \"speed\": \"fast\", \"target\": \"screens\", \"screen_ids\": [$SID]}"
+    [ "$HTTP" = "200" ] && ok "повторная правка принята" || bad "повторная правка: HTTP $HTTP $BODY"
+    BODY=$(drain_cmds)
+    if body_has "[c['type'] for c in r]==['ticker_show'] and r[0]['payload']['message']=='${TK_MSG}_edit'"; then
+      ok "две правки подряд: в очереди одна команда ticker_show (устаревшая погашена)"
+    else
+      bad "две правки подряд: ждали одну ticker_show, в очереди: $BODY"
+    fi
     req GET "/audit?limit=40"
     if [ "$HTTP" = "200" ] && body_has "any(x['event_type']=='ticker' and x['title']=='Бегущая строка изменена' and '${TK_MSG}_edit' in (x['detail'] or '') for x in r)"; then
       ok "в журнале: «Бегущая строка изменена»"
@@ -903,8 +914,11 @@ if [ -n "${SID:-}" ] && [ -n "${SCR_TOKEN:-}" ]; then
     fi
     req DELETE "/tickers/$TK_ID"
     if [ "$HTTP" = "404" ] && body_has "r['detail']=='Бегущая строка не найдена'"; then ok "повторное снятие — 404 «Бегущая строка не найдена»"; else bad "повторное снятие: ждали 404, HTTP $HTTP $BODY"; fi
-    req PUT "/tickers/$TK_ID" -H "$JSON_T" -d "{\"message\": \"${TK_MSG}_late\"}"
+    req PUT "/tickers/$TK_ID" -H "$JSON_T" -d "{\"message\": \"${TK_MSG}_late\", \"target\": \"screens\", \"screen_ids\": [$SID]}"
     [ "$HTTP" = "404" ] && ok "правка снятой строки — 404" || bad "правка снятой строки: ждали 404, HTTP $HTTP"
+    # правка без «где» не должна тихо делать строку «на все экраны»: 400 (проверка тела идёт раньше поиска строки)
+    req PUT "/tickers/$TK_ID" -H "$JSON_T" -d "{\"message\": \"${TK_MSG}_late\"}"
+    if [ "$HTTP" = "400" ] && body_has "r['detail']=='Укажите, где показывать строку'"; then ok "правка без «где» — 400 «Укажите, где показывать строку»"; else bad "правка без «где»: ждали 400, HTTP $HTTP $BODY"; fi
 
     # строки сняты: «Стоп» и «Показ» тестовому экрану ставят только stop / resume, без ticker_hide / ticker_show.
     # Чужая строка «на все экраны» (боевой сервер) была бы живой и у тестового экрана — тогда проверку пропускаем
@@ -943,6 +957,8 @@ if [ -n "${SID:-}" ] && [ -n "${SCR_TOKEN:-}" ]; then
   # ошибки — 400 по-русски
   req POST "/tickers" -H "$JSON_T" -d "{\"message\": \"   \", \"target\": \"screens\", \"screen_ids\": [$SID]}"
   if [ "$HTTP" = "400" ] && body_has "any('А' <= c <= 'я' for c in r['detail'])"; then ok "пустой текст — 400 с русским пояснением"; else bad "пустой текст: ждали 400, HTTP $HTTP $BODY"; fi
+  req POST "/tickers" -H "$JSON_T" -d "{\"message\": \"a\\u0000b\", \"target\": \"screens\", \"screen_ids\": [$SID]}"
+  if [ "$HTTP" = "400" ] && body_has "'недопустим' in r['detail']"; then ok "NUL в тексте — 400 «недопустимые символы», не 500"; else bad "NUL в тексте: ждали 400, HTTP $HTTP $BODY"; fi
   req POST "/tickers" -H "$JSON_T" -d "{\"message\": \"$TK_MSG\", \"target\": \"screens\", \"screen_ids\": [$SID], \"term\": {\"kind\": \"minutes\", \"minutes\": 0}}"
   if [ "$HTTP" = "400" ]; then ok "срок «0 минут» — 400"; else bad "срок 0 минут: ждали 400, HTTP $HTTP $BODY"; fi
   req POST "/tickers" -H "$JSON_T" -d "{\"message\": \"$TK_MSG\", \"target\": \"screens\", \"screen_ids\": [2000000000]}"

@@ -48,11 +48,16 @@ REASON_TEXT = {
 _MAX_INT4 = 2 ** 31 - 1                         # id экранов и групп — SERIAL
 _ON_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _COLOR = re.compile(r"#[0-9a-fA-F]{6}")
-_NEWLINES = re.compile(r"[\r\n  ]+")
+# Разделители строк и табуляции → пробел: \r \n \t \v \f, NEL (U+0085), U+2028 / U+2029 (escape-ами, не символами)
+_NEWLINES = re.compile(r"[\r\n\t\v\f\x85\u2028\u2029]+")
+# Что остаётся управляющим после этого (NUL, ESC, DEL, C1) и одинокие суррогаты: в кадре и в Postgres им не место
+_BAD_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
 _VERSION = re.compile(r"[0-9]{1,6}(?:\.[0-9]{1,6}){0,3}")
 
 _TERM_TEXT = "Срок — «до снятия», «до ЧЧ:00 сегодня» или «на N минут»"
 _WHERE_TEXT = "Где показывать — на всех экранах, в группах или на выбранных экранах"
+_NO_TARGET_TEXT = "Укажите, где показывать строку"
+_BAD_CHARS_TEXT = "Текст строки содержит недопустимые символы"
 _HOUR_TEXT = "Час окончания — целое от 1 до 24"
 
 
@@ -117,10 +122,17 @@ def ticker_live(until_at: datetime | None, now: datetime) -> bool:
 # --- тело запроса -------------------------------------------------------------
 
 def _message(value) -> str:
-    """Текст строки: переводы строк → пробел, 1…200 символов после strip()."""
+    """Текст строки: переводы строк и табуляции → один пробел, 1…200 символов после strip().
+
+    Прочие управляющие символы (NUL, ESC, DEL, C1) и одинокие суррогаты — ValueError: они ломают кадр
+    агента, а суррогат Postgres не принимает (был бы 500).
+    """
     if not isinstance(value, str):
         raise ValueError("Текст строки не может быть пустым")
-    text = _NEWLINES.sub(" ", value).strip()
+    text = _NEWLINES.sub(" ", value)
+    if _BAD_CHARS.search(text):                    # до strip(): он молча съел бы \x1c…\x1f по краям
+        raise ValueError(_BAD_CHARS_TEXT)
+    text = text.strip()
     if not text:
         raise ValueError("Текст строки не может быть пустым")
     if len(text) > MAX_LEN:
@@ -174,6 +186,9 @@ def parse_ticker_body(body: dict, now: datetime, keep_term: bool = False) -> dic
     `keep_term=True` — для правки: если срок в теле не задан ни `term`, ни `duration`, то
     term_given=False и until_at=None, а вызывающий оставляет прежний срок строки. Без keep_term
     срок не задан = «до снятия», term_given=True. `term: null` считается «не задан».
+
+    Правка (keep_term=True) обязана сказать «где»: ни `target`, ни старого `is_all` — ValueError «Укажите,
+    где показывать строку», иначе строка молча стала бы «на все экраны». Запуск без «где» по-прежнему «все».
     """
     if not isinstance(body, dict):
         raise ValueError("Ожидается JSON-объект со строкой")
@@ -184,6 +199,8 @@ def parse_ticker_body(body: dict, now: datetime, keep_term: bool = False) -> dic
 
     target = body.get("target")
     if target is None:
+        if keep_term and body.get("is_all") is None:
+            raise ValueError(_NO_TARGET_TEXT)          # правка без «где» не должна тихо расширять строку до «все экраны»
         target = "all" if body.get("is_all", True) else "screens"
     if target not in TARGETS:
         raise ValueError(_WHERE_TEXT)
@@ -313,11 +330,12 @@ def screen_reason(ticker_id: int, screen: dict, changed_at: datetime, now: datet
     return "not_confirmed"
 
 
-def summarize(rows: list[tuple[str, str]]) -> dict:
-    """Пары (имя экрана, причина) → {total, running, problems: [{screen, reason, text}]}.
+def summarize(rows: list[tuple[int, str, str]]) -> dict:
+    """Тройки (id экрана, имя экрана, причина) → {total, running, problems: [{screen_id, screen, reason, text}]}.
 
-    В problems — всё, что не «бежит», в порядке входа.
+    В problems — всё, что не «бежит», в порядке входа. `screen_id` нужен панели: имена экранов могут
+    повторяться, и по имени она нашла бы чужой экран.
     """
-    problems = [{"screen": name, "reason": reason, "text": REASON_TEXT[reason]}
-                for name, reason in rows if reason != "running"]
+    problems = [{"screen_id": sid, "screen": name, "reason": reason, "text": REASON_TEXT[reason]}
+                for sid, name, reason in rows if reason != "running"]
     return {"total": len(rows), "running": len(rows) - len(problems), "problems": problems}
