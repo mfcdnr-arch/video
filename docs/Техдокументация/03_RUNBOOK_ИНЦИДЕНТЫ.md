@@ -240,6 +240,8 @@ docker exec ds_postgres psql -U display_user -d display_system -c "SELECT id, me
 docker exec -i ds_postgres psql -U display_user -d display_system < server/migrations/034_ticker_redesign.sql
 docker compose restart api celery
 ```
+Перезапуск api и celery безвреден (на секунды прерывает панель и фоновые задачи) — см.
+[08](../Инструкции/08_ОБНОВЛЕНИЕ_СЕРВЕРА.md), «Порядок».
 
 ---
 
