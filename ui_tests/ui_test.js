@@ -31,7 +31,13 @@
  *      E2E_ALLOW_BROADCAST=1 (на стенде): до следующего часа → жёлтая полоса →
  *      «Сменить плейлист» (окно) → «Выключить»; прежнее состояние эфира
  *      возвращается в конце, даже если проверка упала.
- *   6. Копит ошибки консоли, необработанные исключения и ответы HTTP ≥400.
+ *   6. «Бегущая строка»: шаблон (создать кнопкой «+ сохранить как шаблон», выбрать, обновить,
+ *      удалить), запуск на «Экраны» → свой тестовый экран «на N минут», подтверждение экрана
+ *      (heartbeat как у агента 1.4.0 с ticker_state → «бежит на 1 из 1»), «✎ Изменить»
+ *      (срок прежний), «Снять» с подтверждением и записи журнала. Всё — только на собственный
+ *      тестовый экран прогона. Запуск на «Все экраны» идёт на ВСЕ экраны сети и выполняется
+ *      только при E2E_ALLOW_BROADCAST=1 (на стенде).
+ *   7. Копит ошибки консоли, необработанные исключения и ответы HTTP ≥400.
  *
  * Любая ошибка консоли/JS и любой ответ ≥400 — это провал прогона: именно
  * так выглядели дефекты, которые ловили руками.
@@ -43,14 +49,17 @@
  * созданный по ходу, удаляется страховочной уборкой по названию. Показ идёт
  * только на собственный экран прогона «E2E_стенд_…», а не на «Все экраны
  * сети»: даже при жёстком обрыве прогона настоящие экраны его не получат.
- * Единственное исключение — общий эфир при E2E_ALLOW_BROADCAST=1: он по своей
- * природе идёт на ВСЕ экраны сети (только на стенде), и при жёстком обрыве
- * прогона его нужно выключить вручную.
+ * Бегущая строка прогона («E2E_строка_…») тоже идёт только на этот экран; строки и
+ * шаблоны с такой меткой убираются в конце всегда, до удаления самого экрана.
+ * Исключения — при E2E_ALLOW_BROADCAST=1 (только на стенде): общий эфир и бегущая
+ * строка «на все экраны» по своей природе идут на ВСЕ экраны сети, и при жёстком
+ * обрыве прогона их нужно снять вручную (эфир выключить, строку «E2E_строка_…» снять).
  *
  * Запуск — через ui_test.sh (поднимает контейнер с Chromium).
  * Переменные: DS_URL (по умолч. http://nginx), ADMIN_USER, ADMIN_PASS,
- * E2E_ALLOW_BROADCAST=1 — шаг с включением общего эфира (он идёт на ВСЕ экраны,
- * только на стенде; без переменной шаг пропускается с пометкой).
+ * E2E_ALLOW_BROADCAST=1 — шаги с включением общего эфира и запуском бегущей строки
+ * «на все экраны» (они идут на ВСЕ экраны, только на стенде; без переменной шаги
+ * пропускаются с пометкой).
  */
 const puppeteer = require('puppeteer');
 
@@ -65,6 +74,7 @@ const CLIP_QUERY = `ролик_${STAMP}`;        // часть названия:
 const FIXTURE_SCREEN = `E2E_стенд_${STAMP}`;
 const DUP_TITLE = `E2E_дубль_${STAMP}`;
 const NL_PLAYLIST = `E2E_эфир_${STAMP}`;      // плейлист для страницы «Эфир сети» (свой, отдельно от цикла «плейлист»)
+const TK_TAG = `E2E_строка_${STAMP}`;          // метка бегущих строк и шаблонов прогона: по ней идёт уборка
 const BC_ALLOWED = process.env.E2E_ALLOW_BROADCAST === '1';
 
 // Разделы левого меню: [data-nav, заголовок в шапке].
@@ -107,7 +117,7 @@ const SAFE_ACTIONS = new Set([
   'settings-run-selfcheck', 'settings-open-my-password-form',
   'settings-cancel-my-password', 'settings-edit-user',
   'settings-close-edit-user-modal',
-  'ticker-target-all', 'ticker-target-one', 'ticker-pick-color', 'ticker-toggle-screen',
+  'ticker-details', 'ticker-pick-color', 'ticker-speed', 'ticker-term', 'ticker-target',
   'dashboard-open-broadcast',
   'nl-open-playlist', 'nl-close-drawer',
   'adv-open', 'adv-back', 'adv-tab', 'adv-apply-period',
@@ -275,6 +285,41 @@ async function heartbeat(page, id, token, file) {
     });
     return r.status;
   }, id, token, file);
+}
+
+/** Сигнал тестового экрана «как у агента 1.4.0»: версия и ticker_state (id строк, которые у него бегут;
+ *  «Стоп» и «выключен по расписанию» — нет). Возвращает HTTP-код. Без этого панель считает агент
+ *  «старым» («без подтверждения»), потому что обычный heartbeat прогона версии не несёт. */
+async function tickerHeartbeat(page, id, token, file, ids, stopped = false) {
+  return page.evaluate(async (id, token, body) => {
+    const r = await fetch('/api/heartbeat/' + id, {
+      method: 'POST',
+      headers: { 'X-Token': token, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return r.status;
+  }, id, token, { status: 'online', playing_file: file || null, agent_version: '1.4.0',
+                  ticker_state: { ids, stopped: !!stopped, screen_off: false } });
+}
+
+/** Убрать бегущие строки и шаблоны прогона (текст начинается с метки TK_TAG). Строки — первыми и ДО
+ *  удаления тестового экрана: иначе строка осталась бы в панели без экранов. Ничего не печатает,
+ *  если убирать нечего; возвращает число убранного. Ошибки не бросает — они идут в bad(). */
+async function cleanupTickers(page) {
+  let n = 0;
+  const live = await apiCall(page, 'GET', '/tickers');
+  for (const t of (Array.isArray(live.data) ? live.data : []).filter(t => String(t.message).startsWith(TK_TAG))) {
+    const r = await apiCall(page, 'DELETE', '/tickers/' + t.id);
+    if (r.status === 200) { n++; ok(`бегущая строка прогона снята (id ${t.id})`); }
+    else bad(`бегущая строка прогона не снялась (id ${t.id}, HTTP ${r.status})`);
+  }
+  const tpl = await apiCall(page, 'GET', '/ticker-templates');
+  for (const t of (Array.isArray(tpl.data) ? tpl.data : []).filter(t => String(t.message).startsWith(TK_TAG))) {
+    const r = await apiCall(page, 'DELETE', '/ticker-templates/' + t.id);
+    if (r.status === 200) { n++; ok(`шаблон бегущей строки прогона удалён (id ${t.id})`); }
+    else bad(`шаблон бегущей строки прогона не удалился (id ${t.id}, HTTP ${r.status})`);
+  }
+  return n;
 }
 
 /** «Сейчас» глазами сервера (наивное МСК из GET /network/live): дата, час, минута, секунда. */
@@ -1195,6 +1240,294 @@ async function restoreBroadcast(page, fx) {
       try { await restoreBroadcast(page, fx); } catch (e) { bad('эфир не возвращён: ' + e.message.split('\n')[0]); }
     }
 
+    // ── 6б. Бегущая строка: шаблон → запуск → подтверждение → «Стоп» → правка → снятие ──
+    // Путь человека, но ТОЛЬКО на собственный тестовый экран прогона (цель «Экраны»): строка не должна
+    // засветиться у посетителей, если прогон идёт на боевом сервере. Экран подаёт сигнал «как агент
+    // 1.4.0» (heartbeat с ticker_state) — по нему панель считает «бежит на X из N». Метка TK_TAG в тексте
+    // строк и шаблонов нужна для уборки: она идёт всегда, в том числе при падении шага.
+    // «Все экраны» — только при E2E_ALLOW_BROADCAST=1 (стенд).
+    head('Бегущая строка: шаблон, запуск на свой экран, правка, снятие');
+    try {
+      if (!fx.screenId || !fx.token) throw new Error('нет тестового экрана — строку запускать некуда');
+      dialogMode = 'dismiss';
+      const TPL_TEXT = `${TK_TAG} (шаблон)`;
+      const EDIT_TEXT = `${TK_TAG} (правка)`;
+      const tkBeat = (ids, stopped) => tickerHeartbeat(page, fx.screenId, fx.token, fx.clipFile, ids, stopped);
+      const tkSetMsg = (v) => page.$eval('#tk-msg', (el, val) => {
+        el.value = val; el.dispatchEvent(new Event('input', { bubbles: true }));
+      }, v);
+      // Карточка прогона в «Сейчас идут» (по метке в тексте): текст, «где · срок · кто», «бежит на X из N», подробности.
+      const tkCard = () => page.evaluate(tag => {
+        const c = [...document.querySelectorAll('#tk-live .tk-card')]
+          .find(x => x.querySelector('.tk-text').textContent.includes(tag));
+        const sq = e => e ? e.innerText.replace(/\s+/g, ' ').trim() : '';
+        return c ? { id: Number(c.dataset.tickerId), text: c.querySelector('.tk-text').textContent,
+                     meta: sq(c.querySelector('.tk-meta')), conf: sq(c.querySelector('.tk-conf')),
+                     det: sq(c.querySelector('.tk-det')) } : null;
+      }, TK_TAG);
+      // Ждать карточку, подходящую под условие; возвращает {ok, c} — последнее увиденное состояние для сообщения.
+      const tkWaitCard = async (pred, timeout = 15000) => {
+        const t0 = Date.now();
+        for (;;) {
+          const c = await tkCard();
+          if (pred(c)) return { ok: true, c };
+          if (Date.now() - t0 > timeout) return { ok: false, c };
+          await sleep(300);
+        }
+      };
+      const tkOpen = async () => {          // чистая страница: форма пустая, данные прочитаны заново
+        await gotoSection(page, 'dash');
+        await gotoSection(page, 'ticker');
+      };
+      const tkList = async () => { const r = await apiCall(page, 'GET', '/tickers'); return Array.isArray(r.data) ? r.data : []; };
+      // GET /tickers отдаёт прежний (короткий) вид; срок, экраны и «кто изменил» — только в обзоре
+      const tkOverview = async () => { const r = await apiCall(page, 'GET', '/tickers/overview'); return (r.data || {}).tickers || []; };
+      const tkTemplates = async () => { const r = await apiCall(page, 'GET', '/ticker-templates'); return Array.isArray(r.data) ? r.data : []; };
+      const tkAudit = async (title, part) => {
+        const r = await apiCall(page, 'GET', '/audit?limit=100');
+        return (Array.isArray(r.data) ? r.data : []).some(x =>
+          x.event_type === 'ticker' && x.title === title && String(x.detail || '').includes(part));
+      };
+      const formState = () => page.evaluate(() => {
+        const on = sel => { const el = document.querySelector(sel); return el ? el.dataset : {}; };
+        const mins = document.getElementById('tk-minutes');
+        return { title: (document.getElementById('tk-title') || {}).textContent || '',
+                 msg: (document.getElementById('tk-msg') || {}).value,
+                 color: on('[data-action="ticker-pick-color"][aria-pressed="true"]').color,
+                 speed: on('[data-action="ticker-speed"][aria-pressed="true"]').speed,
+                 target: on('[data-action="ticker-target"][aria-pressed="true"]').target,
+                 term: on('[data-action="ticker-term"][aria-pressed="true"]').term,
+                 minutes: mins ? mins.value : null,
+                 hasSave: !!document.getElementById('tk-save'), hasStart: !!document.getElementById('tk-start'),
+                 hasUpdate: !!document.querySelector('[data-action="ticker-update-template"]') };
+      });
+
+      // экран «как агент 1.4.0», пока ничего не бежит: у новой строки будет «ждём подтверждения», а не «старый агент»
+      step = 'бегущая строка: страница';
+      (await tkBeat([])) === 200 ? ok('сигнал тестового экрана как у агента 1.4.0 (ticker_state) принят')
+                                 : bad('сигнал тестового экрана как у агента 1.4.0 не принят');
+      await gotoSection(page, 'ticker');
+      const pg = await page.evaluate(() => ({
+        live: (document.getElementById('tk-live') || {}).innerText || '',
+        title: ((document.getElementById('tk-title') || {}).textContent || '').trim(),
+        count: ((document.getElementById('tk-count') || {}).textContent || '').trim(),
+        startOff: (document.getElementById('tk-start') || {}).disabled,
+        saveTpl: !!document.querySelector('[data-action="ticker-save-template"]'),
+        cards: document.querySelectorAll('#tk-live .tk-card').length }));
+      (/Сейчас идут/.test(pg.live) && pg.title === 'Новая строка' && pg.count === '0 / 200' && pg.startOff === true && pg.saveTpl)
+        ? ok(`страница: «Сейчас идут» (карточек: ${pg.cards}), «Новая строка», счётчик «0 / 200», «Запустить» неактивна`)
+        : bad(`страница «Бегущая строка» не та: «${pg.live.replace(/\s+/g, ' ').slice(0, 60)}», «${pg.title}», «${pg.count}»`);
+
+      // ── конструктор: текст, превью, предел 200 знаков ──
+      step = 'бегущая строка: текст и превью';
+      await page.click('#tk-msg');
+      await page.type('#tk-msg', TPL_TEXT);
+      const typed = await page.evaluate(() => ({ prev: document.getElementById('tk-prev').textContent,
+        count: document.getElementById('tk-count').textContent.trim() }));
+      (typed.prev === TPL_TEXT && typed.count === `${TPL_TEXT.length} / 200`)
+        ? ok(`текст попал в превью, счётчик «${typed.count}»`) : bad(`превью или счётчик не те: «${typed.prev}», «${typed.count}»`);
+      await tkSetMsg('х'.repeat(201));
+      const over = await page.evaluate(() => ({ count: document.getElementById('tk-count').textContent.trim(),
+        off: document.getElementById('tk-start').disabled }));
+      (over.count === '201 / 200' && over.off) ? ok('201 знак: счётчик «201 / 200», «Запустить» неактивна')
+                                               : bad(`предел 200 знаков не держит: «${over.count}», неактивна=${over.off}`);
+      await tkSetMsg(TPL_TEXT);
+
+      // ── шаблон: сохранить кнопкой ──
+      step = 'бегущая строка: сохранить шаблон';
+      await page.click('[data-action="ticker-pick-color"][data-color="#ff6b5e"]');
+      await page.click('[data-action="ticker-speed"][data-speed="slow"]');
+      await page.click('[data-action="ticker-term"][data-term="minutes"]');
+      await page.click('[data-action="ticker-minutes"][data-min="15"]');
+      await page.click('[data-action="ticker-save-template"]');
+      let tpl = null;
+      for (let i = 0; i < 25 && !tpl; i++) {
+        tpl = (await tkTemplates()).find(t => t.message === TPL_TEXT) || null;
+        if (!tpl) await sleep(300);
+      }
+      (tpl && tpl.color === '#ff6b5e' && tpl.speed === 'slow' && tpl.term && tpl.term.kind === 'minutes' && tpl.term.minutes === 15)
+        ? ok(`«+ сохранить как шаблон»: шаблон создан (id ${tpl.id}), красный, медленно, 15 минут`)
+        : bad(`шаблон не создался или записан не так: ${JSON.stringify(tpl)}`);
+      if (!tpl) throw new Error('шаблон не создан — запускать из него нечего');
+      const chipSel = `[data-action="ticker-template"][data-template-id="${tpl.id}"]`;
+      (await waitUntil(page, sel => !!document.querySelector(sel), chipSel, 8000))
+        ? ok('чип шаблона появился на странице') : bad('чипа шаблона нет на странице');
+
+      // ── запуск из шаблона на свой экран «на N минут» ──
+      step = 'бегущая строка: шаблон → «Экраны» → свой экран';
+      await tkOpen();
+      await page.click(chipSel);
+      const fromTpl = await formState();
+      (fromTpl.msg === TPL_TEXT && fromTpl.color === '#ff6b5e' && fromTpl.speed === 'slow' && fromTpl.term === 'minutes'
+        && fromTpl.minutes === '15' && fromTpl.hasUpdate)
+        ? ok('клик по шаблону заполнил текст, цвет, скорость и срок; появилась «Обновить шаблон»')
+        : bad(`шаблон заполнил форму не так: ${JSON.stringify(fromTpl)}`);
+      await page.click('[data-action="ticker-target"][data-target="screens"]');
+      const noScr = await page.$eval('#tk-start', el => el.disabled);
+      noScr ? ok('«Экраны»: пока экран не выбран, «Запустить» неактивна') : bad('«Запустить» доступна без выбранного экрана');
+      const scrSel = `[data-action="ticker-toggle-screen"][data-screen-id="${fx.screenId}"]`;
+      await page.waitForSelector(scrSel, { timeout: 10000 });
+      await page.click(scrSel);
+      await page.click('[data-action="ticker-minutes"][data-min="30"]');
+      const ready = await page.evaluate(sel => ({ on: document.querySelector(sel).getAttribute('aria-pressed'),
+        start: document.getElementById('tk-start').textContent.trim(), off: document.getElementById('tk-start').disabled,
+        mins: document.getElementById('tk-minutes').value }), scrSel);
+      (ready.on === 'true' && ready.start === '▶ Запустить на 1 экране' && !ready.off && ready.mins === '30')
+        ? ok('выбран только свой экран, срок «на 30 минут», кнопка «▶ Запустить на 1 экране»')
+        : bad(`перед запуском: экран ${ready.on}, кнопка «${ready.start}», неактивна=${ready.off}, минут «${ready.mins}»`);
+
+      step = 'бегущая строка: запуск';
+      await page.click('#tk-start');
+      const started = await tkWaitCard(c => !!c);
+      if (!started.ok) throw new Error('после «Запустить» карточки в «Сейчас идут» нет');
+      const tk = (await tkOverview()).find(t => t.message === TPL_TEXT);
+      if (!tk) throw new Error('строки нет в обзоре после запуска');
+      (tk.target === 'screens' && !tk.is_all && JSON.stringify(tk.screen_ids) === JSON.stringify([fx.screenId])
+        && tk.color === '#ff6b5e' && tk.speed === 'slow' && tk.started_by === USER
+        && tk.remaining_seconds >= 1700 && tk.remaining_seconds <= 1800)
+        ? ok(`строка запущена только на свой экран, ~30 минут, запустил ${USER} (id ${tk.id})`)
+        : bad(`запущена не так: цель ${tk.target}, экраны ${JSON.stringify(tk.screen_ids)}, осталось ${tk.remaining_seconds} с, запустил ${tk.started_by}`);
+      const c1 = started.c;
+      (c1.id === tk.id && c1.text === TPL_TEXT && c1.meta.includes(FIXTURE_SCREEN) && /ещё \d+ мин/.test(c1.meta)
+        && c1.meta.includes('запустил ' + USER))
+        ? ok(`карточка: «${c1.meta}»`) : bad(`карточка не та: «${c1.text}» / «${c1.meta}»`);
+      (/бежит на 0 из 1/.test(c1.conf) && /ждём подтверждения/.test(c1.conf))
+        ? ok('сразу после запуска: «бежит на 0 из 1 — ждём подтверждения»') : bad(`подтверждение сразу после запуска: «${c1.conf}»`);
+      const cleared = await formState();
+      (cleared.msg === '' && cleared.target === 'all' && cleared.term === 'cancel')
+        ? ok('конструктор очистился после запуска') : bad(`конструктор не очистился: ${JSON.stringify(cleared)}`);
+      (await tkAudit('Бегущая строка запущена', TPL_TEXT)) ? ok('в журнале: «Бегущая строка запущена»')
+                                                           : bad('в журнале нет записи «Бегущая строка запущена»');
+
+      // ── подтверждение от экрана: heartbeat агента 1.4.0 → автообновление страницы (до 15 с) ──
+      step = 'бегущая строка: бежит на 1 из 1';
+      (await tkBeat([tk.id])) === 200 ? ok('экран сообщил: строка бежит (ticker_state.ids)') : bad('сигнал экрана со строкой не принят');
+      const running = await tkWaitCard(c => !!c && /бежит на 1 из 1/.test(c.conf), 35000);
+      running.ok ? ok('страница сама обновилась: «бежит на 1 из 1»') : bad(`«бежит на 1 из 1» не появилось за 35 с: «${(running.c || {}).conf}»`);
+      await page.click(`[data-ticker-id="${tk.id}"] [data-action="ticker-details"]`);
+      const opened = await tkCard();
+      (opened && /Все экраны подтвердили/.test(opened.det)) ? ok('«бежит на 1 из 1 ▾» раскрыл: «Все экраны подтвердили»')
+                                                              : bad(`подробности не раскрылись: «${(opened || {}).det}»`);
+      await page.click(`[data-ticker-id="${tk.id}"] [data-action="ticker-details"]`);
+      const shut = await tkCard();
+      (shut && shut.det === '') ? ok('повторный клик свернул подробности') : bad('подробности не свернулись');
+
+      // ── «Стоп» на экране строку не снимает ──
+      step = 'бегущая строка: «Стоп» на экране';
+      const stop = await apiCall(page, 'POST', '/command/stop/' + fx.screenId);
+      stop.status === 200 ? ok('«Стоп» тестовому экрану отправлен') : bad(`«Стоп» экрану: HTTP ${stop.status}`);
+      (await tkBeat([], true)) === 200 ? ok('экран сообщил: показ остановлен, строка не бежит') : bad('сигнал остановленного экрана не принят');
+      ((await tkList()).some(t => t.id === tk.id)) ? ok('«Стоп» строку не снял: она осталась в списке') : bad('«Стоп» снял бегущую строку!');
+      await tkOpen();
+      const stopped = await tkWaitCard(c => !!c && /бежит на 0 из 1/.test(c.conf) && /остановлен/.test(c.conf));
+      stopped.ok ? ok('у карточки: «бежит на 0 из 1 — остановлен («Стоп»)»') : bad(`причина после «Стоп»: «${(stopped.c || {}).conf}»`);
+      const resume = await apiCall(page, 'POST', '/command/resume/' + fx.screenId);
+      resume.status === 200 ? ok('«Показ» тестовому экрану отправлен') : bad(`«Показ» экрану: HTTP ${resume.status}`);
+      (await tkBeat([tk.id], false)) === 200 ? ok('экран сообщил: строка снова бежит') : bad('сигнал возобновлённого экрана не принят');
+      await tkOpen();
+      const resumed = await tkWaitCard(c => !!c && /бежит на 1 из 1/.test(c.conf));
+      resumed.ok ? ok('после «Показ»: «бежит на 1 из 1»') : bad(`после «Показ»: «${(resumed.c || {}).conf}»`);
+
+      // ── изменить: срок остаётся прежним ──
+      step = 'бегущая строка: изменить';
+      await page.click(`[data-ticker-id="${tk.id}"] [data-action="ticker-edit"]`);
+      const ed = await formState();
+      (ed.title.trim() === 'Правка строки' && ed.msg === TPL_TEXT && ed.hasSave && !ed.hasStart && ed.term === 'keep'
+        && ed.target === 'screens')
+        ? ok('«✎ Изменить»: конструктор в режиме правки («Сохранить изменения», срок «Не менять»)')
+        : bad(`правка открылась не так: ${JSON.stringify(ed)}`);
+      await tkSetMsg(EDIT_TEXT);
+      await page.click('[data-action="ticker-pick-color"][data-color="#ffffff"]');
+      await page.click('#tk-save');
+      const edited = await tkWaitCard(c => !!c && c.text === EDIT_TEXT);
+      edited.ok ? ok('«Сохранить изменения»: в карточке новый текст') : bad(`текст в карточке не сменился: «${(edited.c || {}).text}»`);
+      const tk2 = (await tkOverview()).find(t => t.id === tk.id);
+      (tk2 && tk2.message === EDIT_TEXT && tk2.color === '#ffffff' && tk2.until_at === tk.until_at && tk2.changed_by === USER)
+        ? ok('на сервере: новый текст и цвет, срок прежний (until_at не сдвинулся), изменил ' + USER)
+        : bad(`после правки: ${JSON.stringify(tk2 && { message: tk2.message, color: tk2.color, until_at: tk2.until_at, was: tk.until_at, changed_by: tk2.changed_by })}`);
+      const back = await formState();
+      (back.title.trim() === 'Новая строка' && back.hasStart && !back.hasSave) ? ok('после сохранения конструктор вернулся к «Новая строка»')
+                                                                              : bad(`конструктор после правки: ${JSON.stringify(back)}`);
+      (await tkAudit('Бегущая строка изменена', EDIT_TEXT)) ? ok('в журнале: «Бегущая строка изменена»')
+                                                            : bad('в журнале нет записи «Бегущая строка изменена»');
+
+      // ── снять ──
+      step = 'бегущая строка: снять';
+      dialogMode = 'accept';             // confirm «Снять бегущую строку?»
+      await page.click(`[data-ticker-id="${tk.id}"] [data-action="ticker-stop"]`);
+      const off = await tkWaitCard(c => c === null, 10000);
+      dialogMode = 'dismiss';
+      off.ok ? ok('«Снять» (с подтверждением): карточка ушла') : bad('после «Снять» карточка осталась');
+      ((await tkList()).some(t => t.id === tk.id)) ? bad('после «Снять» строка осталась в GET /tickers') : ok('строки нет в списке на сервере');
+      (await tkAudit('Бегущая строка снята', EDIT_TEXT)) ? ok('в журнале: «Бегущая строка снята»')
+                                                         : bad('в журнале нет записи «Бегущая строка снята»');
+
+      // ── шаблон: обновить и удалить ──
+      step = 'бегущая строка: обновить и удалить шаблон';
+      await tkOpen();
+      await page.click(chipSel);
+      const NEW_TPL = `${TPL_TEXT} +`;
+      await page.click('#tk-msg');
+      await page.keyboard.press('End');
+      await page.keyboard.type(' +');
+      await page.click('[data-action="ticker-update-template"]');
+      const upd = await waitUntil(page, ([sel, t]) => {
+        const b = document.querySelector(sel);
+        return !!b && b.textContent.trim() === t;
+      }, [chipSel + ' span', NEW_TPL], 8000);
+      const tpl2 = (await tkTemplates()).find(t => t.id === tpl.id);
+      (upd && tpl2 && tpl2.message === NEW_TPL && tpl2.color === '#ff6b5e' && tpl2.speed === 'slow')
+        ? ok('«Обновить шаблон»: шаблон переписан, чип с новым текстом') : bad(`шаблон не обновился: ${JSON.stringify(tpl2)}`);
+      dialogMode = 'accept';             // confirm «Удалить шаблон «…»?»
+      await page.click(`[data-action="ticker-template-delete"][data-template-id="${tpl.id}"]`);
+      const tplGone = await waitUntil(page, sel => !document.querySelector(sel), chipSel, 8000);
+      dialogMode = 'dismiss';
+      tplGone ? ok('«×» (с подтверждением): чип шаблона ушёл') : bad('чип шаблона остался после удаления');
+      ((await tkTemplates()).some(t => t.id === tpl.id)) ? bad('шаблон остался на сервере') : ok('шаблона нет на сервере');
+
+      // ── «Все экраны» — только на стенде ──
+      if (!BC_ALLOWED) {
+        console.log('  – бегущая строка «на все экраны» — пропущено (задайте E2E_ALLOW_BROADCAST=1 на стенде)');
+      } else {
+        step = 'бегущая строка: все экраны';
+        const ALL_TEXT = `${TK_TAG} (все экраны)`;
+        await tkOpen();
+        const nAll = (((await apiCall(page, 'GET', '/tickers/overview')).data || {}).screens || []).length;
+        await tkSetMsg(ALL_TEXT);
+        await page.click('[data-action="ticker-target"][data-target="all"]');
+        await page.click('[data-action="ticker-term"][data-term="minutes"]');
+        await page.click('[data-action="ticker-minutes"][data-min="15"]');
+        const allBtn = await page.$eval('#tk-start', el => el.textContent.trim());
+        (allBtn.startsWith('▶ Запустить на ' + nAll + ' экран')) ? ok(`«Все экраны»: кнопка «${allBtn}»`)
+                                                              : bad(`кнопка «Все экраны»: «${allBtn}», экранов в сети ${nAll}`);
+        await page.click('#tk-start');
+        const all = await tkWaitCard(c => !!c);
+        (all.ok && (nAll === 1 ? /на единственном экране/ : new RegExp(`на всех ${nAll} экран`)).test(all.c.meta))
+          ? ok(`карточка: «${all.c.meta}»`) : bad(`карточка «Все экраны»: «${(all.c || {}).meta}»`);
+        const ov = (await apiCall(page, 'GET', '/tickers/overview')).data || {};
+        const mine = (ov.screens || []).find(s => s.id === fx.screenId);
+        (mine && mine.live_count === 1) ? ok('тестовый экран получил строку «на все экраны» (live_count = 1)')
+                                        : bad(`у тестового экрана live_count = ${mine && mine.live_count}`);
+        dialogMode = 'accept';
+        await page.click(`[data-ticker-id="${all.c.id}"] [data-action="ticker-stop"]`);
+        const allGone = await tkWaitCard(c => c === null, 10000);
+        dialogMode = 'dismiss';
+        allGone.ok ? ok('строка «на все экраны» снята') : bad('строка «на все экраны» не снялась');
+      }
+
+      step = 'бегущая строка: итог';
+      const left = (await tkList()).filter(t => t.message.startsWith(TK_TAG)).length
+                 + (await tkTemplates()).filter(t => t.message.startsWith(TK_TAG)).length;
+      left === 0 ? ok('строк и шаблонов прогона не осталось') : bad(`после цикла осталось строк и шаблонов прогона: ${left}`);
+    } catch (e) {
+      bad('цикл «Бегущая строка» прерван на шаге «' + step + '»: ' + e.message.split('\n')[0]);
+    } finally {
+      dialogMode = 'dismiss';
+      expected = [];
+      await closeModals(page).catch(() => {});
+      try { await cleanupTickers(page); } catch (e) { bad('бегущие строки прогона не убраны: ' + e.message.split('\n')[0]); }
+    }
+
     // ── 7. Карточка рекламодателя: все вкладки открываются ────────────────
     head('Карточка рекламодателя');
     step = 'открытие карточки';
@@ -1326,6 +1659,8 @@ async function restoreBroadcast(page, fx) {
       dialogMode = 'dismiss';
       try {
         await closeModals(page);
+        // Бегущие строки и шаблоны прогона — до удаления экрана (в норме их уже нет: цикл убрал сам)
+        await cleanupTickers(page);
         // Плейлист ищем по названию: цикл мог упасть до удаления. Показы уходят вместе с ним.
         const pls = await apiCall(page, 'GET', '/playlists');
         for (const p of (pls.data || []).filter(p => p.name === PLAYLIST_NAME || p.name === NL_PLAYLIST)) {
