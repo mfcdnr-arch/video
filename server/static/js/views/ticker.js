@@ -324,11 +324,14 @@
 
   function templatesHtml(st){
     const list = st.data ? st.data.templates : [];
-    return list.map(t => `<span class="tk-tpl">
+    const cur = list.find(t => t.id === st.tplId);          // шаблон, из которого заполнена форма (пока не ушли из его контекста)
+    return list.map(t => `<span class="tk-tpl${t === cur ? ' on' : ''}">
         <button type="button" class="tk-tpl-b" data-action="ticker-template" data-template-id="${t.id}" title="${esc(t.message)} — ${esc(termWords(t))}"><i style="background:${safeColor(t.color)}"></i><span>${esc(t.message)}</span></button>
         <button type="button" class="tk-tpl-x" data-action="ticker-template-delete" data-template-id="${t.id}" aria-label="Удалить шаблон «${esc(t.message)}»" title="Удалить шаблон">×</button>
       </span>`).join('')
-      + '<button type="button" class="tk-tpl-add" data-action="ticker-save-template">+ сохранить как шаблон</button>';
+      + '<button type="button" class="tk-tpl-add" data-action="ticker-save-template">+ сохранить как шаблон</button>'
+      + (cur && st.editId == null && canWrite() ? `<button type="button" class="tk-tpl-add" data-action="ticker-update-template"${st.busy ? ' disabled' : ''}
+        title="Записать текущие текст, цвет, скорость и срок в шаблон «${esc(cur.message)}»">Обновить шаблон</button>` : '');
   }
 
   function lookHtml(st){
@@ -399,10 +402,10 @@
     const dis = st.busy || problem ? ' disabled' : '';
     const why = problem && !st.busy ? `<span class="tk-why">${esc(problem)}</span>` : '';
     if(edit){
-      return `<button type="button" class="btn primary" id="tk-save" data-action="ticker-save"${dis}>${st.busy ? 'Сохраняю…' : 'Сохранить изменения'}</button>
+      return `<button type="button" class="btn primary" id="tk-save" data-action="ticker-save"${dis}>${st.submitting ? 'Сохраняю…' : 'Сохранить изменения'}</button>
         <button type="button" class="btn" data-action="ticker-cancel-edit"${st.busy ? ' disabled' : ''}>Отмена</button>${why}`;
     }
-    return `<button type="button" class="btn primary" id="tk-start" data-action="ticker-start"${dis}>${st.busy ? 'Запускаю…' : '▶ Запустить' + (n > 0 ? ' ' + onScreens(n) : '')}</button>${why}`;
+    return `<button type="button" class="btn primary" id="tk-start" data-action="ticker-start"${dis}>${st.submitting ? 'Запускаю…' : '▶ Запустить' + (n > 0 ? ' ' + onScreens(n) : '')}</button>${why}`;
   }
 
   function editHtml(st){
@@ -483,6 +486,7 @@
         const d = await api('/tickers/overview', {signal: ctl.signal});
         if(!alive(st)) return;
         st.data = d;
+        if(st.tplId != null && !d.templates.some(t => t.id === st.tplId)) st.tplId = null;     // шаблон удалили в другом месте
         st.error = null;
         st.at = Date.now();
         syncClock(d.generated_at);
@@ -551,6 +555,7 @@
     }else{
       f.term = 'cancel';
     }
+    st.tplId = id;
     touch(st);
     syncInput(st);
     repaintForm(st);
@@ -568,7 +573,7 @@
   }
 
   function setBusy(st, on){
-    st.busy = on;
+    st.busy = st.submitting = on;
     const form = $('tk-form');
     if(form) form.inert = on;
     paintForm(st);
@@ -580,6 +585,7 @@
     if(st.editId == null) st.draft = JSON.parse(JSON.stringify(st.form));     // начатая новая строка ждёт возврата
     const exist = (ids, list) => { const o = {}; (ids || []).forEach(i => { if(list.some(x => x.id === i)) o[i] = true; }); return o; };
     st.editId = id;
+    st.tplId = null;
     st.form = Object.assign(blankForm(), {message: t.message, color: safeColor(t.color), speed: speedKey(t.speed),
       target: t.target, groups: exist(t.group_ids, st.data.groups), screens: exist(t.screen_ids, st.data.screens), term: 'keep'});
     st.err = '';
@@ -594,6 +600,7 @@
   // Выйти из правки: к начатой до неё новой строке (или пустому конструктору); keep — оставить поля как есть (строку сняли)
   function leaveEdit(st, keep){
     st.editId = null;
+    st.tplId = null;
     if(keep){
       if(st.form.term === 'keep') st.form.term = 'cancel';
     }else{
@@ -649,7 +656,7 @@
     if(ok){
       toast(id != null ? 'Бегущая строка изменена' : 'Бегущая строка запущена');
       if(id != null){ leaveEdit(st, false); }
-      else{ st.form = blankForm(); st.err = ''; syncInput(st); paintAll(st); }
+      else{ st.form = blankForm(); st.tplId = null; st.err = ''; syncInput(st); paintAll(st); }
       await refresh(st);
     }else{
       const btn = $(id != null ? 'tk-save' : 'tk-start');
@@ -680,20 +687,63 @@
     }, 'Бегущая строка снята');
   }
 
+  // Срок формы в виде, который принимает /ticker-templates: час без on_date (он у шаблона не хранится)
+  const templateTerm = f => f.term === 'hour' ? {kind: 'hour', hour: f.hour}
+    : f.term === 'minutes' ? {kind: 'minutes', minutes: minutesOf(f)} : {kind: 'cancel'};
+
+  function templateProblem(st){
+    return textProblem(st) || (st.form.term === 'keep' ? 'Выберите срок шаблона: «До снятия», «До ЧЧ:00» или «На N минут»' : termProblem(st));
+  }
+
+  function templateBody(st){
+    const f = st.form;
+    return JSON.stringify({message: f.message.trim(), color: f.color, speed: f.speed, term: templateTerm(f)});
+  }
+
   function saveTemplate(st){
     if(st.busy || !canWrite() || !st.data) return;
-    const f = st.form;
-    const bad = textProblem(st) || (f.term === 'keep' ? 'Выберите срок шаблона: «До снятия», «До ЧЧ:00» или «На N минут»' : termProblem(st));
+    const bad = templateProblem(st);
     if(bad){ toast(bad); return; }
-    const term = f.term === 'hour' ? {kind: 'hour', hour: f.hour} : f.term === 'minutes' ? {kind: 'minutes', minutes: minutesOf(f)} : {kind: 'cancel'};
-    act(st, () => api('/ticker-templates', {method: 'POST',
-      body: JSON.stringify({message: f.message.trim(), color: f.color, speed: f.speed, term})}), 'Шаблон сохранён');
+    act(st, async () => {
+      await api('/ticker-templates', {method: 'POST', body: templateBody(st)});
+      st.tplId = null;                       // новый шаблон — отдельный; «Обновить» не должен переписать прежний
+    }, 'Шаблон сохранён');
+  }
+
+  // «Обновить шаблон»: текущие текст, цвет, скорость и срок записываются в шаблон, из которого заполнили форму
+  async function updateTemplate(st){
+    if(st.busy || !canWrite() || !st.data || st.tplId == null || st.editId != null) return;
+    const id = st.tplId;
+    if(!st.data.templates.some(t => t.id === id)){ st.tplId = null; paintForm(st); toast('Шаблон не найден — список обновлён'); refresh(st); return; }
+    const bad = templateProblem(st);
+    if(bad){ st.err = bad; paintForm(st); return; }
+    st.busy = true;
+    st.err = '';
+    paintForm(st);                           // кнопка неактивна на время запроса
+    let ok = false;
+    try{
+      await api('/ticker-templates/' + id, {method: 'PUT', body: templateBody(st)});
+      ok = true;
+    }catch(e){
+      if(String(e && e.message) === 'unauthorized') return;
+      if(!alive(st)) return;
+      const msg = errText(e);
+      if(/не найден/i.test(msg)){ st.tplId = null; toast('Шаблон не найден — список обновлён'); }   // его удалили в другом месте
+      else st.err = msg;
+    }
+    st.busy = false;
+    if(ok) toast('Шаблон обновлён');
+    paintForm(st);
+    await refresh(st);
   }
 
   function deleteTemplate(st, id){
     const t = st.data && st.data.templates.find(x => x.id === id);
     if(st.busy || !canWrite() || !t || !confirm(`Удалить шаблон «${t.message}»?`)) return;
-    act(st, () => api('/ticker-templates/' + id, {method: 'DELETE'}), 'Шаблон удалён');
+    act(st, async () => {
+      await api('/ticker-templates/' + id, {method: 'DELETE'});
+      if(st.tplId === id) st.tplId = null;
+    }, 'Шаблон удалён');
   }
 
   // ---- вход в раздел ---------------------------------------------------------------------
@@ -731,7 +781,7 @@
   async function viewTicker(){
     stop(S);
     const st = S = {data: null, error: null, loading: null, again: false, timer: 0, at: 0, busy: false,
-      form: blankForm(), editId: null, draft: null, open: {}, base: null, err: '', prevKey: null, html: {}, box: {}};
+      form: blankForm(), editId: null, tplId: null, submitting: false, draft: null, open: {}, base: null, err: '', prevKey: null, html: {}, box: {}};
     $('view').innerHTML = skeleton(canWrite());
     paintAll(st);
     st.timer = setInterval(() => tick(st), REFRESH_MS);
@@ -760,6 +810,7 @@
         case 'ticker-stop':           return stopTicker(st, id);
         case 'ticker-template':       return canWrite() && !st.busy && st.data && applyTemplate(st, Number(el.dataset.templateId));
         case 'ticker-save-template':  return saveTemplate(st);
+        case 'ticker-update-template': return updateTemplate(st);
         case 'ticker-template-delete': return deleteTemplate(st, Number(el.dataset.templateId));
         case 'ticker-cancel-edit':    return !st.busy && leaveEdit(st, false);
         case 'ticker-start':
