@@ -43,7 +43,6 @@ def test_password_exactly_min_is_ok():
 
 
 def test_password_cyrillic_refused():
-    assert copy_password_problem("пароль-на-копию").startswith("Только латинские")
     assert copy_password_problem("пароль-на-копию") == NOT_ASCII
 
 
@@ -94,6 +93,15 @@ def test_reminder_warn_never():
     ("ui_tests/node_modules/a.js", True),
     ("ds_server_V2_x.tar.gz", True),          # архив в корне — старые выпуски
     ("docs/a.zip", False),                    # а в подпапке это обычный файл проекта
+    ("ds_server_V2_x.tar.xz", True),           # любые сжатия tar: .xz, .bz2, .zst…
+    ("x.tar.bz2", True),
+    ("x.tar.zst", True),
+    ("x.tar.gz.enc", True),                   # и архив с дополнительным суффиксом
+    ("docs/a.tar.xz", False),                 # в подпапке — как и .zip — обычный файл проекта
+    ("docs/x.tar.zst", False),
+    ("star.txt", False),                      # «tar» внутри слова — не архив
+    ("guitar.py", False),
+    ("x.tarball", False),
     (".dev_admin_pass", True),
     ("backups/b.sql.gz", True),
     (".codex/x", True),

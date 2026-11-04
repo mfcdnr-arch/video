@@ -28,7 +28,12 @@ _EXCLUDED_DIRS = frozenset({
     ".git", ".claude", ".codex", ".superpowers", "backups", "__pycache__", "node_modules",
 })
 _EXCLUDED_NAMES = frozenset({".dev_admin_pass", ".DS_Store"})   # пароль стенда разработки и мусор macOS
-_EXCLUDED_ROOT_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".zip")   # старые выпуски-архивы в корне проекта
+
+# Старые выпуски-архивы в корне проекта: .tar с любым сжатием (.tar.gz, .tar.xz,
+# .tar.bz2, .tar.zst…), а также .tgz и .zip. Перечислять сжатия поимённо нельзя —
+# новый формат тихо попал бы в копию и раздул её на гигабайты, поэтому ищем «.tar»
+# в конце имени или перед следующей точкой. «guitar.py» и «x.tarball» не подходят.
+_ROOT_ARCHIVE = re.compile(r"\.tar(\.|$)|\.(tgz|zip)$", re.IGNORECASE)
 
 DEFAULT_HOST = "адрес сервера"                  # подставляем в инструкцию, если своего адреса не узнали
 
@@ -65,8 +70,8 @@ def is_program_excluded(relpath: str) -> bool:
     Исключаем служебные папки и мусор, но НЕ `.env`: в нём пароли базы и MinIO и
     SECRET_KEY, без них восстановленный сервер не прочитает ни базу, ни пароль на
     копию, — копия зашифрована, так что класть секреты в неё безопасно.
-    Архивы-выпуски (`.tar`, `.zip`…) пропускаем только в корне: в подпапках это
-    может быть обычный файл проекта (например, пример для документации).
+    Архивы-выпуски (`.tar*`, `.tgz`, `.zip`) пропускаем только в корне: в подпапках
+    это может быть обычный файл проекта (например, пример для документации).
     """
     parts = [p for p in relpath.split("/") if p and p != "."]
     if not parts:
@@ -76,7 +81,7 @@ def is_program_excluded(relpath: str) -> bool:
     name = parts[-1]
     if name in _EXCLUDED_NAMES or name.endswith(".log"):
         return True
-    return len(parts) == 1 and name.endswith(_EXCLUDED_ROOT_SUFFIXES)
+    return len(parts) == 1 and _ROOT_ARCHIVE.search(name) is not None
 
 
 def copy_filename(now: datetime) -> str:
