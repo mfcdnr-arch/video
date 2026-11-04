@@ -21,7 +21,9 @@ function initModerationViewActions(){
         return Signage.moderationReject(Number(el.dataset.mediaId), el.dataset.mediaTitle || '');
 
       case 'moderation-preview':
-        return window.open(API + '/files/download/' + Number(el.dataset.mediaId), '_blank');
+        // Просмотр в окне панели (видео с перемоткой, сведения о ролике):
+        // прежняя ссылка на файл в новой вкладке только скачивала его
+        return Signage.openMediaPreview(Number(el.dataset.mediaId));
     }
   });
 }

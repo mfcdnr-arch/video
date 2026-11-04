@@ -5,7 +5,8 @@
 # «экран → медиа → плейлист → расписание», показ по датам, что экран играет и
 # качает (лента и список файлов глазами агента), «в сети» по последнему сигналу,
 # бегущая строка (только на тестовом экране), отчёты, биллинг, уведомления,
-# бэкап и архив диагностики отдаются только по входу (без входа — 401).
+# бэкап и архив диагностики отдаются только по входу (без входа — 401), файлы
+# медиатеки — тоже (через nginx; экран качает одобренный ролик с докачкой).
 # Все тестовые данные создаются с префиксом SMOKE_ и удаляются в конце.
 #
 # Использование:   bash smoke_test.sh
@@ -1021,6 +1022,58 @@ else
   [ "$C" = "404" ] && ok "бэкапов нет — по входу 404 на несуществующий номер" || bad "бэкап по входу: HTTP $C"
 fi
 C=$(code_as "$DG" -H "Authorization: Bearer $TOKEN"); [ "$C" = "404" ] && ok "диагностика по входу — 404 на несуществующий номер" || bad "диагностика по входу: HTTP $C"
+
+# ── 5г. Файлы медиатеки — только по входу ────────────────────────────────────
+# Номера роликов идут подряд, имена файлов угадываются: без входа и ролик
+# (/api/files/download), и миниатюра, и /media/<имя> — 401 на любой номер.
+# Экран (X-Token) качает одобренный ролик с докачкой: Range → 206, файл отдаёт
+# nginx по X-Accel-Redirect; ролик на модерации для экрана «не найден» (404),
+# миниатюры и /media/ токен экрана не открывает. Панель: по входу (Bearer) и по
+# cookie ds_media (её ставит POST /session/media; так ходят <img> и <video>) —
+# 200, с Range — 206; токен входа вместо cookie и снятая cookie — 401.
+# Запросы идут через nginx (http://nginx изнутри ds_api): Range и /media/ живут там.
+step "Файлы медиатеки: только по входу"
+NGX="http://nginx"
+# ncode PATH [curl args] — код ответа nginx (тело не нужно); nget — код и размер тела
+ncode(){ local p="$1"; shift; $DC curl -s -o /dev/null -w '%{http_code}' "$NGX$p" "$@" 2>/dev/null; }
+nget(){ local p="$1"; shift; $DC curl -s -o /dev/null -w '%{http_code} %{size_download}' "$NGX$p" "$@" 2>/dev/null; }
+if [ -n "${MID:-}" ] && [ -n "${MID2:-}" ] && [ -n "${SCR_TOKEN:-}" ]; then
+  req GET "/media/$MID"; MFILE=$(body_get filename); MSIZE=$(body_get filesize)
+  MURL="/media/$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$MFILE")"
+  DL="/api/files/download/$MID"; TH="/api/media/$MID/thumbnail"
+  for P in "$DL" "/api/files/download/2147483000" "$TH" "$MURL"; do
+    C=$(ncode "$P"); [ "$C" = "401" ] && ok "без входа $P — 401" || bad "без входа $P: HTTP $C (файл открыт!)"
+  done
+  # /media/ открыт, а API закрыт — nginx работает со старой копией nginx.conf
+  [ "$(ncode "$MURL")" = "200" ] && echo "    └─ после обновления nginx.conf: docker compose up -d --force-recreate nginx"
+  C=$(ncode "$MURL" -I); [ "$C" = "401" ] && ok "без входа HEAD /media/ — 401" || bad "без входа HEAD /media/: HTTP $C"
+  C=$(ncode "$DL" -H "Authorization: Bearer not-a-jwt"); [ "$C" = "401" ] && ok "поддельный токен — 401" || bad "поддельный токен: HTTP $C"
+  C=$(ncode "$MURL" -H "Cookie: ds_media=$TOKEN"); [ "$C" = "401" ] && ok "токен входа вместо cookie — 401" || bad "токен входа вместо cookie: HTTP $C"
+  C=$(ncode "$TH" -H "X-Token: $SCR_TOKEN"); [ "$C" = "401" ] && ok "миниатюра по токену экрана — 401" || bad "миниатюра по токену экрана: HTTP $C"
+  C=$(ncode "$MURL" -H "X-Token: $SCR_TOKEN"); [ "$C" = "401" ] && ok "/media/ по токену экрана — 401" || bad "/media/ по токену экрана: HTTP $C"
+
+  R=$(nget "$DL" -H "X-Token: $SCR_TOKEN"); [ "$R" = "200 $MSIZE" ] && ok "экран качает одобренный ролик ($MSIZE байт)" || bad "экран качает ролик: ждали «200 $MSIZE», получили «$R»"
+  R=$(nget "$DL" -H "X-Token: $SCR_TOKEN" -H "Range: bytes=100-"); [ "$R" = "206 $((MSIZE - 100))" ] \
+    && ok "докачка экрана: Range с 100-го байта — 206, $((MSIZE - 100)) байт" || bad "докачка экрана: ждали «206 $((MSIZE - 100))», получили «$R»"
+  C=$(ncode "/api/files/download/$MID2" -H "X-Token: $SCR_TOKEN"); [ "$C" = "404" ] && ok "ролик на модерации экрану не отдаётся (404)" || bad "ролик на модерации экрану: HTTP $C"
+
+  R=$(nget "$DL" -H "Authorization: Bearer $TOKEN"); [ "$R" = "200 $MSIZE" ] && ok "по входу ролик скачивается" || bad "по входу ролик: «$R»"
+  C=$(ncode "/api/files/download/$MID2" -H "Authorization: Bearer $TOKEN"); [ "$C" = "200" ] && ok "по входу и ролик на модерации (для модерации)" || bad "по входу ролик на модерации: HTTP $C"
+  C=$(ncode "$TH" -H "Authorization: Bearer $TOKEN"); [ "$C" = "200" ] && ok "по входу миниатюра — 200" || bad "по входу миниатюра: HTTP $C"
+  C=$(ncode "$MURL" -I -H "Authorization: Bearer $TOKEN"); [ "$C" = "200" ] && ok "по входу HEAD /media/<имя> — 200" || bad "по входу HEAD /media/: HTTP $C"
+
+  JAR="/tmp/smoke_media_$STAMP.jar"
+  C=$($DC curl -s -o /dev/null -w '%{http_code}' -c "$JAR" -X POST "$NGX/api/session/media" -H "Authorization: Bearer $TOKEN" 2>/dev/null)
+  [ "$C" = "200" ] && ok "cookie файлов выдана (POST /session/media)" || bad "cookie файлов: HTTP $C"
+  R=$(nget "$MURL" -b "$JAR" -H "Range: bytes=0-99"); [ "$R" = "206 100" ] && ok "по cookie /media/<имя> с Range — 206 (перемотка в просмотре)" || bad "по cookie /media/: ждали «206 100», получили «$R»"
+  C=$(ncode "$TH" -b "$JAR"); [ "$C" = "200" ] && ok "по cookie миниатюра — 200" || bad "по cookie миниатюра: HTTP $C"
+  C=$(ncode "$DL" -b "$JAR"); [ "$C" = "200" ] && ok "по cookie «Скачать» — 200" || bad "по cookie «Скачать»: HTTP $C"
+  $DC curl -s -o /dev/null -b "$JAR" -c "$JAR" -X DELETE "$NGX/api/session/media" 2>/dev/null
+  C=$(ncode "$MURL" -b "$JAR"); [ "$C" = "401" ] && ok "снятая cookie (выход) — 401" || bad "снятая cookie: HTTP $C"
+  $DC rm -f "$JAR" 2>/dev/null
+else
+  bad "нет роликов или токена экрана — проверку файлов медиатеки провести не на чем"
+fi
 
 # ── 6. Уборка тестовых данных ────────────────────────────────────────────────
 step "Уборка"

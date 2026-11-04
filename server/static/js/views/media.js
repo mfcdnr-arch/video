@@ -731,7 +731,16 @@ function mdupAsk(file, dup, force){
   });
 }
 
-async function dlMedia(id){ window.open(API + '/files/download/' + id, '_blank'); }
+// «Скачать»: файл отдаётся только по входу — браузер несёт cookie ds_media
+// (mediaSession её ставит или продлевает). Ссылкой, а не blob: видео бывает в
+// сотни мегабайт; имя файла — из ответа сервера (Content-Disposition).
+async function dlMedia(id){
+  await mediaSession();
+  if(!TOKEN) return;   // вход кончился — открыта форма входа
+  const a = document.createElement('a');
+  a.href = API + '/files/download/' + Number(id); a.download = '';
+  document.body.appendChild(a); a.click(); a.remove();
+}
 
 async function setBannerDuration(id, current){
   const v = prompt('Сколько секунд показывать баннер? (1–300)', current);

@@ -51,9 +51,11 @@
   экрана, часового блока, обзора сети и списка плейлистов
 - `server/screen_online.py` — единое правило «экран в сети» (последний сигнал не
   старше 5 минут) и SQL-шаблоны к нему
+- `server/media_access.py` — кто читает файлы медиатеки: экран по `X-Token` (только
+  одобренное), панель по JWT или cookie `ds_media`; отдача через `X-Accel-Redirect`
 - `server/tests/` — pytest (billing, campaigns, контроль монитора, плейлисты,
   показы, дубли, общий эфир, бегущая строка, обзор сети, правило «в сети», группы экранов,
-  скачивание только по входу), запуск через
+  скачивание только по входу, файлы медиатеки), запуск через
   `run_tests.sh`; тесты агента — `agent/tests/`
 - `ui_tests/ui_test.js` — браузерный E2E-прогон панели (puppeteer), запуск через `ui_test.sh`
 - `agent/` — код агента для мини-ПК: `ds_agent.py`, `ds_player.py` (mpv),
@@ -79,6 +81,10 @@
 - Файлы только для вошедших (бэкап БД, архив диагностики) отдаются под `require_write` /
   `get_current_admin`; панель качает их через `apiDownload` (`core/api.js`: fetch с
   `Authorization` → blob), а не ссылкой `<a href>` — ссылка не несёт токен
+- Файлы медиатеки (`/files/download/{id}`, миниатюры, nginx `/media/`) — только через
+  `media_access.py`: `<img>`/`<video>`/ссылка идут по httpOnly-cookie `ds_media`
+  (панель берёт её `mediaSession()` в `core/api.js`), агент — по `X-Token`; большие файлы
+  отдаёт nginx (`X-Accel-Redirect`), не blob
 - Ограничение проекта: **никакого AI/ML** в продукте — только детерминированная логика
 
 ## Key commands

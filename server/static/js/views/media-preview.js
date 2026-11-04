@@ -8,7 +8,8 @@
 //
 // Signage.openMediaPreview(mediaId) вызывается и из других окон (сборка
 // плейлиста и т.п.): просмотр открывается поверх них, закрытие возвращает
-// к окну под ним. Файлы раздаёт nginx по /media/<имя> (с Range — перемотка).
+// к окну под ним. Файлы раздаёт nginx по /media/<имя> (с Range — перемотка)
+// только по входу: <video>/<img> несут cookie ds_media (см. mediaSession).
 //=============================================================================
 
 const MPREV_IMG_RE = /\.(png|jpe?g|bmp|webp|gif)$/i;
@@ -49,7 +50,8 @@ async function openMediaPreview(mediaId){
   MPREV_BUSY.add(id);
   let m;
   try{
-    m = await api('/media/' + id);
+    // cookie файлов — заодно: без неё nginx не отдаст кадр (401)
+    [m] = await Promise.all([api('/media/' + id), mediaSession()]);
   }catch(e){
     toast('Не удалось открыть ролик: ' + mprevErrText(e));
     return null;

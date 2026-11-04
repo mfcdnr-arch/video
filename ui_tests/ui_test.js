@@ -37,7 +37,10 @@
  *      (срок прежний), «Снять» с подтверждением и записи журнала. Всё — только на собственный
  *      тестовый экран прогона. Запуск на «Все экраны» идёт на ВСЕ экраны сети и выполняется
  *      только при E2E_ALLOW_BROADCAST=1 (на стенде).
- *   7. Копит ошибки консоли, необработанные исключения и ответы HTTP ≥400.
+ *   7. Файлы медиатеки — только по входу: без входа ролик, миниатюра и
+ *      /media/<имя> — 401, экран по X-Token качает одобренный ролик, панель —
+ *      по cookie ds_media (кадр просмотра, миниатюра, «Скачать», Range → 206).
+ *   8. Копит ошибки консоли, необработанные исключения и ответы HTTP ≥400.
  *
  * Любая ошибка консоли/JS и любой ответ ≥400 — это провал прогона: именно
  * так выглядели дефекты, которые ловили руками.
@@ -563,6 +566,15 @@ async function restoreBroadcast(page, fx) {
         () => !!document.querySelector('.modal-mprev video, .modal-mprev img'), null, 10000);
       shown ? ok('клик по миниатюре открыл просмотр с видео или картинкой')
             : bad('просмотр ролика не открылся (нет ни <video>, ни <img>)');
+      // Файл отдаётся только по входу: <video>/<img> несут cookie ds_media.
+      // Без неё nginx ответил бы 401 и вместо кадра была бы плашка ошибки.
+      const loaded = shown && await waitUntil(page, () => {
+        const v = document.querySelector('.modal-mprev video');
+        const i = document.querySelector('.modal-mprev img');
+        return v ? v.readyState >= 1 && v.videoWidth > 0 : !!(i && i.complete && i.naturalWidth > 0);
+      }, null, 15000);
+      loaded ? ok('кадр загрузился (файл по cookie входа)')
+             : bad('кадр в просмотре не загрузился — файл не отдан по входу?');
       await page.keyboard.press('Escape');
       const closed = await waitUntil(page, () => !document.querySelector('.modal-backdrop'), null, 5000);
       closed ? ok('Esc закрыл просмотр') : bad('просмотр не закрылся по Esc');
@@ -1803,6 +1815,78 @@ async function restoreBroadcast(page, fx) {
     } finally {
       expected = [];
       try { fs.rmSync(DL_DIR, { recursive: true, force: true }); } catch (_) { /* одноразовый контейнер */ }
+    }
+
+    // ── 10а. Файлы медиатеки: только по входу ─────────────────────────────
+    // Ролик, миниатюра и /media/<имя> без входа — 401 (номера идут подряд,
+    // иначе перебором выкачивалась бы вся медиатека). Панель ходит к файлам по
+    // httpOnly-cookie ds_media: миниатюры <img> и просмотр <video> заголовок не
+    // несут. Экран (X-Token) качает одобренный ролик, миниатюры ему закрыты.
+    // «Скачать» в медиатеке сохраняет файл (ссылкой по cookie, не blob).
+    head('Файлы медиатеки: только по входу');
+    const MDL_DIR = '/tmp/e2e_media_dl_' + STAMP;
+    try {
+      if (!fx.mediaId || !fx.clipFile) throw new Error('нет тестового ролика');
+      const fileUrl = '/media/' + encodeURIComponent(fx.clipFile);
+      const dlUrl = '/api/files/download/' + fx.mediaId;
+      const thUrl = '/api/media/' + fx.mediaId + '/thumbnail';
+      // status запроса из страницы: omit — без cookie (как посторонний), иначе — с cookie панели.
+      // no-store: спрашиваем сервер, а не кеш браузера (миниатюры кешируются на сутки)
+      const fetchStatus = (url, o) => page.evaluate((u, o) => fetch(u, {
+        credentials: o.omit ? 'omit' : 'same-origin', headers: o.headers || {}, cache: 'no-store',
+      }).then(async r => ({ status: r.status, size: (await r.arrayBuffer()).byteLength })), url, o || {});
+
+      step = 'медиа: без входа';
+      expected = [/^HTTP 401: .*(\/api\/files\/download\/\d+|\/api\/media\/\d+\/thumbnail|\/media\/[^/]+)$/];
+      for (const [name, url] of [['ролик', dlUrl], ['миниатюра', thUrl], ['/media/<имя>', fileUrl]]) {
+        const r = await fetchStatus(url, { omit: true });
+        r.status === 401 ? ok(`без входа ${name} — 401`) : bad(`без входа ${name}: HTTP ${r.status} — файл открыт`);
+      }
+      const devTh = await fetchStatus(thUrl, { omit: true, headers: { 'X-Token': fx.token || 'x' } });
+      devTh.status === 401 ? ok('токен экрана миниатюру не открывает (401)') : bad(`миниатюра по токену экрана: HTTP ${devTh.status}`);
+      const devDl = await fetchStatus(dlUrl, { omit: true, headers: { 'X-Token': fx.token || 'x' } });
+      devDl.status === 200 && devDl.size > 0 ? ok(`экран по X-Token качает одобренный ролик (${devDl.size} байт)`)
+                                              : bad(`ролик по токену экрана: HTTP ${devDl.status}`);
+
+      step = 'медиа: по входу (cookie)';
+      const part = await fetchStatus(fileUrl, { headers: { Range: 'bytes=0-9' } });
+      part.status === 206 && part.size === 10 ? ok('по cookie /media/<имя> с Range — 206 (перемотка)')
+                                               : bad(`по cookie /media/: HTTP ${part.status}, ${part.size} байт`);
+      await gotoSection(page, 'media');
+      await page.click('[data-action="media-open-common"]');
+      const TH_SEL = `#view img[src$="/media/${fx.mediaId}/thumbnail"]`;
+      const thumbOk = await waitUntil(page, (sel) => {
+        const i = document.querySelector(sel);
+        return !!(i && i.complete && i.naturalWidth > 0);
+      }, TH_SEL, 15000);
+      thumbOk ? ok('миниатюра тестового ролика в медиатеке загрузилась') : bad('миниатюра тестового ролика не загрузилась');
+
+      step = 'медиа: кнопка «Скачать»';
+      fs.mkdirSync(MDL_DIR, { recursive: true });
+      await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: MDL_DIR });
+      await page.click(`#view [data-action="media-download"][data-file-id="${fx.mediaId}"]`);
+      let saved = null;
+      for (let t = 0; t < 15000 && !saved; t += 250) {
+        const f = MDL_DIR + '/' + fx.clipFile;
+        if (fs.existsSync(f)) saved = fs.readFileSync(f);
+        else await sleep(250);
+      }
+      const png = saved && saved[0] === 0x89 && saved.slice(1, 4).toString() === 'PNG';
+      png ? ok(`«Скачать» сохранила ${fx.clipFile} (${saved.length} байт, PNG)`)
+          : bad(`«Скачать» ролика: файл ${saved ? saved.length + ' байт, не PNG' : 'не сохранён'}`);
+
+      step = 'медиа: выход снимает cookie';
+      await page.evaluate(() => fetch('/api/session/media', { method: 'DELETE' }));
+      const after = await fetchStatus(fileUrl);
+      after.status === 401 ? ok('после снятия cookie (выход) /media/<имя> — 401') : bad(`после снятия cookie: HTTP ${after.status}`);
+      await page.evaluate(() => mediaSession());       // вернуть для остальных шагов
+      const back = await fetchStatus(fileUrl);
+      back.status === 200 ? ok('новая cookie снова открывает файл') : bad(`новая cookie: HTTP ${back.status}`);
+    } catch (e) {
+      bad('шаг «файлы медиатеки» прерван: ' + e.message.split('\n')[0]);
+    } finally {
+      expected = [];
+      try { fs.rmSync(MDL_DIR, { recursive: true, force: true }); } catch (_) { /* одноразовый контейнер */ }
     }
 
   } catch (e) {

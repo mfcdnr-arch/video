@@ -9,13 +9,14 @@ from datetime import timedelta
 from typing import Optional
 
 import aiofiles
-from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from broadcast_store import get_broadcast
 from deps import engine, get_db, get_current_admin, require_write, require_moderator, verify_device_token, MEDIA_PATH
+from media_access import DEVICE, device_may_read, media_file_response, media_reader, panel_media_reader
 from placements_logic import playlists_for_screen
 from placements_store import load_overrides, load_placements, now_msk
 from playable_store import DEFAULT_VENUE, venue_sql
@@ -622,8 +623,10 @@ def update_banner_duration(media_id: int, body: dict = Body(...),
 
 
 @router.get("/media/{media_id}/thumbnail")
-def media_thumbnail(media_id: int, db: Session = Depends(get_db)):
-    """Миниатюра ролика/баннера. Для файлов, загруженных до появления
+def media_thumbnail(media_id: int, db: Session = Depends(get_db),
+                    _reader: str = Depends(panel_media_reader)):
+    """Миниатюра ролика/баннера — только по входу в панель (<img src> несёт
+    cookie ds_media, см. media_access.py). Для файлов, загруженных до появления
     миниатюр, генерируется лениво при первом запросе."""
     thumb = os.path.join(THUMBS_DIR, f"{media_id}.jpg")
     if not os.path.exists(thumb):
@@ -633,8 +636,9 @@ def media_thumbnail(media_id: int, db: Session = Depends(get_db)):
         src = os.path.join(MEDIA_PATH, row.filename)
         if not os.path.exists(src) or not _make_thumbnail(src, media_id):
             raise HTTPException(404, "Миниатюра недоступна")
+    # private: кадр рекламы не должен оседать в общих кешах по пути
     return FileResponse(thumb, media_type="image/jpeg",
-                        headers={"Cache-Control": "public, max-age=86400"})
+                        headers={"Cache-Control": "private, max-age=86400"})
 
 
 # ─── Рекламодатели и папки ──────────────────────────────────────────────────
@@ -865,14 +869,26 @@ def files_for_screen(screen_id: int, db: Session = Depends(get_db),
              "download_url": f"/files/download/{r.id}"} for r in rows]
 
 
-@router.get("/files/download/{media_id}")
-def download_file(media_id: int, db: Session = Depends(get_db)):
-    """Отдать файл мини ПК для скачивания (Range поддерживается через nginx)"""
-    row = db.execute(text("SELECT filename FROM media WHERE id = :id"), {"id": media_id}).fetchone()
-    if not row:
+@router.api_route("/files/download/{media_id}", methods=["GET", "HEAD"])
+def download_file(media_id: int, request: Request, db: Session = Depends(get_db),
+                  reader: str = Depends(media_reader)):
+    """Файл медиатеки: агенту — для закачки (X-Token, докачка по Range через
+    nginx), панели — «Скачать» (JWT или cookie ds_media). Без входа — 401 на
+    любой номер, раньше 404: перебором не узнать, какие номера есть. Экрану —
+    только готовый одобренный файл (media_access.device_may_read), остальное
+    для него «не найдено»."""
+    row = db.execute(text("SELECT filename, status, review_status FROM media WHERE id = :id"),
+                     {"id": media_id}).fetchone()
+    if not row or (reader == DEVICE and not device_may_read(row)):
         raise HTTPException(404, "Файл не найден")
     filepath = os.path.join(MEDIA_PATH, row.filename)
     if not os.path.exists(filepath):
         raise HTTPException(404, "Файл отсутствует на диске")
-    return FileResponse(filepath, media_type="application/octet-stream",
-                        filename=row.filename, headers={"Accept-Ranges": "bytes"})
+    return media_file_response(request, filepath, row.filename)
+
+
+@router.get("/files/auth", status_code=204)
+def media_files_auth(_reader: str = Depends(panel_media_reader)):
+    """Проверка nginx (auth_request) перед отдачей /media/<имя> — просмотр ролика
+    в панели: 204 — отдать, 401 / 403 — отказ (nginx вернёт тот же код)."""
+    return Response(status_code=204)

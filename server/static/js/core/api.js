@@ -29,6 +29,7 @@ async function api(path, opts={}){
 // Сессия кончилась (сервер ответил 401) — назад к форме входа
 function sessionExpired(){
   TOKEN=null; localStorage.removeItem('ds_token');
+  dropMediaSession();
   // Открытое окно осталось бы поверх формы входа и забирало бы фокус (ловушка Tab в modal.js)
   if(typeof closeAllModals === 'function') closeAllModals();
   renderLogin();
@@ -53,6 +54,21 @@ async function apiDownload(path, filename){
   a.href = url; a.download = filename || 'download';
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+// Файлы медиатеки (миниатюры <img>, просмотр <video>, «Скачать» ролика) сервер
+// отдаёт только по входу, а эти запросы заголовок с токеном не несут. Поэтому
+// по токену входа сервер ставит httpOnly-cookie ds_media до конца текущего
+// входа: браузер прикладывает её к файлам сам, скрипту она не видна, в адрес и
+// логи nginx не попадает. Берём при старте панели, перед просмотром и
+// скачиванием (если вход кончился — api() откроет форму входа). true — cookie есть.
+async function mediaSession(){
+  if(!TOKEN) return false;
+  try{ await api('/session/media', {method:'POST'}); return true; }
+  catch(_){ return false; }
+}
+// Выход: снять cookie файлов медиатеки (без входа сервер снимает только её)
+function dropMediaSession(){
+  fetch(API + '/session/media', {method:'DELETE'}).catch(() => {});
 }
 function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2200); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
