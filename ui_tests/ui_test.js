@@ -1675,6 +1675,136 @@ async function restoreBroadcast(page, fx) {
     badge ? ok('бейдж 📺 отрисован на карточках экранов')
           : bad('бейджа 📺 нет — проверьте, что /minipc отдаёт display_connected');
 
+    // ── 10. Бэкап и архив диагностики: скачиваются только по входу ─────────
+    // Бэкап — дамп всей БД (хеши паролей, токены экранов), номера идут подряд:
+    // без входа и по токену экрана сервер отвечает 401. Кнопки «Скачать» тянут
+    // файл через fetch с токеном и сохраняют blob — проверяем, что запрос несёт
+    // Authorization и что на диск лёг настоящий gzip под именем из списка.
+    head('Скачивание бэкапа и диагностики (только по входу)');
+    dialogMode = 'dismiss';
+    const fs = require('fs');
+    const DL_DIR = '/tmp/e2e_downloads_' + STAMP;
+    fs.mkdirSync(DL_DIR, { recursive: true });
+    const cdp = await browser.target().createCDPSession();
+    await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: DL_DIR });
+    // Размер скачанного файла и gzip ли он (−1 — файл не появился)
+    const savedFile = async (name) => {
+      const f = DL_DIR + '/' + name;
+      for (let t = 0; t < 15000; t += 250) {
+        if (fs.existsSync(f)) {
+          const b = fs.readFileSync(f);
+          return { size: b.length, gzip: b[0] === 0x1f && b[1] === 0x8b };
+        }
+        await sleep(250);
+      }
+      return { size: -1, gzip: false };
+    };
+    // Нажать «Скачать» и дождаться ответа сервера на этот файл
+    const clickDownload = async (selector, urlTail) => {
+      const respP = page.waitForResponse(r => r.url().endsWith(urlTail), { timeout: 30000 });
+      await page.click(selector);
+      const resp = await respP;
+      return { status: resp.status(),
+               auth: (resp.request().headers()['authorization'] || '').startsWith('Bearer ') };
+    };
+    const anonStatus = (path, headers) => page.evaluate(
+      (p, h) => fetch('/api' + p, { headers: h }).then(r => r.status), path, headers || {});
+
+    step = 'бэкап: создание из панели';
+    let bk = null;
+    try {
+      await gotoSection(page, 'settings');
+      const before = ((await apiCall(page, 'GET', '/backups')).data || []).map(b => b.id);
+      await page.click('[data-action="settings-create-backup"]');
+      const SEL = '#backup-list [data-action="settings-download-backup"]';
+      const fresh = await waitUntil(page, (a) =>
+        [...document.querySelectorAll(a.sel)].some(b => !a.ids.includes(Number(b.dataset.backupId))),
+        { sel: SEL, ids: before }, 60000);
+      if (fresh) {
+        bk = await page.evaluate((a) => {
+          const b = [...document.querySelectorAll(a.sel)].find(b => !a.ids.includes(Number(b.dataset.backupId)));
+          return { id: Number(b.dataset.backupId), filename: b.dataset.filename };
+        }, { sel: SEL, ids: before });
+        ok(`бэкап создан из панели (${bk.filename})`);
+      } else {
+        bad('бэкап не появился в списке за 60 с');
+      }
+
+      if (bk) {
+        step = 'бэкап: без входа';
+        const path = `/backups/${bk.id}/download`;
+        expected = [/^HTTP 401: .*\/api\/backups\/\d+\/download$/];
+        const anon = await anonStatus(path);
+        anon === 401 ? ok('без входа бэкап не отдаётся (401)') : bad(`бэкап без входа: HTTP ${anon} — дамп БД открыт`);
+        const dev = await anonStatus(path, { 'X-Token': fx.token || 'x' });
+        dev === 401 ? ok('токен экрана бэкап не открывает (401)') : bad(`бэкап по токену экрана: HTTP ${dev}`);
+        expected = [];
+
+        step = 'бэкап: кнопка «Скачать»';
+        const r = await clickDownload(`${SEL}[data-backup-id="${bk.id}"]`, '/api' + path);
+        const f = await savedFile(bk.filename);
+        (r.status === 200 && r.auth && f.size > 0 && f.gzip)
+          ? ok(`«Скачать» сохранила ${bk.filename} (${f.size} байт, gzip), запрос с токеном`)
+          : bad(`скачивание бэкапа: HTTP ${r.status}, токен ${r.auth ? 'есть' : 'нет'}, ` +
+                `файл ${f.size < 0 ? 'не сохранён' : f.size + ' байт' + (f.gzip ? '' : ', не gzip')}`);
+      }
+    } catch (e) {
+      bad('шаг «бэкап» прерван: ' + e.message.split('\n')[0]);
+    } finally {
+      expected = [];
+      if (bk) {
+        const d = await apiCall(page, 'DELETE', '/backups/' + bk.id);
+        d.status === 200 ? ok('тестовый бэкап удалён') : bad(`тестовый бэкап не удалился (HTTP ${d.status})`);
+      }
+    }
+
+    step = 'диагностика: архив от экрана';
+    try {
+      if (!fx.screenId || !fx.token) throw new Error('нет тестового экрана');
+      // Агент присылает архив по X-Token (как ds_sync.py после команды collect_diag);
+      // тело — пустой, но настоящий gzip
+      const up = await page.evaluate(async (sid, t) => {
+        const gz = new Uint8Array([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        const body = new FormData();
+        body.append('file', new Blob([gz], { type: 'application/gzip' }), 'diag.tar.gz');
+        const r = await fetch('/api/diagnostics/upload/' + sid, { method: 'POST', headers: { 'X-Token': t }, body });
+        return { status: r.status, data: await r.json().catch(() => null) };
+      }, fx.screenId, fx.token);
+      if (up.status !== 200 || !up.data) throw new Error(`агент не загрузил архив (HTTP ${up.status})`);
+      ok(`архив диагностики пришёл от экрана (${up.data.filename})`);
+
+      await gotoSection(page, 'screens');
+      // Список архивов на карточке экрана — как после «🧾 Диагностика» / «↻ Обновить»
+      await page.evaluate(id => showScreenDiagList(id), fx.screenId);
+      const BTN = `#scr-diag-${fx.screenId} [data-action="screen-download-diag"]`;
+      if (!await page.waitForSelector(BTN, { timeout: 10000 }).catch(() => null)) {
+        throw new Error('кнопки «Скачать» у архива нет');
+      }
+      const dg = await page.$eval(BTN, el => ({ id: Number(el.dataset.diagId), filename: el.dataset.filename }));
+
+      step = 'диагностика: без входа';
+      const path = `/diagnostics/${dg.id}/download`;
+      expected = [/^HTTP 401: .*\/api\/diagnostics\/\d+\/download$/];
+      const anon = await anonStatus(path);
+      anon === 401 ? ok('без входа архив диагностики не отдаётся (401)') : bad(`диагностика без входа: HTTP ${anon}`);
+      const dev = await anonStatus(path, { 'X-Token': fx.token });
+      dev === 401 ? ok('токен экрана архив не открывает (401)') : bad(`диагностика по токену экрана: HTTP ${dev}`);
+      expected = [];
+
+      step = 'диагностика: кнопка «Скачать»';
+      const r = await clickDownload(BTN, '/api' + path);
+      const f = await savedFile(dg.filename);
+      (r.status === 200 && r.auth && f.size > 0 && f.gzip)
+        ? ok(`«Скачать» сохранила ${dg.filename} (${f.size} байт), запрос с токеном`)
+        : bad(`скачивание архива: HTTP ${r.status}, токен ${r.auth ? 'есть' : 'нет'}, ` +
+              `файл ${f.size < 0 ? 'не сохранён' : f.size + ' байт' + (f.gzip ? '' : ', не gzip')}`);
+    } catch (e) {
+      bad('шаг «диагностика» прерван: ' + e.message.split('\n')[0]);
+    } finally {
+      expected = [];
+      try { fs.rmSync(DL_DIR, { recursive: true, force: true }); } catch (_) { /* одноразовый контейнер */ }
+    }
+
   } catch (e) {
     bad('прогон прерван: ' + e.message.split('\n')[0]);
   } finally {

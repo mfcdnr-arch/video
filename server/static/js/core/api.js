@@ -21,16 +21,38 @@ async function api(path, opts={}){
     headers['Content-Type'] = 'application/json';
   }
   const res = await fetch(API + path, {...opts, headers});
-  if(res.status === 401){
-    TOKEN=null; localStorage.removeItem('ds_token');
-    // Открытое окно осталось бы поверх формы входа и забирало бы фокус (ловушка Tab в modal.js)
-    if(typeof closeAllModals === 'function') closeAllModals();
-    renderLogin();
-    throw new Error('unauthorized');
-  }
+  if(res.status === 401) sessionExpired();
   if(!res.ok){ const t = await res.text(); throw new Error(t || ('HTTP '+res.status)); }
   const ct = res.headers.get('content-type')||'';
   return ct.includes('json') ? res.json() : res.text();
+}
+// Сессия кончилась (сервер ответил 401) — назад к форме входа
+function sessionExpired(){
+  TOKEN=null; localStorage.removeItem('ds_token');
+  // Открытое окно осталось бы поверх формы входа и забирало бы фокус (ловушка Tab в modal.js)
+  if(typeof closeAllModals === 'function') closeAllModals();
+  renderLogin();
+  throw new Error('unauthorized');
+}
+// Скачивание файла, который сервер отдаёт только по входу (бэкап БД, архив
+// диагностики). Ссылка <a href> заголовок с токеном не несёт, а сам токен в
+// адресе осел бы в логах nginx и истории браузера — поэтому тянем через fetch
+// с Authorization и отдаём браузеру как blob под именем filename.
+async function apiDownload(path, filename){
+  const headers = {};
+  if(TOKEN) headers['Authorization'] = 'Bearer ' + TOKEN;
+  const res = await fetch(API + path, {headers});
+  if(res.status === 401) sessionExpired();
+  if(!res.ok){
+    let msg = 'HTTP ' + res.status;
+    try{ const j = await res.json(); if(j && j.detail) msg = String(j.detail); }catch(_){}
+    throw new Error(msg);
+  }
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement('a');
+  a.href = url; a.download = filename || 'download';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2200); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
