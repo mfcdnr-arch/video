@@ -94,6 +94,8 @@ services:
       # Код агента — только для регрессионных тестов (pytest гоняем внутри
       # ds_api). Сервер этот каталог не читает; в проде монтировать не нужно.
       - ./agent:/agent:ro
+      # программа сервера и .env для копии на флешку — только чтение
+      - ./:/srv/project:ro
       - media_data:/data/media
       - backup_data:/data/backups
       - agent_updates_data:/data/agent_updates
