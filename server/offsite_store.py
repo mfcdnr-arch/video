@@ -192,9 +192,14 @@ def check_login_password(db, username: str, password: str) -> bool:
 # --- одноразовые ссылки -------------------------------------------------------------------
 
 def _redis():
-    """Клиент Redis. Отдельная функция, чтобы тесты подменяли её словарём-заглушкой."""
+    """Клиент Redis. Отдельная функция, чтобы тесты подменяли её словарём-заглушкой.
+
+    Таймаут 2 секунды (как в routers/system.py): без него запрос к недоступному Redis висит минутами,
+    а выдача ссылки — это обычный POST из панели, которому надо быстро ответить «Redis недоступен».
+    """
     import redis
-    return redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379"))
+    return redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379"),
+                                socket_timeout=2, socket_connect_timeout=2)
 
 
 def issue_ticket(payload: dict, ttl: int = TICKET_TTL) -> str:
@@ -244,6 +249,11 @@ INSTRUCTION_NAME = "ВОССТАНОВЛЕНИЕ.txt"
 INNER_NAME = "copy.tar.gz"                  # имена совпадают с OPENSSL_DECRYPT_CMD и с инструкцией
 ENC_NAME = INNER_NAME + ".enc"
 SHA_NAME = ENC_NAME + ".sha256"
+# Маркер «сборка ещё идёт»: пустой файл в папке сборки. Дамп большой базы и шифрование могут идти
+# дольше 15 минут, и без маркера cleanup_stale (его зовёт соседний запрос) стёр бы папку у собирающейся
+# копии. Забытый маркер (процесс убили посреди сборки) через BUILD_MAX_AGE_S перестаёт защищать.
+BUILD_MARKER = ".building"
+BUILD_MAX_AGE_S = 6 * 3600
 # Разделы копии: каждый кладём папкой даже пустым, чтобы `docker cp <папка>/.` в инструкции не падал.
 _SECTIONS = ("program", "db", "documents", "media_documents", "agent_updates")
 
@@ -338,6 +348,16 @@ def _check_project() -> None:
             raise ProjectNotMounted(
                 f"Папка проекта не подключена к серверу (нет {name} в {PROJECT_DIR}): "
                 "обновите сервер, запустив install_server.sh на самом сервере")
+
+
+def project_mounted() -> bool:
+    """Виден ли корень проекта из контейнера (то же правило, что перед сборкой): для статуса в панели,
+    чтобы «сервер не обновлён» было видно сразу, а не после нажатия «Скачать»."""
+    try:
+        _check_project()
+    except ProjectNotMounted:
+        return False
+    return True
 
 
 def _last_migration() -> str:
@@ -452,8 +472,9 @@ class _CopyArchive:
         self._tf.addfile(ti, io.BytesIO(data))
 
 
-def _safe_basename(filename) -> str | None:
-    """Имя файла из БД → безопасное имя в папке media_documents/: только последняя часть пути.
+def safe_basename(filename) -> str | None:
+    """Имя файла из БД → безопасное имя в папке раздела (media_documents/ в копии, media/ в архиве
+    роликов): только последняя часть пути.
 
     Имя в БД — данные пользователя: «../x» или «/etc/passwd» не должны вывести за раздел. Обратные
     слэши тоже считаем разделителями (имя могли загрузить с Windows). None — имени нет вовсе.
@@ -469,7 +490,7 @@ def _add_media_documents(ar: _CopyArchive, rows) -> list[str]:
     строки БД, файла для которых на диске нет (или имя непригодно): их копия не восстановит."""
     missing, seen = [], set()
     for r in rows:
-        base = _safe_basename(r.filename)
+        base = safe_basename(r.filename)
         if base in seen:
             continue                    # тот же файл уже в копии (две строки БД на одно имя)
         st = None
@@ -548,6 +569,7 @@ def build_copy(db, *, who: str, host: str, password: str, now: datetime) -> Buil
     os.mkdir(workdir, 0o700)
     os.chmod(workdir, 0o700)            # на миг здесь лежит расшифрованный архив с .env: чужим закрыто
     try:
+        open(os.path.join(workdir, BUILD_MARKER), "wb").close()
         # 1. дамп — первым: контрольные числа снимаем сразу за ним, чтобы они совпали с дампом
         dump_path = os.path.join(workdir, "dump.sql.gz")
         _pg_dump_gz(dump_path)
@@ -602,6 +624,7 @@ def build_copy(db, *, who: str, host: str, password: str, now: datetime) -> Buil
         out_path = os.path.join(workdir, filename)
         size = write_tar(items, out_path)
         os.remove(enc_path)             # остаётся только внешний tar
+        os.remove(os.path.join(workdir, BUILD_MARKER))      # собрано: дальше это обычная готовая папка
         return BuiltCopy(path=out_path, filename=filename, size=size, workdir=workdir)
     except BaseException:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -611,7 +634,11 @@ def build_copy(db, *, who: str, host: str, password: str, now: datetime) -> Buil
 def cleanup_stale(older_than_s: int = 900) -> int:
     """Удалить папки сборки в OFFSITE_TMP старше older_than_s секунд (по умолчанию 15 минут); вернуть
     сколько удалено. Нужна для копий, которые собрали, а ссылку так и не открыли. Трогает только
-    настоящие папки: файл или симлинк в OFFSITE_TMP — чужое, мы его не создавали."""
+    настоящие папки: файл или симлинк в OFFSITE_TMP — чужое, мы его не создавали.
+
+    Папку с маркером BUILD_MARKER (сборка ещё идёт) не трогает, пока маркеру нет BUILD_MAX_AGE_S:
+    сборка большой базы дольше 15 минут — не мусор. Старше — процесс умер, папку стираем.
+    """
     try:
         names = os.listdir(OFFSITE_TMP)
     except OSError:
@@ -622,6 +649,9 @@ def cleanup_stale(older_than_s: int = 900) -> int:
         path = os.path.join(OFFSITE_TMP, name)
         try:
             if os.path.islink(path) or not os.path.isdir(path) or os.stat(path).st_mtime > cutoff:
+                continue
+            marker = os.path.join(path, BUILD_MARKER)
+            if os.path.isfile(marker) and os.stat(marker).st_mtime > time.time() - BUILD_MAX_AGE_S:
                 continue
         except OSError:
             continue

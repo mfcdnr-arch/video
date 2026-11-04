@@ -401,3 +401,12 @@ def test_redis_client_uses_redis_url(monkeypatch):
     monkeypatch.delenv("REDIS_URL")
     store._redis()
     assert seen == ["redis://example:6380", "redis://redis:6379"]
+
+
+def test_redis_client_has_timeouts(monkeypatch):
+    """Без таймаутов недоступный Redis подвесил бы запрос на минуты; как в routers/system.py — 2 секунды."""
+    import redis
+    seen = []
+    monkeypatch.setattr(redis.Redis, "from_url", staticmethod(lambda url, **kw: seen.append(kw) or "client"))
+    store._redis()
+    assert seen == [{"socket_timeout": 2, "socket_connect_timeout": 2}]
