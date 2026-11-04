@@ -1,7 +1,9 @@
-"""«Копия на флешку» на сервере: состояние в БД, ролики для архивов, журнал, одноразовые ссылки.
+"""«Копия на флешку» на сервере: состояние в БД, ролики для архивов, журнал, одноразовые ссылки,
+сборка ежедневной копии.
 
-Здесь только SQL и Redis. Шифрование копии — offsite_crypto, правила и сборка архивов —
+SQL и Redis — здесь же; шифрование копии — offsite_crypto, правила и потоковый tar —
 offsite_rules / offsite_tar (чистая логика), а HTTP-слой (роутер) склеивает всё это.
+Сборка ежедневной копии (build_copy) — внизу модуля: она берёт файлы с диска и дамп базы, а не только SQL.
 
 Состояние — одна строка offsite_copy_state (id = 1): зашифрованный пароль на копию, кто и когда
 скачал копию и ролики, и «водяной знак» роликов — наибольший id, который уже ушёл на флешку
@@ -17,14 +19,29 @@ now_msk), а не NOW() Postgres: контейнер БД живёт в UTC, и 
 
 Функции не делают commit — транзакцией управляет вызывающий (роутер).
 """
+import hashlib
+import io
 import json
 import os
+import re
 import secrets
-from datetime import datetime
+import shutil
+import stat
+import subprocess
+import tarfile
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Iterator
+from urllib.parse import unquote, urlsplit
 
 from sqlalchemy import text
 
-from deps import pwd_context
+from deps import DATABASE_URL, MEDIA_PATH, pwd_context
+from offsite_crypto import OPENSSL_DECRYPT_CMD, encrypt_file_openssl
+from offsite_rules import copy_filename, is_program_excluded, safe_host
+from offsite_tar import TarItem, write_tar
 
 AUDIT_TYPE = "backup"           # копия на флешку — того же рода событие, что и бэкап БД
 TICKET_PREFIX = "offsite:ticket:"
@@ -204,3 +221,411 @@ def take_ticket(token: str) -> dict | None:
     except ValueError:      # в т.ч. UnicodeDecodeError и JSONDecodeError
         return None
     return payload if isinstance(payload, dict) else None
+
+
+# --- сборка ежедневной копии --------------------------------------------------------------
+#
+# Копия собирается во временной папке контейнера и отдаётся браузеру одним файлом (выдачу и удаление
+# папки после неё делает роутер). На сервере она не хранится: в ней открытые пароли из .env, и копиться
+# им незачем. Поэтому любая ошибка сборки стирает папку целиком, а забытые (ссылку так и не открыли)
+# стирает cleanup_stale.
+
+# Временные папки сборки. Не в /data: туда смонтированы тома с живыми данными, а здесь на минуту
+# лежит расшифрованный архив со всеми паролями сервера — ему место в закрытой папке контейнера.
+OFFSITE_TMP = "/tmp/ds_offsite"
+# Корень проекта сервера: в docker-compose.yml у api он смонтирован только на чтение (./:/srv/project:ro).
+# Оттуда берутся и программа, и сам файл .env байт в байт — значения из окружения не пересобираем.
+PROJECT_DIR = os.getenv("OFFSITE_PROJECT_DIR", "/srv/project")
+BACKUP_DIR = os.getenv("BACKUP_DIR", "/data/backups")
+AGENT_UPDATE_PATH = os.getenv("AGENT_UPDATE_PATH", "/data/agent_updates")
+RESTORE_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "offsite_restore.txt")
+
+INSTRUCTION_NAME = "ВОССТАНОВЛЕНИЕ.txt"
+INNER_NAME = "copy.tar.gz"                  # имена совпадают с OPENSSL_DECRYPT_CMD и с инструкцией
+ENC_NAME = INNER_NAME + ".enc"
+SHA_NAME = ENC_NAME + ".sha256"
+# Разделы копии: каждый кладём папкой даже пустым, чтобы `docker cp <папка>/.` в инструкции не падал.
+_SECTIONS = ("program", "db", "documents", "media_documents", "agent_updates")
+
+_MSK = timezone(timedelta(hours=3))
+_CHUNK = 1 << 20
+
+# Контрольные числа манифеста: (ключ, подпись, запрос). Ключ — он же имя столбца в _COUNTS_SQL,
+# и тот же запрос стоит в инструкции (шаг «Проверка»): человек сверяет числа с манифестом глазами.
+COUNT_FIELDS = (
+    ("screens", "экраны", "SELECT count(*) FROM screens"),
+    ("media", "ролики, без «Документов»", "SELECT count(*) FROM media WHERE status <> 'document'"),
+    ("media_docs", "«Документы» медиатеки", "SELECT count(*) FROM media WHERE status = 'document'"),
+    ("playlists", "плейлисты", "SELECT count(*) FROM playlists"),
+    ("users", "пользователи", "SELECT count(*) FROM users"),
+    ("advertisers", "рекламодатели", "SELECT count(*) FROM advertisers"),
+    ("advertiser_docs", "документы рекламодателей", "SELECT count(*) FROM advertiser_documents"),
+)
+# Один запрос, а не семь: числа снимаются из одного снимка базы и согласованы между собой.
+_COUNTS_SQL = "SELECT " + ", ".join(f"({sql}) AS {key}" for key, _, sql in COUNT_FIELDS)
+
+
+class ProjectNotMounted(Exception):
+    """Корень проекта не виден из контейнера api (нет .env или docker-compose.yml): сервер не обновлён."""
+
+
+@dataclass
+class BuiltCopy:
+    """Готовая копия: внешний tar лежит в workdir (его вызывающий удаляет после отдачи)."""
+    path: str
+    filename: str
+    size: int
+    workdir: str
+
+
+def _msk_ts(now: datetime) -> int:
+    """Секунды unix для наивного МСК — время файлов в tar (иначе `ls -l` на новой машине соврёт на 3 часа)."""
+    return int(now.replace(tzinfo=_MSK).timestamp())
+
+
+def _one_line(value) -> str:
+    """Текст в одну строку: имя из БД или логин не должны сломать вёрстку манифеста и инструкции."""
+    return " ".join(str(value if value is not None else "").split())
+
+
+def _remove_quiet(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _pg_dump_gz(dst_path: str) -> None:
+    """Снять дамп БД в dst_path: `pg_dump "$DATABASE_URL" | gzip`. Любая беда — RuntimeError с текстом
+    stderr (до 300 символов, пароль БД из адреса вычищен); недописанный файл удаляется.
+
+    Модульная функция, а не вложенная: тесты подменяют её, чтобы не нужен был настоящий Postgres.
+    """
+    ok = False
+    try:
+        with open(dst_path, "wb") as out:
+            try:
+                dump = subprocess.Popen(["pg_dump", DATABASE_URL],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except FileNotFoundError:
+                raise RuntimeError("pg_dump не найден на сервере")
+            try:
+                gz = subprocess.Popen(["gzip"], stdin=dump.stdout, stdout=out)
+            except FileNotFoundError:
+                dump.kill()
+                dump.wait()
+                raise RuntimeError("gzip не найден на сервере")
+            dump.stdout.close()                 # чтобы gzip увидел конец потока, когда pg_dump закончит
+            _, err = dump.communicate()
+            gz.wait()
+        if dump.returncode != 0 or gz.returncode != 0:
+            msg = err.decode(errors="ignore")
+            # пароль БД стоит в адресе подключения; если pg_dump его где-то процитировал — прячем
+            raw_pw = urlsplit(DATABASE_URL).password
+            for secret in ({raw_pw, unquote(raw_pw)} if raw_pw else ()):
+                if secret:
+                    msg = msg.replace(secret, "***")
+            raise RuntimeError("Ошибка pg_dump: " + msg.strip()[:300])
+        ok = True
+    finally:
+        if not ok:
+            _remove_quiet(dst_path)
+
+
+def _check_project() -> None:
+    for name in (".env", "docker-compose.yml"):
+        if not os.path.isfile(os.path.join(PROJECT_DIR, name)):
+            raise ProjectNotMounted(
+                f"Папка проекта не подключена к серверу (нет {name} в {PROJECT_DIR}): "
+                "обновите сервер, запустив install_server.sh на самом сервере")
+
+
+def _last_migration() -> str:
+    """Наибольший номер NNN_ среди миграций проекта (как написан в имени файла), чтобы манифест и
+    инструкция назвали версию базы. Нет миграций — «не определён»."""
+    best = None
+    try:
+        names = os.listdir(os.path.join(PROJECT_DIR, "server", "migrations"))
+    except OSError:
+        names = []
+    for name in names:
+        m = re.match(r"(\d+)_", name)
+        if m and (best is None or int(m.group(1)) > int(best)):
+            best = m.group(1)
+    return best or "не определён"
+
+
+def _control_numbers(db) -> list[tuple[str, str, int]]:
+    row = db.execute(text(_COUNTS_SQL)).fetchone()
+    return [(key, label, int(getattr(row, key))) for key, label, _ in COUNT_FIELDS]
+
+
+def _raise(err: OSError) -> None:
+    raise err
+
+
+def _iter_files(root: str, skip=None) -> Iterator[tuple[str, str, os.stat_result]]:
+    """Обычные файлы папки root по порядку: (путь от root через «/», полный путь, lstat).
+
+    Симлинки не берём и не идём по ним: ссылка из проекта наружу утащила бы в копию чужие файлы,
+    а при восстановлении оказалась бы битой. Не обычные файлы (сокеты, каналы) тоже пропускаем.
+    skip(путь) отсекает целые папки и файлы (правила is_program_excluded). Нет папки — пусто; папка,
+    которую нельзя прочитать, — ошибка (копия молча без части файлов хуже, чем отказ).
+    """
+    if not os.path.isdir(root):
+        return
+    for cur, dirs, files in os.walk(root, topdown=True, onerror=_raise, followlinks=False):
+        rel_dir = os.path.relpath(cur, root).replace(os.sep, "/")
+        prefix = "" if rel_dir == "." else rel_dir + "/"
+        dirs[:] = sorted(d for d in dirs if not (skip and skip(prefix + d)))
+        for name in sorted(files):
+            rel = prefix + name
+            if skip and skip(rel):
+                continue
+            full = os.path.join(cur, name)
+            try:
+                st = os.lstat(full)
+            except OSError:         # пропал между листингом и чтением — как будто и не было
+                continue
+            if stat.S_ISREG(st.st_mode):
+                yield rel, full, st
+
+
+class _HashingReader:
+    """Обёртка над файлом для tarfile.addfile: считает sha256 тех байт, что реально ушли в архив."""
+
+    def __init__(self, f):
+        self._f = f
+        self.sha = hashlib.sha256()
+
+    def read(self, n: int = -1) -> bytes:
+        buf = self._f.read(n)
+        self.sha.update(buf)
+        return buf
+
+
+class _CopyArchive:
+    """Внутренний copy.tar.gz: добавляет файлы и запоминает sha256 и размер каждого для описи.
+
+    Файлы кладутся без владельцев хоста (uid/gid 0, имён нет): на новой машине их всё равно
+    переназначит тот, кто распаковывает.
+    """
+
+    def __init__(self, path: str, now: datetime):
+        self._mtime = _msk_ts(now)
+        self._tf = tarfile.open(path, "w:gz", format=tarfile.PAX_FORMAT, encoding="utf-8", compresslevel=6)
+        self.listing: list[tuple[str, int, str]] = []       # (sha256, размер, путь в архиве)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._tf.close()
+        return False
+
+    def _info(self, arcname: str, mode: int, mtime: int) -> tarfile.TarInfo:
+        ti = tarfile.TarInfo(arcname)
+        ti.mode = mode
+        ti.mtime = mtime
+        ti.uid = ti.gid = 0
+        ti.uname = ti.gname = ""
+        return ti
+
+    def add_dir(self, arcname: str) -> None:
+        ti = self._info(arcname, 0o755, self._mtime)
+        ti.type = tarfile.DIRTYPE
+        self._tf.addfile(ti)
+
+    def add_file(self, arcname: str, path: str, st: os.stat_result, mode: int) -> None:
+        ti = self._info(arcname, mode, int(st.st_mtime))
+        ti.size = st.st_size
+        with open(path, "rb") as f:
+            reader = _HashingReader(f)
+            # addfile читает ровно ti.size байт; файл короче заявленного — OSError, и сборка отменится
+            self._tf.addfile(ti, reader)
+        self.listing.append((reader.sha.hexdigest(), st.st_size, arcname))
+
+    def add_bytes(self, arcname: str, data: bytes) -> None:
+        """Небольшой текст из памяти (манифест). В опись не попадает: свой хеш в себя не вписать."""
+        ti = self._info(arcname, 0o644, self._mtime)
+        ti.size = len(data)
+        self._tf.addfile(ti, io.BytesIO(data))
+
+
+def _safe_basename(filename) -> str | None:
+    """Имя файла из БД → безопасное имя в папке media_documents/: только последняя часть пути.
+
+    Имя в БД — данные пользователя: «../x» или «/etc/passwd» не должны вывести за раздел. Обратные
+    слэши тоже считаем разделителями (имя могли загрузить с Windows). None — имени нет вовсе.
+    """
+    name = str(filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+    if not name.strip() or name in (".", "..") or "\0" in name:
+        return None
+    return name
+
+
+def _add_media_documents(ar: _CopyArchive, rows) -> list[str]:
+    """Файлы «Документов» медиатеки в раздел media_documents/. Возвращает строки для манифеста про те
+    строки БД, файла для которых на диске нет (или имя непригодно): их копия не восстановит."""
+    missing, seen = [], set()
+    for r in rows:
+        base = _safe_basename(r.filename)
+        if base in seen:
+            continue                    # тот же файл уже в копии (две строки БД на одно имя)
+        st = None
+        if base is not None:
+            try:
+                st = os.lstat(os.path.join(MEDIA_PATH, base))
+            except OSError:
+                st = None
+        if st is None or not stat.S_ISREG(st.st_mode):
+            shown = base or _one_line(r.filename) or "(пустое имя)"
+            missing.append(f"  media_documents/{shown} - нет файла (id {r.id}, «{_one_line(r.title)}»)")
+            continue
+        seen.add(base)
+        # 0644: эти файлы nginx отдаёт из /data/media, они должны читаться всеми внутри контейнера
+        ar.add_file("media_documents/" + base, os.path.join(MEDIA_PATH, base), st, 0o644)
+    return missing
+
+
+def _manifest_text(*, now, who, host, migration, counts, listing, missing) -> str:
+    lines = [
+        "ОПИСЬ КОПИИ СЕРВЕРА DIGITAL SIGNAGE",
+        "",
+        f"Создана:        {now:%Y-%m-%d %H:%M:%S} (МСК)",
+        f"Кем:            {_one_line(who)}",
+        f"Адрес сервера:  {_one_line(host)}",
+        f"Миграция БД:    {migration} (последняя в этой копии)",
+        "",
+        "Контрольные числа (число строк в таблицах базы сразу после снятия дампа).",
+        "После восстановления те же числа печатает команда из шага «Проверка» инструкции:",
+    ]
+    lines += [f"  {key}: {value}    ({label})" for key, label, value in counts]
+    lines += ["", "Не попали в копию (в базе строка есть, файла на диске нет):"]
+    lines += missing or ["  ничего"]
+    lines += ["", "Файлы копии: sha256, размер в байтах, путь (сам MANIFEST.txt в списке не значится):"]
+    lines += [f"{sha}  {size}  {arcname}" for sha, size, arcname in listing]
+    return "\n".join(lines) + "\n"
+
+
+def _render_instruction(values: dict) -> str:
+    """Шаблон инструкции с подставленными полями {{имя}}. Один проход: значение, похожее на поле
+    (логин «{{host}}»), второй раз не раскрывается. Неизвестное поле остаётся как есть."""
+    with open(RESTORE_TEMPLATE, encoding="utf-8") as f:
+        template = f.read()
+    return re.sub(r"\{\{(\w+)\}\}", lambda m: values.get(m.group(1), m.group(0)), template)
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            buf = f.read(_CHUNK)
+            if not buf:
+                return h.hexdigest()
+            h.update(buf)
+
+
+def build_copy(db, *, who: str, host: str, password: str, now: datetime) -> BuiltCopy:
+    """Собрать ежедневную копию в OFFSITE_TMP/<uuid>/ и вернуть внешний tar ds_copy_*.tar.
+
+    Внутри внешнего tar три открытых файла: инструкция, запертая паролем часть и её sha256. Запертая
+    часть (формат openssl) после расшифровки — copy.tar.gz: program/ (с настоящим .env), свежий дамп,
+    документы рекламодателей, «Документы» медиатеки, файлы OTA и MANIFEST.txt.
+
+    Любая ошибка (pg_dump, диск, исчезнувший файл, БД) стирает папку сборки целиком: недособранная
+    копия не должна лежать на диске. Пароль в тексты исключений не попадает. Транзакцией БД управляет
+    вызывающий; здесь только чтение.
+    """
+    if not password:
+        raise ValueError("Пароль на копию не задан")
+    _check_project()
+    filename = copy_filename(now)
+
+    os.makedirs(OFFSITE_TMP, mode=0o700, exist_ok=True)
+    os.chmod(OFFSITE_TMP, 0o700)
+    workdir = os.path.join(OFFSITE_TMP, uuid.uuid4().hex)
+    os.mkdir(workdir, 0o700)
+    os.chmod(workdir, 0o700)            # на миг здесь лежит расшифрованный архив с .env: чужим закрыто
+    try:
+        # 1. дамп — первым: контрольные числа снимаем сразу за ним, чтобы они совпали с дампом
+        dump_path = os.path.join(workdir, "dump.sql.gz")
+        _pg_dump_gz(dump_path)
+        counts = _control_numbers(db)
+        doc_rows = document_rows(db)
+        migration = _last_migration()
+
+        # 2. внутренний copy.tar.gz
+        inner_path = os.path.join(workdir, INNER_NAME)
+        with _CopyArchive(inner_path, now) as ar:
+            for section in _SECTIONS:
+                ar.add_dir(section)
+            for rel, full, st in _iter_files(PROJECT_DIR, skip=is_program_excluded):
+                # .env — только владельцу, что бы ни стояло в источнике; остальным — их права
+                mode = 0o600 if rel == ".env" else (st.st_mode & 0o777)
+                ar.add_file("program/" + rel, full, st, mode)
+            ar.add_file(f"db/backup_{now:%Y%m%d_%H%M%S}.sql.gz", dump_path, os.lstat(dump_path), 0o644)
+            for rel, full, st in _iter_files(os.path.join(BACKUP_DIR, "documents")):
+                ar.add_file("documents/" + rel, full, st, 0o644)
+            missing = _add_media_documents(ar, doc_rows)
+            for rel, full, st in _iter_files(AGENT_UPDATE_PATH):
+                ar.add_file("agent_updates/" + rel, full, st, 0o644)
+            ar.add_bytes("MANIFEST.txt", _manifest_text(
+                now=now, who=who, host=safe_host(host), migration=migration, counts=counts,
+                listing=ar.listing, missing=missing).encode("utf-8"))
+        os.remove(dump_path)
+
+        # 3. запираем и сразу убираем открытый архив
+        enc_path = os.path.join(workdir, ENC_NAME)
+        encrypt_file_openssl(inner_path, enc_path, password)
+        os.remove(inner_path)
+
+        # 4. внешний tar: инструкция + запертая часть + её контрольная сумма
+        instruction = _render_instruction({
+            "created_at": f"{now:%Y-%m-%d %H:%M}",
+            "created_by": _one_line(who),
+            "host": safe_host(host),
+            "copy_file": filename,
+            "decrypt_cmd": OPENSSL_DECRYPT_CMD,
+            "migration": migration,
+            "pg_user": os.getenv("POSTGRES_USER") or "display_user",
+            "pg_db": os.getenv("POSTGRES_DB") or "display_system",
+            "counts_sql": _COUNTS_SQL,
+        }).encode("utf-8")
+        sha_line = f"{_sha256_file(enc_path)}  {ENC_NAME}\n".encode("ascii")
+        ts = _msk_ts(now)
+        items = [
+            TarItem(INSTRUCTION_NAME, len(instruction), data=instruction, mtime=ts),
+            TarItem(ENC_NAME, os.path.getsize(enc_path), path=enc_path, mtime=ts),
+            TarItem(SHA_NAME, len(sha_line), data=sha_line, mtime=ts),
+        ]
+        out_path = os.path.join(workdir, filename)
+        size = write_tar(items, out_path)
+        os.remove(enc_path)             # остаётся только внешний tar
+        return BuiltCopy(path=out_path, filename=filename, size=size, workdir=workdir)
+    except BaseException:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+
+
+def cleanup_stale(older_than_s: int = 900) -> int:
+    """Удалить папки сборки в OFFSITE_TMP старше older_than_s секунд (по умолчанию 15 минут); вернуть
+    сколько удалено. Нужна для копий, которые собрали, а ссылку так и не открыли. Трогает только
+    настоящие папки: файл или симлинк в OFFSITE_TMP — чужое, мы его не создавали."""
+    try:
+        names = os.listdir(OFFSITE_TMP)
+    except OSError:
+        return 0
+    cutoff = time.time() - older_than_s
+    removed = 0
+    for name in names:
+        path = os.path.join(OFFSITE_TMP, name)
+        try:
+            if os.path.islink(path) or not os.path.isdir(path) or os.stat(path).st_mtime > cutoff:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.exists(path):
+            removed += 1
+    return removed
