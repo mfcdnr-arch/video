@@ -523,6 +523,76 @@ def test_cleanup_stale_ignores_files_and_symlinks(env):
     assert stray.exists()
 
 
+# --- чистка не трогает идущую сборку ------------------------------------------------------
+
+def test_build_leaves_no_marker_after_success(env):
+    """Маркер «сборка идёт» нужен только пока копия собирается; в готовой папке остаётся один внешний tar."""
+    built = build(env)
+    assert store.BUILD_MARKER not in os.listdir(built.workdir)
+
+
+def test_cleanup_stale_skips_running_build(env, monkeypatch):
+    """Дамп большой базы может идти дольше 15 минут. Пока сборка не закончилась (маркер .building),
+    чистка её папку не трогает, даже если сама папка выглядит старой — иначе копия развалилась бы."""
+    seen = {}
+
+    def slow_dump(dst_path):
+        _fake_pg_dump(dst_path)
+        (workdir,) = [p for p in env.out.iterdir() if p.is_dir()]
+        t = time.time() - 20 * 60
+        os.utime(workdir, (t, t))                    # «прошло 20 минут»
+        seen["marker"] = (workdir / store.BUILD_MARKER).exists()
+        seen["removed"] = store.cleanup_stale()
+        seen["alive"] = workdir.is_dir()
+    monkeypatch.setattr(store, "_pg_dump_gz", slow_dump)
+    built = build(env)
+    assert seen == {"marker": True, "removed": 0, "alive": True}
+    assert os.path.exists(built.path)               # сборка дошла до конца
+
+
+def test_cleanup_stale_removes_crashed_build_after_six_hours(env):
+    """Процесс убили посреди сборки: маркер остался. Через 6 часов это уже не «идёт», а мусор."""
+    crashed = env.out / "crashed"
+    running = env.out / "running"
+    for d in (crashed, running):
+        _write(d / store.BUILD_MARKER, b"")
+        _write(d / "dump.sql.gz", b"x")
+    for d, hours in ((crashed, 7), (running, 5)):
+        t = time.time() - hours * 3600
+        os.utime(d / store.BUILD_MARKER, (t, t))
+        os.utime(d, (t, t))
+    assert store.cleanup_stale() == 1
+    assert not crashed.exists()
+    assert running.exists()
+
+
+def test_cleanup_stale_still_removes_old_dir_without_marker(env):
+    """Готовую, но так и не скачанную копию (маркера уже нет) стираем через 15 минут, как раньше."""
+    done = env.out / "done"
+    _write(done / "ds_copy.tar", b"x")
+    t = time.time() - 20 * 60
+    os.utime(done, (t, t))
+    assert store.cleanup_stale() == 1
+    assert not done.exists()
+
+
+def test_failed_build_removes_marker_with_workdir(env, monkeypatch):
+    def boom(dst_path):
+        raise RuntimeError("Ошибка pg_dump: нет связи")
+    monkeypatch.setattr(store, "_pg_dump_gz", boom)
+    with pytest.raises(RuntimeError):
+        build(env)
+    assert _tmp_is_empty(env)
+
+
+# --- «проект подключён» для статуса ---------------------------------------------------------
+
+def test_project_mounted_flag(env):
+    assert store.project_mounted() is True
+    (env.project / ".env").unlink()
+    assert store.project_mounted() is False
+
+
 # --- монтирование проекта в compose ---------------------------------------------------------
 
 COMPOSE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
