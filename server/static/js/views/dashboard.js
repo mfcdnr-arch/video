@@ -10,7 +10,8 @@ async function viewDash(){
   const view=document.getElementById('view');
   try{
     const d = await api('/dashboard');
-    let h='<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));">';
+    // напоминание о копии на флешку — самым верхним блоком, только у суперадмина (js/views/offsite.js)
+    let h=(isSuper() ? '<div id="offsite-banner"></div>' : '')+'<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));">';
     h+=kpi('Всего экранов', d.screens_total, '');
     h+=kpi('Онлайн', d.screens_online, Math.round((d.screens_online/(d.screens_total||1))*100)+'% сети', 'var(--accent)');
     h+=kpi('Не работают', d.screens_offline, d.screens_offline? 'требуют внимания':'', 'var(--danger)');
@@ -118,6 +119,7 @@ async function viewDash(){
       h+='</table>';
     }
     view.innerHTML=h;
+    if(isSuper()) loadOffsiteBanner();    // из запомненного сразу, затем свежее состояние; ошибка дашборд не ломает
   }catch(e){ view.innerHTML='<div class="empty">Не удалось загрузить дашборд: '+esc(e.message)+'</div>'; }
 }
 const FEED_IC={upload:['◫','#5ba3ec'],sync:['⇄','#7fe3c4'],stop:['■','#ff8a7a'],register:['▣','#7fe3c4'],schedule:['▦','#f5b73d'],backup:['⤓','#aeb4be'],broadcast:['⇄','#12a886'],ticker:['▦','#ffd34d'],advertiser:['◧','#5ba3ec']};

@@ -72,6 +72,9 @@ async function viewSettings(){
       <div class="sec">Журнал операций</div>
       <div id="audit-log-block" class="muted">Загрузка…</div>
 
+      ${isSuper() ? `<div class="sec">Копия на флешку</div>
+      <div id="offsite-block" class="muted">Загрузка…</div>` : ''}
+
       <div class="sec">Резервное копирование</div>
       <div style="margin-bottom:10px;display:flex;align-items:center;gap:12px;">
         <span class="muted" style="font-size:12px;">Авто-бэкап раз в 24 часа &middot; backup_*.sql.gz</span>
@@ -144,6 +147,7 @@ async function viewSettings(){
   loadAuditLog();
   loadBackups();
   if(isSuper()) loadNotifications();
+  if(isSuper()) loadOffsiteBlock();     // блок «Копия на флешку» (js/views/offsite.js)
 }
 
 async function loadNotifications(){
