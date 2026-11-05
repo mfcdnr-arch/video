@@ -659,3 +659,29 @@ def cleanup_stale(older_than_s: int = 900) -> int:
         if not os.path.exists(path):
             removed += 1
     return removed
+
+
+def cleanup_all() -> int:
+    """Стереть всё содержимое OFFSITE_TMP (саму папку оставить); вернуть сколько записей удалено.
+
+    Зовётся при старте API: процесс один, сборка не переживает его перезапуск, поэтому всё, что осталось
+    в OFFSITE_TMP, — недособранная или забытая копия (внутри расшифрованный архив с .env). В отличие
+    от cleanup_stale возраст не смотрит. Симлинк и файл просто удаляются, по ссылке наружу не идём.
+    """
+    try:
+        names = os.listdir(OFFSITE_TMP)
+    except OSError:
+        return 0
+    removed = 0
+    for name in names:
+        path = os.path.join(OFFSITE_TMP, name)
+        try:
+            if os.path.islink(path) or not os.path.isdir(path):
+                os.remove(path)
+            else:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
+        if not os.path.lexists(path):
+            removed += 1
+    return removed

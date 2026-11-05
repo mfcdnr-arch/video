@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import stat
+import threading
 import time
 from typing import Optional
 
@@ -55,6 +56,18 @@ MSG_REDIS = "Хранилище одноразовых ссылок (Redis) не
 MSG_BAD_TICKET = "Ссылка недействительна или устарела — запросите скачивание заново"
 MSG_NO_NEW_MEDIA = "Новых роликов нет"
 MSG_NO_MEDIA = "В медиатеке нет роликов"
+MSG_NO_MEDIA_FILES = "Файлы роликов не найдены на диске — архив не собран"
+MSG_BUSY = "Копия уже собирается — подождите и повторите"
+
+# Сколько собранная копия может лежать на сервере, если ссылку так и не открыли: ссылка живёт 2 минуты,
+# дальше копия никому не нужна, а на диске она опасна (внутри .env и дамп). 15 минут — порог cleanup_stale,
+# минута запаса, чтобы таймер не опередил чистку по возрасту.
+COPY_TTL_S = 15 * 60 + 60
+
+# Одна сборка копии за раз. Дамп и шифрование большой базы идут минуты; повтор «Скачать» из нетерпения
+# (или 504 от nginx и повторный клик) запускал бы параллельные сборки, каждая с расшифрованным
+# архивом на диске. Процесс API один (uvicorn без --workers), поэтому достаточно замка в памяти.
+_build_lock = threading.Lock()
 
 # Имя файла в заголовке Content-Disposition берётся из токена в Redis: пускаем только то, что умеют
 # выдавать наши offsite_rules (латиница, цифры, точка, дефис, подчёркивание), иначе заголовок можно сломать.
@@ -135,6 +148,50 @@ def _own_workdir(workdir) -> bool:
     return os.path.dirname(real) == os.path.realpath(store.OFFSITE_TMP) and os.path.isdir(real)
 
 
+def _sweep_stale() -> None:
+    """Стереть забытые папки сборки. Не должна ронять запрос: чистка — побочное дело."""
+    try:
+        store.cleanup_stale()
+    except Exception as e:
+        log.warning("Копия на флешку: чистка забытых папок не удалась (%s: %s)", type(e).__name__, str(e)[:200])
+
+
+def _expire_copy(workdir: str) -> None:
+    """Сработал таймер выдачи: ссылку за это время не открыли (или открыли, и скачивание уже идёт).
+    Папку стираем в любом случае — идущему скачиванию это не мешает, файл у него открыт и дочитается;
+    заодно подчищаем остальное забытое (например, сборку, которую убили на середине)."""
+    try:
+        _remove_workdir(workdir)
+        store.cleanup_stale()
+    except Exception as e:
+        log.warning("Копия на флешку: не удалось стереть просроченную копию (%s: %s)",
+                    type(e).__name__, str(e)[:200])
+
+
+def _arm_expiry(workdir: str) -> None:
+    """Через COPY_TTL_S стереть папку копии, если она ещё на месте. Без этого неоткрытая копия лежала бы
+    до следующего POST /offsite/copy. Таймер-демон: остановке сервера не мешает."""
+    timer = threading.Timer(COPY_TTL_S, _expire_copy, args=(workdir,))
+    timer.daemon = True
+    timer.start()
+
+
+def _wipe_on_start() -> None:
+    """При старте процесса стереть всё в OFFSITE_TMP: процесс один, и ни одна сборка не переживает его
+    перезапуск, так что всё, что там лежит, — остатки убитой сборки (открытый copy.tar.gz с .env и дампом).
+    Вешается на событие запуска приложения, а не выполняется при импорте: импорт модуля (тесты,
+    celery) не должен ничего стирать."""
+    try:
+        n = store.cleanup_all()
+        if n:
+            log.warning("Копия на флешку: при старте стёрты остатки сборок (%d)", n)
+    except Exception as e:
+        log.warning("Копия на флешку: чистка при старте не удалась (%s: %s)", type(e).__name__, str(e)[:200])
+
+
+router.add_event_handler("startup", _wipe_on_start)
+
+
 def _finish(mark) -> None:
     """Отметить «скачано» новой сессией и закоммитить. Зовётся только после последнего куска потока.
 
@@ -156,6 +213,7 @@ def _finish(mark) -> None:
 
 @router.get("/offsite/status")
 def offsite_status(admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
+    _sweep_stale()                              # панель опрашивает статус постоянно: забытые копии уходят вовремя
     now = now_msk()
     st = store.load_state(db)
     totals = store.media_totals(db, st["media_watermark"])
@@ -229,20 +287,31 @@ def offsite_make_copy(body: CopyBody, request: Request, admin: dict = Depends(re
     if password is None:
         raise HTTPException(409, MSG_NO_PASSWORD)
 
-    store.cleanup_stale()                       # забытые копии прошлых запросов: не копим на диске
+    # Проверка пароля уже позади: посторонний занятость сборки не выведает. Замок берём без ожидания —
+    # второй запрос честно получает «уже собирается», а не встаёт в очередь на минуты (и не плодит копии).
+    if not _build_lock.acquire(blocking=False):
+        raise HTTPException(409, MSG_BUSY)
     try:
-        built = store.build_copy(db, who=who, host=request.headers.get("host"),
-                                 password=password, now=now_msk())
-    except store.ProjectNotMounted:
-        raise HTTPException(503, MSG_NOT_MOUNTED)
-    except (RuntimeError, ValueError, OSError) as e:
-        # build_copy уже убрал за собой папку; текст ошибки очищен от пароля БД и пароля на копию
-        raise HTTPException(500, str(e)[:500] or type(e).__name__)
+        store.cleanup_stale()                   # забытые копии прошлых запросов: не копим на диске
+        try:
+            built = store.build_copy(db, who=who, host=request.headers.get("host"),
+                                     password=password, now=now_msk())
+        except store.ProjectNotMounted:
+            raise HTTPException(503, MSG_NOT_MOUNTED)
+        except (RuntimeError, ValueError, OSError) as e:
+            # build_copy уже убрал за собой папку; текст ошибки очищен от пароля БД и пароля на копию
+            raise HTTPException(500, str(e)[:500] or type(e).__name__)
+    finally:
+        _build_lock.release()
     try:
+        # В токене только путь, имя и кто попросил: пароль на копию в Redis не кладём
         token = _issue_ticket({"kind": "copy", "workdir": built.workdir, "filename": built.filename,
                                "who": who})
-    except HTTPException:
-        _remove_workdir(built.workdir)          # ссылки нет — собранная копия никому не нужна, а на диске опасна
+        _arm_expiry(built.workdir)
+    except BaseException:
+        # Любая беда после сборки (Redis, не получилось запустить таймер, что-то непредвиденное): ссылки нет,
+        # собранная копия никому не нужна, а на диске опасна — стираем и отдаём ошибку дальше
+        _remove_workdir(built.workdir)
         raise
     return {"url": DOWNLOAD_URL + token, "filename": built.filename, "bytes": built.size}
 
@@ -268,10 +337,17 @@ def offsite_make_media(body: MediaBody, admin: dict = Depends(require_superadmin
     upto = totals["max_id"]
     if count == 0 or upto <= after:
         raise HTTPException(409, MSG_NO_NEW_MEDIA if body.scope == "new" else MSG_NO_MEDIA)
+    # Файлы смотрим уже сейчас: архив без единого файла — не архив. Выдай мы на него ссылку, «скачано»
+    # сдвинуло бы водяной знак и сделало напоминание зелёным, хотя на флешке ничего нет.
+    files, _, _, missing = _media_files(store.media_rows(db, after, upto))
+    if not files:
+        raise HTTPException(409, MSG_NO_MEDIA_FILES)
     filename = media_filename(body.scope, now_msk(), after, upto)
     token = _issue_ticket({"kind": "media", "scope": body.scope, "after": after, "upto": upto,
                            "filename": filename, "who": who})
-    return {"url": DOWNLOAD_URL + token, "filename": filename, "count": count, "bytes": size}
+    # count и bytes — по базе; missing — сколько из этих роликов файла на диске не имеют (в архив не войдут)
+    return {"url": DOWNLOAD_URL + token, "filename": filename, "count": count, "bytes": size,
+            "missing": missing}
 
 
 # --- скачивание по одноразовой ссылке -------------------------------------------------------
@@ -359,23 +435,28 @@ def _media_response(db, payload: dict, filename: str, who: str):
         raise HTTPException(404, MSG_BAD_TICKET)
     # Строки читаем заново, а не из токена: за минуты между выдачей и скачиванием файлы могли пропасть,
     # а размер в Content-Length должен соответствовать тому, что реально пойдёт в поток.
-    files, lines, total = _media_files(store.media_rows(db, after, upto))
+    files, lines, total, missing = _media_files(store.media_rows(db, after, upto))
+    if not files:
+        # файлы пропали между выдачей ссылки и скачиванием: пустой архив не отдаём и ничего не отмечаем
+        raise HTTPException(404, MSG_NO_MEDIA_FILES)
     manifest = ("\n".join(lines) + "\n").encode("utf-8") if lines else b""
     items = [TarItem("media/" + MEDIA_MANIFEST, len(manifest), data=manifest, mtime=int(time.time()))] + files
     size = tar_size(items)
     return StreamingResponse(
-        _stream_media(items, who, scope, after, upto, len(files), total), media_type="application/x-tar",
+        _stream_media(items, who, scope, after, upto, len(files), total, missing),
+        media_type="application/x-tar",
         headers=_headers(filename, size))
 
 
-def _media_files(rows) -> tuple[list, list, int]:
-    """Файлы роликов для tar, строки манифеста и сумма байт.
+def _media_files(rows) -> tuple[list, list, int, int]:
+    """Файлы роликов для tar, строки манифеста, сумма байт и число строк базы без файла на диске.
 
     Берём только обычные файлы, лежащие в MEDIA_PATH под своим именем (basename: имя в базе — данные
     пользователя, «../x» не должно вывести за раздел). Нет файла — строка остаётся в манифесте с пометкой
-    «нет файла»: потерянное видно, а архив всё равно собирается. Один файл на две строки базы кладём раз.
+    «нет файла», а в missing считается: потерянное видно, и архив с частью файлов всё равно собирается
+    (вызывающий решает, что делать, если не нашлось ни одного). Один файл на две строки базы кладём раз.
     """
-    files, lines, seen, total = [], [], set(), 0
+    files, lines, seen, total, missing = [], [], set(), 0, 0
     for r in rows:
         base = store.safe_basename(r.filename)
         st = None
@@ -389,6 +470,7 @@ def _media_files(rows) -> tuple[list, list, int]:
         tail = f"\t{_cell(r.md5_hash)}"
         if st is None or not stat.S_ISREG(st.st_mode):
             lines.append(head + str(int(r.filesize or 0)) + tail + "\tнет файла")
+            missing += 1
             continue
         lines.append(head + str(st.st_size) + tail)
         if base in seen:
@@ -397,17 +479,21 @@ def _media_files(rows) -> tuple[list, list, int]:
         files.append(TarItem("media/" + base, st.st_size, path=os.path.join(MEDIA_PATH, base),
                              mtime=int(st.st_mtime)))
         total += st.st_size
-    return files, lines, total
+    return files, lines, total, missing
 
 
-def _stream_media(items, who: str, scope: str, after: int, upto: int, count: int, total: int):
+def _stream_media(items, who: str, scope: str, after: int, upto: int, count: int, total: int,
+                  missing: int = 0):
     yield from iter_tar(items, CHUNK)
     # Весь архив ушёл — только теперь водяной знак двигается до upto (а не до текущего максимума)
-    _finish(lambda db: _mark_media(db, who, scope, after, upto, count, total))
+    _finish(lambda db: _mark_media(db, who, scope, after, upto, count, total, missing))
 
 
-def _mark_media(db, who: str, scope: str, after: int, upto: int, count: int, total: int) -> None:
+def _mark_media(db, who: str, scope: str, after: int, upto: int, count: int, total: int,
+                missing: int = 0) -> None:
     store.mark_media_done(db, who, scope, upto, count, total, now_msk())
     kind = "новые" if scope == "new" else "все"
-    store.audit(db, "Ролики скачаны на флешку",
-                f"{kind}, {count} шт, {_mb(total)}, id {after + 1}–{upto}", who)
+    detail = f"{kind}, {count} шт, {_mb(total)}, id {after + 1}–{upto}"
+    if missing:
+        detail += f", нет файла: {missing}"       # потерянное не прячем: видно и в журнале, не только в манифесте
+    store.audit(db, "Ролики скачаны на флешку", detail, who)
