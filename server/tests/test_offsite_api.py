@@ -14,6 +14,7 @@ World — «база» с состоянием (одна строка offsite_co
 import asyncio
 import gc
 import io
+import json
 import os
 import re
 import tarfile
@@ -234,6 +235,23 @@ def env(tmp_path, monkeypatch, world):
     media.mkdir()
     out = tmp_path / "offsite_tmp"
     redis = FakeRedis()
+    timers = []
+
+    class FakeTimer:
+        """Вместо настоящего threading.Timer на 16 минут: запоминаем и даём «сработать» вручную."""
+
+        def __init__(self, interval, function, args=None, kwargs=None):
+            self.interval, self.function, self.args = interval, function, tuple(args or ())
+            self.daemon = False
+            self.started = False
+            timers.append(self)
+
+        def start(self):
+            self.started = True
+
+        def fire(self):
+            self.function(*self.args)
+    monkeypatch.setattr("threading.Timer", FakeTimer)
     monkeypatch.setattr(store, "PROJECT_DIR", str(project))
     monkeypatch.setattr(store, "BACKUP_DIR", str(tmp_path / "backups"))
     monkeypatch.setattr(store, "MEDIA_PATH", str(media))
@@ -246,7 +264,7 @@ def env(tmp_path, monkeypatch, world):
     monkeypatch.setattr(offsite, "now_msk", lambda: NOW)
     monkeypatch.setenv("POSTGRES_USER", "display_user")
     monkeypatch.setenv("POSTGRES_DB", "display_system")
-    return NS(project=project, media=media, out=out, redis=redis, tmp=tmp_path)
+    return NS(project=project, media=media, out=out, redis=redis, tmp=tmp_path, timers=timers)
 
 
 @pytest.fixture
@@ -644,6 +662,7 @@ def test_copy_redis_down_when_issuing_removes_built_copy(client, world, env):
     r = post_copy(client)
     assert r.status_code == 503 and r.json()["detail"] == REDIS_DOWN
     assert tmp_is_empty(env)                                        # собранная копия не осталась лежать
+    assert env.timers == []
 
 
 def test_media_redis_down_503(client, world, env):
@@ -804,8 +823,8 @@ def test_media_new_flow_moves_watermark(client, world, env):
     r = post_media(client, "new")
     assert r.status_code == 200
     m = r.json()
-    assert set(m) == {"url", "filename", "count", "bytes"}
-    assert (m["count"], m["bytes"]) == (3, 6000)
+    assert set(m) == {"url", "filename", "count", "bytes", "missing"}
+    assert (m["count"], m["bytes"], m["missing"]) == (3, 6000, 0)
     assert m["filename"] == "ds_media_new_2026-11-04_0930_id1-3.tar"
     assert re.fullmatch(r"/api/offsite/download\?t=[A-Za-z0-9_-]{32,}", m["url"])
     assert world.state["media_watermark"] == 0                      # ссылку выдали — знак не двигается
@@ -902,6 +921,7 @@ def test_media_missing_file_skipped(client, world, env):
     add_media(world, env, 3, 300)
     m = post_media(client, "new").json()
     assert m["count"] == 3                                          # по базе
+    assert m["missing"] == 1                                        # из них без файла на диске
     g = get_download(client, m["url"])
     assert g.status_code == 200
     assert int(g.headers["content-length"]) == len(g.content)       # размер посчитан по тем, что реально идут
@@ -916,6 +936,8 @@ def test_media_missing_file_skipped(client, world, env):
     assert world.state["media_watermark"] == 3
     assert world.state["last_media_count"] == 2
     assert world.state["last_media_bytes"] == 400
+    # потерянное видно и в журнале, не только в манифесте
+    assert re.fullmatch(r"новые, 2 шт, \d+\.\d МБ, id 1–3, нет файла: 1", world.audit[0][2])
 
 
 def test_media_non_regular_file_counts_as_missing(client, world, env):
@@ -983,6 +1005,275 @@ def test_media_bad_scope_400(client, body):
     assert "new" in r.json()["detail"] and "all" in r.json()["detail"]
 
 
+# --- забытые копии не лежат на диске --------------------------------------------------------
+
+def _old_dir(env, name="forgotten", age_s=3600):
+    d = env.out / name
+    _write(d / "ds_copy.tar", b"x")
+    t = os.stat(d).st_mtime - age_s
+    os.utime(d, (t, t))
+    return d
+
+
+def test_status_sweeps_stale_dirs(client, env):
+    """Копию собрали, ссылку так и не открыли (закрытая вкладка, 504): панель опрашивает статус, и
+    забытая папка уходит без ожидания следующего «Скачать»."""
+    old = _old_dir(env)
+    fresh = env.out / "fresh"
+    _write(fresh / "ds_copy.tar", b"x")
+    assert client.get("/offsite/status", headers=bearer()).status_code == 200
+    assert not old.exists()
+    assert fresh.exists()                                           # свежую не трогаем
+
+
+def test_status_for_non_superadmin_sweeps_nothing(client, env):
+    old = _old_dir(env)
+    assert client.get("/offsite/status", headers=bearer("admin")).status_code == 403
+    assert old.exists()
+
+
+def test_status_survives_sweep_failure(client, env, monkeypatch):
+    def boom(*a, **kw):
+        raise OSError("диск недоступен")
+    monkeypatch.setattr(store, "cleanup_stale", boom)
+    assert client.get("/offsite/status", headers=bearer()).status_code == 200
+
+
+def test_copy_arms_expiry_timer_that_removes_workdir(client, world, env):
+    with_copy_password(world)
+    j = post_copy(client).json()
+    assert len(env.timers) == 1
+    t = env.timers[0]
+    assert t.started and t.daemon                                   # демон: остановке сервера не мешает
+    assert t.interval >= 15 * 60                                    # не раньше порога чистки по возрасту
+    assert len(list(env.out.iterdir())) == 1
+    t.fire()                                                        # «прошло 16 минут», ссылку не открыли
+    assert tmp_is_empty(env)
+    assert get_download(client, j["url"]).status_code == 404        # скачивать уже нечего
+
+
+def test_expiry_also_sweeps_other_forgotten_dirs(client, world, env):
+    with_copy_password(world)
+    post_copy(client)
+    old = _old_dir(env, "killed_build")
+    env.timers[0].fire()
+    assert not old.exists() and tmp_is_empty(env)
+
+
+def test_expiry_callback_is_harmless_when_dir_is_gone(env):
+    offsite._expire_copy(str(env.out / "no_such"))                  # не падает
+
+
+def test_expiry_does_not_break_a_download_in_progress(client, world, env):
+    """Таймер сработал, пока файл качают (большая копия по медленной флешке): открытый файл дочитается."""
+    with_copy_password(world)
+    j = post_copy(client).json()
+    resp = offsite.download(t=token_of(j["url"]), db=world.session())
+    env.timers[0].fire()
+    assert tmp_is_empty(env)
+
+    async def drain():
+        return b"".join([c async for c in resp.body_iterator])
+    body = asyncio.run(drain())
+    assert len(body) == j["bytes"] and "copy.tar.gz.enc" in tar_members(body)
+    assert world.state["last_copy_at"] == NOW                       # отдано целиком — отмечено
+
+
+def test_no_timer_when_build_failed(client, world, env):
+    with_copy_password(world)
+    (env.project / ".env").unlink()
+    assert post_copy(client).status_code == 503
+    assert env.timers == []
+
+
+def test_ticket_payload_has_no_password(client, world, env):
+    with_copy_password(world)
+    j = post_copy(client).json()
+    (raw,) = env.redis.data.values()
+    assert set(json.loads(raw)) == {"kind", "workdir", "filename", "who"}
+    for secret in (COPY_PW, LOGIN_PW):
+        assert secret not in raw.decode("utf-8")
+    assert j["url"].split("t=")[1] in next(iter(env.redis.data))
+
+
+@pytest.mark.parametrize("exc", [KeyError("неожиданно"), RuntimeError("redis-py сломался"), ValueError("x")])
+def test_any_error_issuing_ticket_removes_built_copy(client, world, env, monkeypatch, exc):
+    """Не только Redis: что бы ни упало после сборки, расшифрованная копия на диске не остаётся."""
+    with_copy_password(world)
+
+    def boom(payload, ttl=120):
+        raise exc
+    monkeypatch.setattr(store, "issue_ticket", boom)
+    quiet = TestClient(client.app, raise_server_exceptions=False)
+    r = post_copy(quiet)
+    assert r.status_code == 500
+    assert tmp_is_empty(env) and env.timers == []
+    assert not offsite._build_lock.locked()
+
+
+def test_timer_start_failure_removes_built_copy(client, world, env, monkeypatch):
+    with_copy_password(world)
+
+    def boom(workdir):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(offsite, "_arm_expiry", boom)
+    quiet = TestClient(client.app, raise_server_exceptions=False)
+    assert post_copy(quiet).status_code == 500
+    assert tmp_is_empty(env)
+
+
+def test_startup_wipes_everything_in_offsite_tmp(client, env):
+    """Процесс один: после перезапуска ни одна сборка не жива, всё в OFFSITE_TMP — остатки убитой
+    (в них расшифрованный архив с .env). Свежесть не важна."""
+    killed = env.out / "killed_build"
+    _write(killed / store.BUILD_MARKER, b"")
+    _write(killed / "copy.tar.gz", b"plaintext with .env")
+    _write(env.out / "stray.tar", b"x")
+    outside = env.tmp / "outside"
+    _write(outside / "keep.txt", b"keep")
+    os.symlink(outside, env.out / "link")
+    with TestClient(client.app):                                    # вход в with запускает события старта
+        assert os.listdir(env.out) == []
+    assert (outside / "keep.txt").read_bytes() == b"keep"           # по ссылке наружу не ходим
+
+
+def test_startup_hook_is_registered_and_import_wipes_nothing(client, env):
+    assert offsite._wipe_on_start in offsite.router.on_startup
+    leftover = env.out / "build"
+    _write(leftover / "copy.tar.gz", b"x")
+    client.get("/offsite/status", headers=bearer())                 # обычные запросы без запуска приложения
+    assert leftover.exists()
+
+
+def test_startup_wipe_failure_does_not_block_the_app(client, env, monkeypatch):
+    def boom():
+        raise OSError("нет доступа")
+    monkeypatch.setattr(store, "cleanup_all", boom)
+    with TestClient(client.app) as c:
+        assert c.get("/offsite/status", headers=bearer()).status_code == 200
+
+
+# --- одна сборка за раз ---------------------------------------------------------------------
+
+def test_copy_busy_409_while_another_build_runs(client, world, env):
+    with_copy_password(world)
+    assert offsite._build_lock.acquire(blocking=False)
+    try:
+        r = post_copy(client)
+    finally:
+        offsite._build_lock.release()
+    assert r.status_code == 409 and r.json()["detail"] == "Копия уже собирается — подождите и повторите"
+    assert tmp_is_empty(env) and env.redis.data == {} and env.timers == []
+
+
+def test_busy_check_comes_after_the_login_check(client, world):
+    """Занятость сборки — не повод выдать её постороннему: сначала пароль входа."""
+    with_copy_password(world)
+    assert offsite._build_lock.acquire(blocking=False)
+    try:
+        r = post_copy(client, login="wrong-login-pass")
+    finally:
+        offsite._build_lock.release()
+    assert r.status_code == 403
+    assert [a[1] for a in world.audit] == ["Неверный пароль при скачивании копии"]
+
+
+def test_second_click_during_real_build_gets_409(client, world, env, monkeypatch):
+    """Настоящий сценарий: пока идёт сборка, приходит второй «Скачать» — собирается одна копия, не две."""
+    with_copy_password(world)
+    nested = {}
+
+    def slow_dump(dst_path):
+        _fake_pg_dump(dst_path)
+        if "r" not in nested:                   # второй клик — один раз (без замка он сам запустил бы сборку)
+            nested["r"] = None
+            nested["r"] = post_copy(client)
+    monkeypatch.setattr(store, "_pg_dump_gz", slow_dump)
+    r = post_copy(client)
+    assert r.status_code == 200
+    assert nested["r"].status_code == 409
+    assert len(env.timers) == 1 and len(list(env.out.iterdir())) == 1
+    assert not offsite._build_lock.locked()
+
+
+@pytest.mark.parametrize("exc", [store.ProjectNotMounted("нет .env"), RuntimeError("boom"),
+                                 OSError("диск"), KeyError("неожиданно")])
+def test_build_lock_released_after_failure(client, world, env, monkeypatch, exc):
+    with_copy_password(world)
+
+    real, calls = store.build_copy, []
+
+    def flaky(*a, **kw):
+        if not calls:
+            calls.append(1)
+            raise exc                                               # первая сборка падает, вторая — настоящая
+        return real(*a, **kw)
+    monkeypatch.setattr(store, "build_copy", flaky)
+    quiet = TestClient(client.app, raise_server_exceptions=False)
+    assert post_copy(quiet).status_code in (500, 503)
+    assert not offsite._build_lock.locked()
+    assert post_copy(client).status_code == 200                     # замок свободен — следующая сборка идёт
+
+
+def test_build_lock_released_after_success(client, world):
+    with_copy_password(world)
+    assert post_copy(client).status_code == 200
+    assert not offsite._build_lock.locked()
+    assert post_copy(client).status_code == 200                     # и следующая сборка не упирается в замок
+
+
+# --- ролики без файлов ----------------------------------------------------------------------
+
+def test_media_all_files_missing_409_and_nothing_moves(client, world, env):
+    """Архив без единого файла — не архив: ссылки нет, водяной знак на месте, напоминание не зеленеет."""
+    for i in (1, 2, 3):
+        add_media(world, env, i, 50, file=False)
+    with_copy_password(world, last_copy_at=datetime(2026, 11, 4, 7, 0, 0), last_copy_by="boss")
+    before = dict(world.state)
+    for scope in ("new", "all"):
+        r = post_media(client, scope)
+        assert r.status_code == 409
+        assert r.json()["detail"] == "Файлы роликов не найдены на диске — архив не собран"
+    assert env.redis.data == {} and world.state == before and world.audit == []
+    j = client.get("/offsite/status", headers=bearer()).json()
+    assert j["media"]["new_count"] == 3 and j["state"] == "warn"
+
+
+def test_media_files_vanish_before_download_404(client, world, env):
+    for i in (1, 2, 3):
+        add_media(world, env, i, 50)
+    m = post_media(client, "new").json()
+    for i in (1, 2, 3):
+        os.remove(env.media / f"clip{i}.mp4")                       # файлы пропали, пока ссылку не открыли
+    g = get_download(client, m["url"])
+    assert g.status_code == 404
+    assert g.json()["detail"] == "Файлы роликов не найдены на диске — архив не собран"
+    assert world.state is None or world.state["media_watermark"] == 0
+    assert world.audit == []
+
+
+def test_media_rows_deleted_before_download_404(client, world, env):
+    add_media(world, env, 1, 50)
+    m = post_media(client, "new").json()
+    world.media.clear()                                             # ролики удалили из медиатеки
+    g = get_download(client, m["url"])
+    assert g.status_code == 404
+    assert world.state is None or world.state["last_media_at"] is None
+    assert world.audit == []
+
+
+def test_media_partial_loss_is_counted_in_post_and_audit(client, world, env):
+    add_media(world, env, 1, 100)
+    add_media(world, env, 2, 100, file=False)
+    add_media(world, env, 3, 100, file=False)
+    m = post_media(client, "new").json()
+    assert (m["count"], m["missing"]) == (3, 2)
+    g = get_download(client, m["url"])
+    assert g.status_code == 200
+    assert re.fullmatch(r"новые, 1 шт, \d+\.\d МБ, id 1–3, нет файла: 2", world.audit[0][2])
+    assert world.state["media_watermark"] == 3 and world.state["last_media_count"] == 1
+
+
 # --- сброс пароля на сервере ------------------------------------------------------------------
 
 def test_reset_offsite_password_script(world, monkeypatch, capsys):
@@ -1045,7 +1336,8 @@ def test_nginx_offsite_location_before_api_and_unbuffered():
     assert i_off < i_api
     block = text[i_off:text.index("\n        }\n", i_off)]
     for needle in ("rewrite ^/api/(.*)$ /$1 break;", "proxy_pass $ds_api;", "proxy_buffering off;",
-                   "proxy_read_timeout 300s;", "proxy_http_version 1.1;", "proxy_set_header Host $host;",
+                   "proxy_read_timeout 3600s;", "send_timeout 300s;", "proxy_http_version 1.1;", "proxy_set_header Host $host;",
                    "proxy_set_header X-Real-IP $remote_addr;"):
         assert needle in block, needle
+    assert "proxy_read_timeout 300s" not in block       # сборка копии дольше 5 минут не должна давать 504
     assert "X-DS-Accel" not in block        # этот роутер X-Accel-Redirect не отдаёт

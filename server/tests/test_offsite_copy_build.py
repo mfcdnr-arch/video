@@ -585,6 +585,31 @@ def test_failed_build_removes_marker_with_workdir(env, monkeypatch):
     assert _tmp_is_empty(env)
 
 
+# --- полная чистка при старте ---------------------------------------------------------------
+
+def test_cleanup_all_wipes_everything_regardless_of_age(env):
+    """Старт процесса: ни одна сборка не пережила перезапуск, значит всё в OFFSITE_TMP — остатки. Возраст и маркер
+    не спасают: свежая папка с маркером — тоже остатки убитой сборки."""
+    running = env.out / "running"
+    _write(running / store.BUILD_MARKER, b"")
+    _write(running / "copy.tar.gz", b"plaintext")
+    done = env.out / "done"
+    _write(done / "ds_copy.tar", b"x")
+    stray = _write(env.out / "stray.txt", b"s")
+    victim = env.tmp / "victim"
+    _write(victim / "keep.txt", b"keep")
+    os.symlink(victim, env.out / "link")
+    assert store.cleanup_all() == 4
+    assert os.listdir(env.out) == []
+    assert env.out.is_dir()                                         # сама папка остаётся
+    assert (victim / "keep.txt").read_bytes() == b"keep"            # по симлинку наружу не ходили
+    assert not stray.exists()
+
+
+def test_cleanup_all_without_dir_is_not_an_error(env):
+    assert store.cleanup_all() == 0
+
+
 # --- «проект подключён» для статуса ---------------------------------------------------------
 
 def test_project_mounted_flag(env):
