@@ -19,7 +19,8 @@
 #                  копию и задаёт тестовый (SMOKE-copy-pass-1), собирает и скачивает копию и
 #                  ролики (двигает отметку «последняя копия» и «водяной знак» роликов),
 #                  проверяет tar с тремя файлами и расшифровку, пишет в журнал; в конце снова
-#                  сбрасывает пароль на копию — поэтому только на стенде, не на боевом сервере
+#                  сбрасывает пароль на копию — поэтому только на стенде: шаг сам отказывает
+#                  (проверка проваливается), если контейнер ds_api не из compose-проекта dsdev
 #
 # Код возврата 0 — все проверки прошли; иначе число упавших проверок.
 set -uo pipefail
@@ -1089,14 +1090,15 @@ fi
 # токену экрана — 401; по входу статус — 200 со всеми ключами, без пароля, «ok/warn» согласован с
 # «копия сегодня и новых роликов нет»; ссылка скачивания с чужим или пустым кодом — 404; неверный
 # объём роликов — 400.
-# С SMOKE_ALLOW_OFFSITE=1 (только стенд: меняет пароль на копию и отметки «скачано»): пароль на копию
-# сбрасывается на сервере и задаётся заново (неверный пароль входа → 403, не совпали → 400, слабый → 400,
+# С SMOKE_ALLOW_OFFSITE=1 (только стенд dsdev: меняет пароль на копию и отметки «скачано»; до первого
+# изменения проверяется метка compose-проекта контейнера ds_api, не dsdev — отказ и провал проверки):
+# пароль на копию сбрасывается на сервере и задаётся заново (неверный пароль входа → 403, не совпали → 400, слабый → 400,
 # смена без текущего → 403); копия без пароля → 409, с неверным паролем входа → 403; копия собирается,
-# ссылка отдаёт tar ровно из трёх файлов (инструкция, запертая часть, sha256), сумма сходится, запертая
-# часть открывается openssl паролем на копию и не открывается чужим, внутри база, программа с .env и
+# ссылка отдаёт НЕсжатый tar ровно из трёх файлов (инструкция с командой расшифровки как на сервере,
+# запертая часть, sha256), сумма сходится, запертая часть открывается openssl паролем на копию и не открывается чужим, внутри база, программа с .env и
 # опись; второй заход по ссылке → 404; «скачано» попало в статус и в журнал (пароля в журнале нет);
-# ролики «новые» — tar с манифестом и файлом тестового ролика, после скачивания «новых» нет (409), «все»
-# — тоже скачиваются; напоминание в итоге «ok». В конце пароль на копию снова сбрасывается (и при обрыве
+# ролики «новые» — tar с манифестом и файлом тестового ролика («нет файла» в манифесте = missing из ответа),
+# после скачивания «новых» нет (409), «все» — тоже скачиваются; напоминание в итоге «ok». В конце пароль на копию снова сбрасывается (и при обрыве
 # скрипта): стенд остаётся без пароля. Отметка «последняя копия» и «водяной знак» роликов остаются.
 step "Копия на флешку: доступ и одноразовая ссылка"
 JSON_O='Content-Type: application/json'
@@ -1123,8 +1125,11 @@ req POST "/offsite/media" -H "$JSON_O" -d '{"scope":"zzz"}'
 # Скрипты проверки архивов — внутри ds_api (там есть python3, tarfile и openssl)
 OFF_PY_COPY='
 import sys, tarfile, hashlib, subprocess, tempfile, os, shutil
-path, pw, instr, enc_name, sha_name = sys.argv[1:6]
-t = tarfile.open(path)
+path, pw, instr, enc_name, sha_name, decrypt_cmd = sys.argv[1:7]
+try:
+    t = tarfile.open(path, "r:")      # только несжатый tar: сжатый gzip-ом здесь не открывается
+except Exception as e:
+    print("архив не открывается как несжатый tar: " + ascii(str(e))); sys.exit(0)
 names = sorted(m.name for m in t.getmembers())
 if names != sorted([instr, enc_name, sha_name]):
     print("состав tar: " + ascii(names)); sys.exit(0)
@@ -1143,7 +1148,7 @@ try:
         print("запертая часть не в формате openssl"); sys.exit(0)
     text = t.extractfile(instr).read().decode("utf-8")
     if pw in text: print("пароль на копию лежит в инструкции"); sys.exit(0)
-    if "openssl enc -d" not in text: print("в инструкции нет команды расшифровки"); sys.exit(0)
+    if decrypt_cmd not in text: print("в инструкции нет команды расшифровки как на сервере: " + decrypt_cmd); sys.exit(0)
     def dec(p, out):
         return subprocess.run(["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-md", "sha256", "-iter", "200000",
                                "-pass", "pass:" + p, "-in", enc, "-out", out], capture_output=True).returncode
@@ -1163,7 +1168,10 @@ finally:
 OFF_PY_MEDIA='
 import sys, tarfile
 path, fname, title = sys.argv[1:4]
-t = tarfile.open(path)
+try:
+    t = tarfile.open(path, "r:")      # только несжатый tar: сжатый gzip-ом здесь не открывается
+except Exception as e:
+    print("архив не открывается как несжатый tar: " + ascii(str(e))); sys.exit(0)
 names = t.getnames()
 man = "media/MANIFEST_media.txt"
 if man not in names: print("нет MANIFEST_media.txt"); sys.exit(0)
@@ -1174,10 +1182,20 @@ if "media/" + fname not in names: print("в архиве нет файла те�
 print("OK %d %d %d" % (len([n for n in names if n != man]), len(lines), sum(1 for l in lines if l.endswith("нет файла"))))
 '
 
+# Охрана: шаг с флагом стирает пароль на копию и сдвигает «водяной знак» роликов (его reset не откатывает),
+# а имя контейнера ds_api у боевого сервера такое же, как у стенда. Поэтому до первого изменения состояния
+# проверяем метку compose-проекта контейнера: только dsdev (bash dev_stand.sh up) — всё остальное отказ.
+off_on_dev_stand(){ [ "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' ds_api 2>/dev/null)" = "dsdev" ]; }
 if [ "${SMOKE_ALLOW_OFFSITE:-}" != "1" ]; then
   echo "  – копия и ролики на флешку (пароль, сборка, скачивание) — пропущено (задайте SMOKE_ALLOW_OFFSITE=1 на стенде)"
+elif ! off_on_dev_stand; then
+  bad "шаг копии на флешку с флагом — только на стенде dsdev (bash dev_stand.sh up); пропущено"
 else
   OFF_PW0="SMOKE-copy-pass-0"; OFF_PW1="SMOKE-copy-pass-1"
+  # команда расшифровки — как её знает сервер (OPENSSL_DECRYPT_CMD); в инструкции на флешке она должна стоять слово в слово
+  OFF_DECRYPT=$($DC python -c "import sys; sys.path.insert(0, '/app'); from offsite_crypto import OPENSSL_DECRYPT_CMD; print(OPENSSL_DECRYPT_CMD)" 2>/dev/null)
+  [[ "$OFF_DECRYPT" == *"-aes-256-cbc -pbkdf2 -md sha256 -iter 200000"* ]] && ok "команда расшифровки взята с сервера: $OFF_DECRYPT" \
+    || bad "команду расшифровки с сервера прочитать не удалось или она другая: «$OFF_DECRYPT»"
   OFF_DIR="/tmp/smoke_offsite_$STAMP"; OFF_DIRTY=1
   off_finish(){ # пароль на копию — снова сбросить (и при обрыве скрипта), убрать скачанные тестовые файлы
     if [ "$OFF_DIRTY" = "1" ]; then
@@ -1254,8 +1272,8 @@ else
        && [[ "$(off_hdr content-disposition)" == *"filename=\"$OFF_FILE\""* ]] && [[ "$(off_hdr content-type)" == application/x-tar* ]]; then
       ok "скачивание по ссылке без входа: 200, $OFF_SIZE байт = Content-Length, имя $OFF_FILE, application/x-tar"
     else bad "скачивание копии: HTTP $OFF_CODE, на диске ${OFF_SIZE:-?} из $OFF_BYTES, Content-Length «$(off_hdr content-length)»"; fi
-    R=$($DC python3 -I -c "$OFF_PY_COPY" "$OFF_DIR/copy.tar" "$OFF_PW1" "ВОССТАНОВЛЕНИЕ.txt" "copy.tar.gz.enc" "copy.tar.gz.enc.sha256" 2>&1)
-    if [[ "$R" == OK* ]]; then ok "копия: tar из трёх файлов, sha256 сходится, openssl открывает паролем на копию, чужим — нет, внутри база, программа с .env и опись (${R#OK } файлов)"
+    R=$($DC python3 -I -c "$OFF_PY_COPY" "$OFF_DIR/copy.tar" "$OFF_PW1" "ВОССТАНОВЛЕНИЕ.txt" "copy.tar.gz.enc" "copy.tar.gz.enc.sha256" "$OFF_DECRYPT" 2>&1)
+    if [[ "$R" == OK* ]]; then ok "копия: несжатый tar из трёх файлов, sha256 сходится, в инструкции команда расшифровки как на сервере, openssl открывает паролем на копию, чужим — нет, внутри база, программа с .env и опись (${R#OK } файлов)"
     else bad "проверка содержимого копии: $R"; fi
     off_get "$OFF_URL" "$OFF_DIR/copy2.tar"
     [ "$OFF_CODE" = "404" ] && ok "вторая попытка по той же ссылке — 404 (ссылка одноразовая)" || bad "вторая попытка по ссылке: HTTP $OFF_CODE (ждали 404)"
@@ -1273,8 +1291,8 @@ else
   # 4. ролики: «новые», потом «все»
   req GET "/media/${MID:-0}"; OFF_MFILE=$(body_get filename)
   req POST "/offsite/media" -H "$JSON_O" -d '{"scope":"new"}'
-  if [ "$HTTP" = "200" ] && body_has "r['url'].startswith('/api/offsite/download?t=') and r['filename'].startswith('ds_media_new_') and r['filename'].endswith('.tar') and r['count']>=1 and r['bytes']>0 and r['missing']==0"; then
-    OFF_URL=$(body_get url); OFF_MFN=$(body_get filename); OFF_MCNT=$(body_get count)
+  if [ "$HTTP" = "200" ] && body_has "r['url'].startswith('/api/offsite/download?t=') and r['filename'].startswith('ds_media_new_') and r['filename'].endswith('.tar') and r['count']>=1 and r['bytes']>0 and isinstance(r['missing'],int)"; then
+    OFF_URL=$(body_get url); OFF_MFN=$(body_get filename); OFF_MCNT=$(body_get count); OFF_MMISS=$(body_get missing)
     ok "ролики «новые»: $OFF_MFN, $OFF_MCNT шт, ссылка выдана"
   else
     OFF_URL=""; bad "ролики «новые»: HTTP $HTTP $BODY"
@@ -1286,8 +1304,8 @@ else
     R=$($DC python3 -I -c "$OFF_PY_MEDIA" "$OFF_DIR/media_new.tar" "${OFF_MFILE:-?}" "SMOKE_media_$STAMP" 2>&1)
     if [[ "$R" == OK* ]]; then
       read -r _ OFF_NF OFF_NL OFF_NM <<< "$R"
-      [ "$OFF_NL" = "$OFF_MCNT" ] && [ "$OFF_NM" = "0" ] && ok "архив «новых»: файлов $OFF_NF, манифест на $OFF_NL строк = число из ответа, файл тестового ролика внутри, без пропавших" \
-        || bad "архив «новых»: в манифесте $OFF_NL строк (ждали $OFF_MCNT), без файла: $OFF_NM"
+      [ "$OFF_NL" = "$OFF_MCNT" ] && [ "$OFF_NM" = "$OFF_MMISS" ] && ok "архив «новых»: файлов $OFF_NF, манифест на $OFF_NL строк = count из ответа, «нет файла» в манифесте ($OFF_NM) = missing из ответа ($OFF_MMISS), файл тестового ролика внутри" \
+        || bad "архив «новых»: в манифесте $OFF_NL строк (ждали $OFF_MCNT), «нет файла» $OFF_NM (в ответе missing=$OFF_MMISS)"
     else bad "проверка архива «новых»: $R"; fi
     off_get "$OFF_URL" "$OFF_DIR/media_new2.tar"
     [ "$OFF_CODE" = "404" ] && ok "ролики: вторая попытка по ссылке — 404" || bad "ролики, вторая попытка: HTTP $OFF_CODE (ждали 404)"
@@ -1297,13 +1315,14 @@ else
     [ "$HTTP" = "409" ] && detail_has "Новых роликов нет" && ok "«новые» после скачивания — 409 «Новых роликов нет»" || bad "«новые» повторно: HTTP $HTTP (ждали 409)"
   fi
   req POST "/offsite/media" -H "$JSON_O" -d '{"scope":"all"}'
-  if [ "$HTTP" = "200" ] && body_has "r['filename'].startswith('ds_media_all_') and r['count']>=1 and r['missing']==0"; then
-    OFF_URL=$(body_get url); OFF_MCNT=$(body_get count)
+  if [ "$HTTP" = "200" ] && body_has "r['filename'].startswith('ds_media_all_') and r['count']>=1 and isinstance(r['missing'],int)"; then
+    OFF_URL=$(body_get url); OFF_MCNT=$(body_get count); OFF_MMISS=$(body_get missing)
     off_get "$OFF_URL" "$OFF_DIR/media_all.tar"
     R=$($DC python3 -I -c "$OFF_PY_MEDIA" "$OFF_DIR/media_all.tar" "${OFF_MFILE:-?}" "SMOKE_media_$STAMP" 2>&1)
     if [ "$OFF_CODE" = "200" ] && [[ "$R" == OK* ]]; then
       read -r _ OFF_NF OFF_NL OFF_NM <<< "$R"
-      [ "$OFF_NL" = "$OFF_MCNT" ] && ok "ролики «все»: $OFF_MCNT шт скачались, манифест и файл тестового ролика на месте" || bad "ролики «все»: в манифесте $OFF_NL строк (ждали $OFF_MCNT)"
+      [ "$OFF_NL" = "$OFF_MCNT" ] && [ "$OFF_NM" = "$OFF_MMISS" ] && ok "ролики «все»: $OFF_MCNT шт скачались, манифест на $OFF_NL строк, «нет файла» ($OFF_NM) = missing из ответа, файл тестового ролика на месте" \
+        || bad "ролики «все»: в манифесте $OFF_NL строк (ждали $OFF_MCNT), «нет файла» $OFF_NM (в ответе missing=$OFF_MMISS)"
     else bad "ролики «все»: HTTP $OFF_CODE, $R"; fi
   else bad "ролики «все»: HTTP $HTTP $BODY"; fi
   req GET "/audit?limit=100"
