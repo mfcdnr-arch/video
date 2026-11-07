@@ -42,8 +42,9 @@
 #                  скрипт СБРАСЫВАЕТ пароль на копию на сервере (docker exec ds_api python
 #                  /app/reset_offsite_password.py), прогон задаёт тестовый пароль
 #                  E2E-copy-pass-1, собирает и скачивает копию и ролики (двигает отметку
-#                  «последняя копия» и «водяной знак» роликов) — только на стенде, не на
-#                  боевом сервере; без переменной шаги пропускаются с пометкой,
+#                  «последняя копия» и «водяной знак» роликов) — только на стенде: скрипт
+#                  до любых действий проверяет, что ds_api из compose-проекта dsdev, иначе
+#                  отказ с кодом 1; без переменной шаги пропускаются с пометкой,
 #                  E2E_SHOTS_DIR=папка — сохранить туда снимки экрана шага «Копия на
 #                  флешку» (нужен E2E_ALLOW_OFFSITE=1; папка монтируется в контейнер).
 #
@@ -72,8 +73,23 @@ fi
 
 # «Копия на флешку» (E2E_ALLOW_OFFSITE=1): пароль на копию сбрасывается на сервере ДО прогона (прогон
 # задаёт его сам и ждёт, что его нет) и ПОСЛЕ — в том числе при Ctrl+C и при обрыве: стенд остаётся без пароля.
+# Охрана: шаг стирает пароль на копию и сдвигает «водяной знак» роликов (сброс пароля его не откатывает), а имя
+# контейнера ds_api у боевого сервера такое же, как у стенда. Поэтому ПЕРВЫМ делом, до trap и любого сброса,
+# проверяем метку compose-проекта ds_api: только dsdev (bash dev_stand.sh up), иначе отказ и провал прогона.
 OFFSITE_RESET="docker exec ds_api python /app/reset_offsite_password.py"
+E2E_DECRYPT_CMD=""
 if [ "${E2E_ALLOW_OFFSITE:-}" = "1" ]; then
+    if [ "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' ds_api 2>/dev/null)" != "dsdev" ]; then
+        echo "ОШИБКА: шаг копии на флешку с флагом — только на стенде dsdev (bash dev_stand.sh up); пропущено."
+        echo "      └─ Контейнер ds_api не из compose-проекта dsdev: это может быть боевой сервер, ничего не тронуто."
+        exit 1
+    fi
+    # команда расшифровки — как её знает сервер: в инструкции на флешке она должна стоять слово в слово
+    E2E_DECRYPT_CMD=$(docker exec ds_api python -c "import sys; sys.path.insert(0, '/app'); from offsite_crypto import OPENSSL_DECRYPT_CMD; print(OPENSSL_DECRYPT_CMD)" 2>/dev/null)
+    if [ -z "$E2E_DECRYPT_CMD" ]; then
+        echo "ОШИБКА: не удалось прочитать команду расшифровки с сервера (docker exec ds_api python -c ... OPENSSL_DECRYPT_CMD)."
+        exit 1
+    fi
     trap 'if $OFFSITE_RESET >/dev/null 2>&1; then echo "• Пароль на копию сброшен (стенд без пароля)."; else echo "ПРЕДУПРЕЖДЕНИЕ: пароль на копию не сбросился — выполните: $OFFSITE_RESET"; fi' EXIT
     if ! $OFFSITE_RESET >/dev/null 2>&1; then
         echo "ОШИБКА: не удалось сбросить пароль на копию ($OFFSITE_RESET)."
@@ -95,6 +111,7 @@ docker run --rm --network "$NET" \
     -e DS_URL="$DS_URL" -e ADMIN_USER="$ADMIN_USER" -e ADMIN_PASS="$ADMIN_PASS" \
     -e E2E_ALLOW_BROADCAST="${E2E_ALLOW_BROADCAST:-}" \
     -e E2E_ALLOW_OFFSITE="${E2E_ALLOW_OFFSITE:-}" \
+    -e E2E_DECRYPT_CMD="$E2E_DECRYPT_CMD" \
     "${SHOTS_ARGS[@]+"${SHOTS_ARGS[@]}"}" \
     -e NODE_PATH=/home/pptruser/node_modules \
     --entrypoint node "$IMAGE" /ui/ui_test.js

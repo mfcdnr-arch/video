@@ -75,8 +75,11 @@
  * «на все экраны» (они идут на ВСЕ экраны, только на стенде; без переменной шаги
  * пропускаются с пометкой),
  * E2E_ALLOW_OFFSITE=1 — шаги «Копия на флешку» со сменой пароля на копию и скачиванием копии и
- * роликов (только на стенде; пароль на копию должен быть сброшен до прогона — это делает
- * ui_test.sh; без переменной шаги пропускаются с пометкой),
+ * роликов (только на стенде dsdev: ui_test.sh до всего проверяет метку compose-проекта ds_api и
+ * отказывает на другом; пароль на копию должен быть сброшен до прогона — это делает ui_test.sh;
+ * без переменной шаги пропускаются с пометкой),
+ * E2E_DECRYPT_CMD — команда расшифровки как её знает сервер (передаёт ui_test.sh): она должна стоять в
+ * инструкции из скачанной копии слово в слово,
  * E2E_SHOTS_DIR — папка для снимков экрана (в контейнере; ui_test.sh монтирует папку хоста).
  */
 const puppeteer = require('puppeteer');
@@ -2135,7 +2138,7 @@ async function restoreBroadcast(page, fx) {
           const t = readTar(copyFile);
           const ENC = 'copy.tar.gz.enc', SHA = ENC + '.sha256', INS = 'ВОССТАНОВЛЕНИЕ.txt';
           if (!t) {
-            bad(`${copyFile}: tar не целый`);
+            bad(`${copyFile}: tar не целый или сжат (ждали несжатый tar)`);
           } else if (JSON.stringify(t.names) !== JSON.stringify([ENC, SHA, INS].sort())) {
             bad(`${copyFile}: в tar не те файлы: ${t.names.join(', ')}`);
           } else {
@@ -2145,8 +2148,13 @@ async function restoreBroadcast(page, fx) {
             (shaLine[0] === sha && shaLine[1] === ENC && t.files[ENC].subarray(0, 8).toString('latin1') === 'Salted__')
               ? ok('sha256 запертой части сходится, формат openssl (Salted__)') : bad('sha256 запертой части не сошлась или формат не openssl');
             const ins = t.files[INS].toString('utf8');
-            (ins.includes('openssl enc -d') && !ins.includes(OFFSITE_PASS))
-              ? ok('в инструкции есть команда расшифровки, пароля на копию нет') : bad('инструкция: нет команды расшифровки или в ней пароль');
+            // команда расшифровки — слово в слово как её знает сервер (OPENSSL_DECRYPT_CMD; её передаёт ui_test.sh);
+            // без неё (прямой запуск) хотя бы параметры шифра: расхождение с сервером значило бы копию, которую не открыть
+            const decrypt = process.env.E2E_DECRYPT_CMD || '';
+            const cipherFlags = '-aes-256-cbc -pbkdf2 -md sha256 -iter 200000';
+            (ins.includes(cipherFlags) && (!decrypt || ins.includes(decrypt)) && !ins.includes(OFFSITE_PASS))
+              ? ok(`в инструкции команда расшифровки ${decrypt ? 'как на сервере' : '(параметры шифра)'}: ${decrypt || cipherFlags}; пароля на копию нет`)
+              : bad(`инструкция: нет команды расшифровки${decrypt ? ' «' + decrypt + '»' : ''} или в ней пароль`);
           }
           // «скачана» сервер отмечает после последнего байта; блок и напоминание узнают об этом опросом
           await waitStatus(d => d.copy.today && d.copy.last_file === copyFile, 30000)
