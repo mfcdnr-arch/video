@@ -119,7 +119,8 @@ async function viewDash(){
       h+='</table>';
     }
     view.innerHTML=h;
-    if(isSuper()) loadOffsiteBanner();    // из запомненного сразу, затем свежее состояние; ошибка дашборд не ломает
+    // из запомненного сразу, затем свежее состояние; ни ошибка, ни отсутствие offsite.js дашборд не ломают
+    if(isSuper() && typeof loadOffsiteBanner === 'function') loadOffsiteBanner();
   }catch(e){ view.innerHTML='<div class="empty">Не удалось загрузить дашборд: '+esc(e.message)+'</div>'; }
 }
 const FEED_IC={upload:['◫','#5ba3ec'],sync:['⇄','#7fe3c4'],stop:['■','#ff8a7a'],register:['▣','#7fe3c4'],schedule:['▦','#f5b73d'],backup:['⤓','#aeb4be'],broadcast:['⇄','#12a886'],ticker:['▦','#ffd34d'],advertiser:['◧','#5ba3ec']};
