@@ -30,8 +30,9 @@
 //
 // Скачивание. В ответе приходит одноразовая ссылка /api/offsite/download?t=… — её открывает созданный
 // <a href download> + click(): браузер качает прямо на диск, со своим индикатором. Это нарочно НЕ
-// apiDownload (blob держал бы гигабайты в памяти вкладки). Через 3 с блок и напоминание перечитываются:
-// сервер отмечает «скачано», только когда файл отдан целиком.
+// apiDownload (blob держал бы гигабайты в памяти вкладки). Сервер отмечает «скачано», только когда файл
+// отдан целиком, поэтому после начала скачивания блок и напоминание перечитываются (через 3 с, затем
+// раз в 15 с, не дольше часа), пока отметка не появится; кнопки роликов всё это время заняты.
 //
 // Время от сервера — наивное МСК («2026-11-04T18:42:00»): ЧЧ:ММ и дата берутся срезом строки.
 // fmtServerTS тут не годится — он считает строку временем UTC и сдвигает на пояс браузера (+3 ч).
@@ -40,7 +41,9 @@
 (function(){
   const STATUS = '/offsite/status';
   const DL_PREFIX = '/api/offsite/download?t=';      // как отдаёт сервер; на другой адрес не переходим
-  const REFRESH_MS = 3000;                           // через сколько после начала скачивания перечитать состояние
+  const POLL_FIRST_MS = 3000;                        // первое перечитывание после начала скачивания: малая копия уже могла дойти
+  const POLL_MS = 15000;                             // дальше — раз в 15 с, пока файл не скачается целиком
+  const POLL_CAP_MS = 60 * 60 * 1000;                // но не дольше часа (оборванное скачивание сервер не отметит никогда)
   const MSG_NOT_MOUNTED = 'Сервер не обновлён для копии на флешку: запустите install_server.sh';
   const MSG_NO_STATE = 'Состояние копии не загружено — обновите страницу';
   const MSG_STARTED = 'Скачивание началось. Отметка появится, когда файл скачается целиком';
@@ -54,25 +57,36 @@
   let blockState = 'loading';    // 'loading' | 'ok' | 'fail'
   let bannerBox = null, bannerHtml = '';   // что и куда нарисовано (то же самое не перерисовываем)
   let blockBox = null, blockHtml = '';
-  let mediaBusy = false;         // идёт запрос ссылки на ролики или ждём перечитывания после него
-  let refreshTimer = 0;
+  let mediaBusy = false;         // идёт запрос ссылки на ролики или ролики ещё скачиваются (ждём отметку сервера)
+  let watch = {};                // за чем следим: {copy|media: {from: last_at на момент клика, until: мс}}
+  let watchUser = null;          // чей это вход (смена пользователя — слежение снимается)
+  let pollTimer = 0;             // таймер единственного цикла опроса (0 — не взведён)
   let W = null;                  // открытое окно (оно может быть только одно)
 
   const $ = id => document.getElementById(id);
 
   // ---- мелочи ---------------------------------------------------------------
 
-  // api() бросает Error(тело ответа); у FastAPI 400/403/409/503 — {"detail": "текст"}
+  // api() бросает Error(тело ответа); у FastAPI 400/403/409/503 — {"detail": "текст"}.
+  // Всё видимое в панели — по-русски: текст сервера без единой русской буквы («Internal Server Error»,
+  // английская ошибка сборки) заменяем общим сообщением, код берём из «HTTP 502», если он известен.
   function errText(e){
     if(e instanceof TypeError) return 'нет связи с сервером';
     const t = String((e && e.message) || e || '').trim();
+    const code = (/^HTTP (\d{3})\b/.exec(t) || [])[1];
+    let msg = null;
     try{
       const j = JSON.parse(t);
-      if(j && typeof j.detail === 'string') return j.detail;
-      if(j && Array.isArray(j.detail)) return 'некорректный запрос';
+      if(j && typeof j.detail === 'string') msg = j.detail;
+      else if(j && Array.isArray(j.detail)) return 'некорректный запрос';
     }catch(_){}
-    if(/^</.test(t)) return 'сервер не ответил вовремя — подождите минуту и повторите';   // страница-заглушка nginx (502/504)
-    return t.slice(0, 200) || 'неизвестная ошибка';
+    if(msg === null){
+      if(/^</.test(t)) return 'сервер не ответил вовремя — подождите минуту и повторите';   // страница-заглушка nginx (502/504)
+      msg = t;
+    }
+    msg = msg.trim().slice(0, 200);
+    if(!msg) return 'неизвестная ошибка';
+    return /[А-Яа-яЁё]/.test(msg) ? msg : 'Сервер ответил ошибкой' + (code ? ' (HTTP ' + code + ')' : '') + '. Повторите позже';
   }
 
   // Размер: МБ с одним знаком, от 1024 МБ — ГБ с одним знаком («640,0 МБ», «18,6 ГБ»)
@@ -316,13 +330,66 @@
     paintBlock();
   }
 
-  // Через 3 с после начала скачивания перечитать состояние (и разморозить кнопки роликов)
-  function scheduleRefresh(){
-    clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(() => {
-      mediaBusy = false;
-      refreshView();
-    }, REFRESH_MS);
+  // ---- слежение за скачиванием ------------------------------------------------------
+  // Сервер отмечает «скачано», только когда отдан последний байт, а nginx отдаёт не быстрее 20 МБ/с:
+  // архив роликов идёт минуты, а то и десятки минут. Поэтому после начала скачивания состояние
+  // перечитывается: через 3 с (малая копия) и дальше каждые 15 с. Скачивание «дошло», когда last_at
+  // (копии или роликов) стал другим, чем был в момент клика. Цикл один на всех: новое скачивание
+  // добавляет своё слежение и взводит таймер заново. Он кончается, когда дождались всех, когда со
+  // страницы ушли оба контейнера (напоминание и блок), когда сменился вход и через час. Кнопки роликов
+  // заняты (mediaBusy), пока слежение за роликами не кончилось: второй клик не начнёт второе скачивание.
+
+  function hasWatch(){ return !!(watch.copy || watch.media); }
+
+  function armPoll(ms){
+    clearTimeout(pollTimer);
+    pollTimer = setTimeout(pollTick, ms);
+  }
+
+  // kind — 'copy' | 'media'; from — last_at (копии или роликов) на момент клика
+  function watchDownload(kind, from){
+    watch[kind] = {from: from || null, until: Date.now() + POLL_CAP_MS};
+    watchUser = ME.username;
+    armPoll(POLL_FIRST_MS);
+  }
+
+  function stopWatch(){
+    watch = {};
+    clearTimeout(pollTimer);
+    pollTimer = 0;
+    mediaBusy = false;
+    repaint();
+  }
+
+  async function pollTick(){
+    pollTimer = 0;
+    if(!hasWatch()) return;
+    if(!isSuper() || ME.username !== watchUser || (!$('offsite-banner') && !$('offsite-block'))) return stopWatch();
+    let s = null;
+    try{
+      s = await api(STATUS);
+      if(!sane(s)) s = null;
+    }catch(e){
+      if(String((e && e.message) || '') === 'unauthorized') return stopWatch();
+      // связь мигнула — ждём следующего круга, слежение не снимаем
+    }
+    if(!hasWatch()) return;                      // за время запроса слежение сняли
+    if(s){
+      bannerSeq++; blockSeq++;                   // запоздавшие ответы обычных загрузок не затрут свежее
+      setStatus(s);
+      blockState = 'ok';
+      if(watch.copy && (s.copy || {}).last_at !== watch.copy.from) delete watch.copy;
+      if(watch.media && (s.media || {}).last_at !== watch.media.from){ delete watch.media; mediaBusy = false; }
+    }
+    const now = Date.now();
+    for(const k of ['copy', 'media']){           // час прошёл, а отметки нет: скачивание оборвали — больше не ждём
+      if(watch[k] && now >= watch[k].until){
+        delete watch[k];
+        if(k === 'media') mediaBusy = false;
+      }
+    }
+    repaint();
+    if(hasWatch() && !pollTimer) armPoll(POLL_MS);
   }
 
   // ---- скачивание -----------------------------------------------------------------
@@ -350,9 +417,10 @@
       if(!n){ toast('В медиатеке нет роликов'); return; }
       if(!confirm(`Скачать все ролики: ${n} шт, ${fmtSize(md.all_bytes)}?\n\nАрхив большой, скачивание может занять много времени.`)) return;
     }
+    const from = md.last_at || null;             // метка прошлого скачивания: когда она сменится, файл дошёл
     mediaBusy = true;
     repaint();
-    let held = false;                            // кнопки остаются занятыми до перечитывания состояния
+    let held = false;                            // кнопки остаются занятыми, пока идёт слежение за скачиванием
     try{
       const r = await api('/offsite/media', {method: 'POST', body: JSON.stringify({scope})});
       if(!startDownload(r && r.url, r && r.filename)){ toast('Сервер не прислал ссылку на скачивание — повторите'); return; }
@@ -360,7 +428,7 @@
       const miss = Number(r.missing) || 0;
       if(miss > 0) setTimeout(() => toast('В архиве не хватает файлов на сервере: ' + miss), 2400);   // после первой плашки
       held = true;
-      scheduleRefresh();
+      watchDownload('media', from);
     }catch(e){
       if(String((e && e.message) || '') === 'unauthorized') return;
       toast(errText(e));
@@ -443,8 +511,8 @@
       busyText: 'Сохраняю…',
       body: `<div class="oc-form">
         ${needCurrent ? field('oc-pw-current', 'Текущий пароль на копию', 'off', '', true) : ''}
-        ${field('oc-pw-new', 'Новый пароль', 'new-password', 'Не короче 10 символов, только латинские буквы, цифры и знаки (без пробелов)', !needCurrent)}
-        ${field('oc-pw-new2', 'Ещё раз', 'new-password')}
+        ${field('oc-pw-new', 'Новый пароль', 'off', 'Не короче 10 символов, только латинские буквы, цифры и знаки (без пробелов)', !needCurrent)}
+        ${field('oc-pw-new2', 'Ещё раз', 'off')}
         ${field('oc-pw-login', 'Ваш пароль для входа в панель', 'current-password')}
         <div class="oc-hint" role="note">${esc(MSG_PW_WARN)}</div>
         <div class="oc-err" id="oc-err" role="alert" hidden></div>
@@ -522,6 +590,8 @@
       if(inp) inp.focus({preventScroll: true});
       return;
     }
+    const s0 = cur();
+    const from = (s0 && s0.copy && s0.copy.last_at) || null;   // метка прошлой копии: когда сменится, файл дошёл
     setBusy(st, true);                           // сразу, до await: второй клик ничего не сделает
     showErr('');
     let r;
@@ -543,7 +613,7 @@
     }
     if(!st.closed) st.modal.close();
     toast(MSG_STARTED);
-    scheduleRefresh();
+    watchDownload('copy', from);
   }
 
   // ---- действия -------------------------------------------------------------------------
