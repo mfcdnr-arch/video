@@ -25,7 +25,7 @@
 - `server/main.py` — сборка FastAPI-приложения, подключение роутеров
 - `server/routers/` — роутеры по доменам: auth, users, screens, media, playlists,
   placements, schedule, network, campaigns, broadcast, billing, advertiser_office,
-  advertiser_docs, reports, notifications, backups, ticker, system, agent_ota,
+  advertiser_docs, reports, notifications, backups, offsite, ticker, system, agent_ota,
   websockets
 - `server/playlist_rules.py` — правила плейлиста: повторы ×N, мягкие
   предупреждения, «общий час» (чистая логика, без БД)
@@ -33,7 +33,7 @@
   выбор плейлистов на час, `active_until` (чистая логика, без БД)
 - `server/placements_store.py` — SQL показов: чтение/запись, развёртывание групп
   и «всех экранов», `resolve_placement_hour` (что играет на экране сейчас)
-- `server/migrations/` — SQL-миграции с номерами `001`…`034`, применяются
+- `server/migrations/` — SQL-миграции с номерами `001`…`035`, применяются
   автоматически при первом старте Postgres
 - `server/network_live.py` — «Эфир сети»: что идёт на экране сейчас, до какого
   часа и что дальше (чистая логика, без БД; поверх клеток `placements_logic`)
@@ -53,9 +53,18 @@
   старше 5 минут) и SQL-шаблоны к нему
 - `server/media_access.py` — кто читает файлы медиатеки: экран по `X-Token` (только
   одобренное), панель по JWT или cookie `ds_media`; отдача через `X-Accel-Redirect`
+- `server/offsite_rules.py` — «копия на флешку»: пароль на копию, напоминание ok/warn,
+  состав копии, имена файлов (чистая логика, без БД)
+- `server/offsite_tar.py` — потоковый tar без сжатия с заранее посчитанным размером
+  (чистая логика, без БД)
+- `server/offsite_crypto.py` — запирание копии в формате `openssl enc -pbkdf2` и
+  хранение пароля на копию (Fernet от `SECRET_KEY`)
+- `server/offsite_store.py` — SQL «копии на флешку»: состояние, отметки «скачано», выборка
+  роликов, одноразовые ссылки (Redis), сборка копии, чистка временных папок; шаблон
+  инструкции — `server/offsite_restore.txt`, сброс пароля — `server/reset_offsite_password.py`
 - `server/tests/` — pytest (billing, campaigns, контроль монитора, плейлисты,
   показы, дубли, общий эфир, бегущая строка, обзор сети, правило «в сети», группы экранов,
-  скачивание только по входу, файлы медиатеки), запуск через
+  скачивание только по входу, файлы медиатеки, копия на флешку), запуск через
   `run_tests.sh`; тесты агента — `agent/tests/`
 - `ui_tests/ui_test.js` — браузерный E2E-прогон панели (puppeteer), запуск через `ui_test.sh`
 - `agent/` — код агента для мини-ПК: `ds_agent.py`, `ds_player.py` (mpv),
@@ -85,6 +94,9 @@
   `media_access.py`: `<img>`/`<video>`/ссылка идут по httpOnly-cookie `ds_media`
   (панель берёт её `mediaSession()` в `core/api.js`), агент — по `X-Token`; большие файлы
   отдаёт nginx (`X-Accel-Redirect`), не blob
+- Копии для флешки на сервере не хранятся: копия собирается во временной папке и стирается
+  после отдачи, а скачивание — одноразовая ссылка из авторизованного POST (не `apiDownload`:
+  архивы в гигабайты); пароль на копию никогда не показывается и не пишется в журнал
 - Ограничение проекта: **никакого AI/ML** в продукте — только детерминированная логика
 
 ## Key commands
@@ -96,10 +108,12 @@
   в `.dev_admin_pass`, он в `.gitignore`); только для разработки, не для сервера
 - `bash smoke_test.sh` — smoke-проверка ключевых HTTP-эндпоинтов
   (`SMOKE_ALLOW_BROADCAST=1` — ещё и шаг общего эфира: он идёт на ВСЕ экраны,
-  только на стенде)
+  только на стенде; `SMOKE_ALLOW_OFFSITE=1` — ещё и полный цикл «копии на флешку»:
+  сбрасывает пароль на копию, только на стенде `dsdev`)
 - `bash ui_test.sh` — браузерный прогон панели (разделы, кнопки, циклы CRUD;
   `E2E_ALLOW_BROADCAST=1` — ещё и включение общего эфира и бегущая строка «на все
-  экраны», только на стенде)
+  экраны», только на стенде; `E2E_ALLOW_OFFSITE=1` — ещё и скачивание копии и роликов,
+  только на стенде `dsdev`)
 - `docker compose logs -f api` — следить за логами backend
 - `bash migrate.sh` — применить/проверить миграции БД
 - `bash collect_diag.sh` — собрать диагностику сервера
