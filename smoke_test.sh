@@ -6,13 +6,20 @@
 # качает (лента и список файлов глазами агента), «в сети» по последнему сигналу,
 # бегущая строка (только на тестовом экране), отчёты, биллинг, уведомления,
 # бэкап и архив диагностики отдаются только по входу (без входа — 401), файлы
-# медиатеки — тоже (через nginx; экран качает одобренный ролик с докачкой).
+# медиатеки — тоже (через nginx; экран качает одобренный ролик с докачкой);
+# «Копия на флешку»: статус и выдача ссылок — только суперадмину (без входа и по токену
+# экрана — 401), одноразовая ссылка скачивания без выдачи — 404.
 # Все тестовые данные создаются с префиксом SMOKE_ и удаляются в конце.
 #
 # Использование:   bash smoke_test.sh
 # Переменные:      ADMIN_USER (по умолч. admin), ADMIN_PASS (admin123)
 #                  SMOKE_ALLOW_BROADCAST=1 — шаг «Общий эфир»: он включает эфир на ВСЕ
 #                  экраны сети (прежнее состояние возвращается), поэтому только на стенде
+#                  SMOKE_ALLOW_OFFSITE=1 — полный цикл «Копии на флешку»: СБРАСЫВАЕТ пароль на
+#                  копию и задаёт тестовый (SMOKE-copy-pass-1), собирает и скачивает копию и
+#                  ролики (двигает отметку «последняя копия» и «водяной знак» роликов),
+#                  проверяет tar с тремя файлами и расшифровку, пишет в журнал; в конце снова
+#                  сбрасывает пароль на копию — поэтому только на стенде, не на боевом сервере
 #
 # Код возврата 0 — все проверки прошли; иначе число упавших проверок.
 set -uo pipefail
@@ -1073,6 +1080,241 @@ if [ -n "${MID:-}" ] && [ -n "${MID2:-}" ] && [ -n "${SCR_TOKEN:-}" ]; then
   $DC rm -f "$JAR" 2>/dev/null
 else
   bad "нет роликов или токена экрана — проверку файлов медиатеки провести не на чем"
+fi
+
+# ── 5д. Копия на флешку ──────────────────────────────────────────────────────
+# Копия сервера (запертая паролем) и tar-архивы роликов отдаются суперадмину по ОДНОРАЗОВОЙ ссылке:
+# браузер качает её без заголовка Authorization, поэтому «входом» служит сам токен.
+# Без флага (ничего не меняет, безопасно и на боевом сервере): статус и выдача ссылок без входа и по
+# токену экрана — 401; по входу статус — 200 со всеми ключами, без пароля, «ok/warn» согласован с
+# «копия сегодня и новых роликов нет»; ссылка скачивания с чужим или пустым кодом — 404; неверный
+# объём роликов — 400.
+# С SMOKE_ALLOW_OFFSITE=1 (только стенд: меняет пароль на копию и отметки «скачано»): пароль на копию
+# сбрасывается на сервере и задаётся заново (неверный пароль входа → 403, не совпали → 400, слабый → 400,
+# смена без текущего → 403); копия без пароля → 409, с неверным паролем входа → 403; копия собирается,
+# ссылка отдаёт tar ровно из трёх файлов (инструкция, запертая часть, sha256), сумма сходится, запертая
+# часть открывается openssl паролем на копию и не открывается чужим, внутри база, программа с .env и
+# опись; второй заход по ссылке → 404; «скачано» попало в статус и в журнал (пароля в журнале нет);
+# ролики «новые» — tar с манифестом и файлом тестового ролика, после скачивания «новых» нет (409), «все»
+# — тоже скачиваются; напоминание в итоге «ok». В конце пароль на копию снова сбрасывается (и при обрыве
+# скрипта): стенд остаётся без пароля. Отметка «последняя копия» и «водяной знак» роликов остаются.
+step "Копия на флешку: доступ и одноразовая ссылка"
+JSON_O='Content-Type: application/json'
+# oj ключ=значение … — JSON-тело из пар: пароли с кавычками и кириллица тело не ломают
+oj(){ python3 -c "import sys,json; print(json.dumps(dict(a.split('=',1) for a in sys.argv[1:]), ensure_ascii=False))" "$@"; }
+# detail_has ТЕКСТ — в поле detail ответа об ошибке есть этот текст
+detail_has(){ local d; d=$(body_get detail); [[ "$d" == *"$1"* ]]; }
+C=$(code_as "/offsite/status"); [ "$C" = "401" ] && ok "статус копии без входа — 401" || bad "статус копии без входа: HTTP $C"
+C=$(code_as "/offsite/status" -H "X-Token: ${SCR_TOKEN:-x}"); [ "$C" = "401" ] && ok "статус копии по токену экрана — 401" || bad "статус копии по токену экрана: HTTP $C"
+for OP in password copy media; do
+  C=$(code_as "/offsite/$OP" -X POST -H "$JSON_O" -d '{}')
+  [ "$C" = "401" ] && ok "POST /offsite/$OP без входа — 401" || bad "POST /offsite/$OP без входа: HTTP $C"
+done
+req GET "/offsite/status"
+if [ "$HTTP" = "200" ] && body_has "set(r)=={'password','copy','media','state','project_mounted'} and set(r['password'])=={'set','set_at','set_by','needs_reset'} and set(r['copy'])=={'last_at','last_by','last_file','last_bytes','today'} and set(r['media'])=={'new_count','new_bytes','all_count','all_bytes','last_at','last_by'} and isinstance(r['password']['set'],bool) and isinstance(r['project_mounted'],bool)"; then
+  ok "статус копии по входу: все ключи на месте, пароля в ответе нет"; else bad "статус копии: HTTP $HTTP, ключи не те"; fi
+if body_has "r['state'] in ('ok','warn') and (r['state']=='ok')==(r['copy']['today'] and r['media']['new_count']==0)"; then
+  ok "напоминание «ok/warn» согласовано: ok только когда копия сегодня и новых роликов нет"; else bad "напоминание не сходится с «копия сегодня» и «новые ролики»"; fi
+C=$(code_as "/offsite/download?t=xxx"); [ "$C" = "404" ] && ok "ссылка с чужим кодом — 404 (входа не требует)" || bad "ссылка с чужим кодом: HTTP $C"
+C=$(code_as "/offsite/download"); [ "$C" = "404" ] && ok "ссылка без кода — 404" || bad "ссылка без кода: HTTP $C"
+req POST "/offsite/media" -H "$JSON_O" -d '{"scope":"zzz"}'
+[ "$HTTP" = "400" ] && ok "ролики: неизвестный объём — 400" || bad "ролики: неизвестный объём: HTTP $HTTP (ждали 400)"
+
+# Скрипты проверки архивов — внутри ds_api (там есть python3, tarfile и openssl)
+OFF_PY_COPY='
+import sys, tarfile, hashlib, subprocess, tempfile, os, shutil
+path, pw, instr, enc_name, sha_name = sys.argv[1:6]
+t = tarfile.open(path)
+names = sorted(m.name for m in t.getmembers())
+if names != sorted([instr, enc_name, sha_name]):
+    print("состав tar: " + ascii(names)); sys.exit(0)
+d = tempfile.mkdtemp()
+try:
+    h = hashlib.sha256()
+    enc = os.path.join(d, "enc")
+    with t.extractfile(enc_name) as src, open(enc, "wb") as dst:
+        while True:
+            b = src.read(1 << 20)
+            if not b: break
+            h.update(b); dst.write(b)
+    if t.extractfile(sha_name).read().decode("ascii").split() != [h.hexdigest(), enc_name]:
+        print("sha256 запертой части не сошлась"); sys.exit(0)
+    if open(enc, "rb").read(8) != b"Salted__":
+        print("запертая часть не в формате openssl"); sys.exit(0)
+    text = t.extractfile(instr).read().decode("utf-8")
+    if pw in text: print("пароль на копию лежит в инструкции"); sys.exit(0)
+    if "openssl enc -d" not in text: print("в инструкции нет команды расшифровки"); sys.exit(0)
+    def dec(p, out):
+        return subprocess.run(["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-md", "sha256", "-iter", "200000",
+                               "-pass", "pass:" + p, "-in", enc, "-out", out], capture_output=True).returncode
+    bad = os.path.join(d, "bad")
+    if dec(pw + "x", bad) == 0 and open(bad, "rb").read(2) == b"\x1f\x8b":
+        print("копия открылась чужим паролем"); sys.exit(0)
+    good = os.path.join(d, "inner.tar.gz")
+    if dec(pw, good) != 0: print("копия не открылась паролем на копию"); sys.exit(0)
+    names = tarfile.open(good, "r:gz").getnames()
+    if "MANIFEST.txt" not in names: print("внутри нет MANIFEST.txt"); sys.exit(0)
+    if not any(n.startswith("db/backup_") and n.endswith(".sql.gz") for n in names): print("внутри нет дампа базы"); sys.exit(0)
+    if "program/.env" not in names: print("внутри нет program/.env"); sys.exit(0)
+    print("OK %d" % len(names))
+finally:
+    shutil.rmtree(d, ignore_errors=True)
+'
+OFF_PY_MEDIA='
+import sys, tarfile
+path, fname, title = sys.argv[1:4]
+t = tarfile.open(path)
+names = t.getnames()
+man = "media/MANIFEST_media.txt"
+if man not in names: print("нет MANIFEST_media.txt"); sys.exit(0)
+text = t.extractfile(man).read().decode("utf-8")
+lines = [l for l in text.splitlines() if l.strip()]
+if title not in text: print("в манифесте нет названия тестового ролика"); sys.exit(0)
+if "media/" + fname not in names: print("в архиве нет файла тестового ролика"); sys.exit(0)
+print("OK %d %d %d" % (len([n for n in names if n != man]), len(lines), sum(1 for l in lines if l.endswith("нет файла"))))
+'
+
+if [ "${SMOKE_ALLOW_OFFSITE:-}" != "1" ]; then
+  echo "  – копия и ролики на флешку (пароль, сборка, скачивание) — пропущено (задайте SMOKE_ALLOW_OFFSITE=1 на стенде)"
+else
+  OFF_PW0="SMOKE-copy-pass-0"; OFF_PW1="SMOKE-copy-pass-1"
+  OFF_DIR="/tmp/smoke_offsite_$STAMP"; OFF_DIRTY=1
+  off_finish(){ # пароль на копию — снова сбросить (и при обрыве скрипта), убрать скачанные тестовые файлы
+    if [ "$OFF_DIRTY" = "1" ]; then
+      OFF_DIRTY=0
+      if $DC python /app/reset_offsite_password.py >/dev/null 2>&1; then
+        req GET "/offsite/status"
+        body_has "r['password']['set'] is False" && ok "пароль на копию снова сброшен — стенд без пароля" || bad "после сброса пароль на копию остался"
+      else bad "пароль на копию не сбросился (docker exec ds_api python /app/reset_offsite_password.py)"; fi
+    fi
+    $DC rm -rf "$OFF_DIR" 2>/dev/null
+  }
+  trap off_finish EXIT
+  $DC mkdir -p "$OFF_DIR"
+  # off_get ССЫЛКА ФАЙЛ — скачать без входа по ссылке из ответа (в ответе она с /api — так её видит браузер,
+  # а curl идёт в API напрямую); код — в OFF_CODE, заголовки — в OFF_HEAD
+  off_get(){
+    OFF_HEAD=$($DC curl -s -D - -o "$2" -w $'\nHTTPCODE:%{http_code}' "$API${1#/api}" 2>/dev/null | tr -d '\r')
+    OFF_CODE="${OFF_HEAD##*HTTPCODE:}"
+  }
+  off_hdr(){ echo "$OFF_HEAD" | grep -i "^$1:" | head -1 | cut -d: -f2- | sed 's/^ *//'; }
+  # off_wait ВЫРАЖЕНИЕ — до 10 с ждём, пока статус копии удовлетворит python-выражению над r (отметку «скачано»
+  # сервер ставит чуть позже последнего байта)
+  off_wait(){ local i; for i in $(seq 1 20); do req GET "/offsite/status"; [ "$HTTP" = "200" ] && body_has "$1" && return 0; sleep 0.5; done; return 1; }
+
+  # 1. чистое начало: пароль сброшен командой на сервере
+  R=$($DC python /app/reset_offsite_password.py 2>&1); RC=$?
+  [ "$RC" -eq 0 ] && ok "пароль на копию сброшен на сервере (чистое начало)" || bad "сброс пароля на копию: $R"
+  req GET "/offsite/status"
+  body_has "r['password']['set'] is False and r['password']['needs_reset'] is False" && ok "пароля на копию нет" || bad "после сброса пароль на копию остался"
+  body_has "r['project_mounted'] is True" && ok "папка проекта подключена к ds_api — копию есть из чего собирать" \
+    || bad "project_mounted=false: копию не собрать (запустите install_server.sh)"
+  req POST "/offsite/copy" -H "$JSON_O" -d "$(oj login_password="$ADMIN_PASS")"
+  [ "$HTTP" = "409" ] && detail_has "Сначала задайте пароль на копию" && ok "копия без пароля на копию — 409" || bad "копия без пароля на копию: HTTP $HTTP (ждали 409)"
+
+  # 2. пароль на копию: правила и порядок проверок
+  req POST "/offsite/password" -H "$JSON_O" -d "$(oj new_password="$OFF_PW0" new_password2="$OFF_PW0" login_password="wrong-$ADMIN_PASS")"
+  [ "$HTTP" = "403" ] && detail_has "Неверный пароль входа" && ok "пароль на копию: неверный пароль входа — 403" || bad "пароль на копию, неверный вход: HTTP $HTTP (ждали 403)"
+  req POST "/offsite/password" -H "$JSON_O" -d "$(oj new_password="$OFF_PW0" new_password2="${OFF_PW0}x" login_password="$ADMIN_PASS")"
+  [ "$HTTP" = "400" ] && detail_has "Пароли не совпадают" && ok "пароль на копию: не совпали — 400" || bad "пароль на копию, не совпали: HTTP $HTTP (ждали 400)"
+  req POST "/offsite/password" -H "$JSON_O" -d "$(oj new_password="short1" new_password2="short1" login_password="$ADMIN_PASS")"
+  [ "$HTTP" = "400" ] && ok "пароль на копию: слишком короткий — 400" || bad "пароль на копию, короткий: HTTP $HTTP (ждали 400)"
+  req POST "/offsite/password" -H "$JSON_O" -d "$(oj new_password="Пароль-Копия-12345" new_password2="Пароль-Копия-12345" login_password="$ADMIN_PASS")"
+  [ "$HTTP" = "400" ] && ok "пароль на копию: кириллица — 400 (нужны латинские знаки)" || bad "пароль на копию, кириллица: HTTP $HTTP (ждали 400)"
+  req GET "/offsite/status"
+  body_has "r['password']['set'] is False" && ok "отказы пароля не оставили: пароля на копию по-прежнему нет" || bad "после отказов пароль на копию появился"
+  req POST "/offsite/password" -H "$JSON_O" -d "$(oj new_password="$OFF_PW0" new_password2="$OFF_PW0" login_password="$ADMIN_PASS")"
+  [ "$HTTP" = "200" ] && body_has "r=={'status':'saved'}" && ok "пароль на копию задан" || bad "задать пароль на копию: HTTP $HTTP $BODY"
+  req GET "/offsite/status"
+  if body_has "r['password']['set'] is True and r['password']['needs_reset'] is False and r['password']['set_by']=='$ADMIN_USER' and r['password']['set_at']"; then
+    ok "в статусе: пароль задан, кем и когда"; else bad "статус после задания пароля: HTTP $HTTP"; fi
+  req POST "/offsite/password" -H "$JSON_O" -d "$(oj new_password="$OFF_PW1" new_password2="$OFF_PW1" login_password="$ADMIN_PASS")"
+  [ "$HTTP" = "403" ] && detail_has "Неверный текущий пароль на копию" && ok "смена пароля без текущего — 403" || bad "смена без текущего: HTTP $HTTP (ждали 403)"
+  req POST "/offsite/password" -H "$JSON_O" -d "$(oj new_password="$OFF_PW1" new_password2="$OFF_PW1" login_password="$ADMIN_PASS" current_password="${OFF_PW0}x")"
+  [ "$HTTP" = "403" ] && ok "смена пароля с неверным текущим — 403" || bad "смена с неверным текущим: HTTP $HTTP (ждали 403)"
+  req POST "/offsite/password" -H "$JSON_O" -d "$(oj new_password="$OFF_PW1" new_password2="$OFF_PW1" login_password="$ADMIN_PASS" current_password="$OFF_PW0")"
+  [ "$HTTP" = "200" ] && ok "пароль на копию сменён (с текущим)" || bad "смена пароля с текущим: HTTP $HTTP $BODY"
+
+  # 3. копия: отказы и сборка
+  req POST "/offsite/copy" -H "$JSON_O" -d "$(oj login_password="wrong-$ADMIN_PASS")"
+  [ "$HTTP" = "403" ] && detail_has "Неверный пароль входа" && ok "копия: неверный пароль входа — 403" || bad "копия, неверный вход: HTTP $HTTP (ждали 403)"
+  req POST "/offsite/copy" -H "$JSON_O" -d '{}'
+  [ "$HTTP" = "403" ] && ok "копия без пароля входа в теле — 403" || bad "копия без пароля входа: HTTP $HTTP (ждали 403)"
+  req POST "/offsite/copy" -H "$JSON_O" -d "$(oj login_password="$ADMIN_PASS")"
+  if [ "$HTTP" = "200" ] && body_has "r['url'].startswith('/api/offsite/download?t=') and len(r['url'])>40 and r['filename'].startswith('ds_copy_') and r['filename'].endswith('.tar') and r['bytes']>0"; then
+    OFF_URL=$(body_get url); OFF_FILE=$(body_get filename); OFF_BYTES=$(body_get bytes)
+    ok "копия собрана: $OFF_FILE, $OFF_BYTES байт, одноразовая ссылка выдана"
+  else
+    OFF_URL=""; OFF_FILE=""; OFF_BYTES=""; bad "сборка копии: HTTP $HTTP $BODY"
+  fi
+  if [ -n "$OFF_URL" ]; then
+    off_get "$OFF_URL" "$OFF_DIR/copy.tar"
+    OFF_SIZE=$($DC stat -c %s "$OFF_DIR/copy.tar" 2>/dev/null)
+    if [ "$OFF_CODE" = "200" ] && [ "$OFF_SIZE" = "$OFF_BYTES" ] && [ "$(off_hdr content-length)" = "$OFF_BYTES" ] \
+       && [[ "$(off_hdr content-disposition)" == *"filename=\"$OFF_FILE\""* ]] && [[ "$(off_hdr content-type)" == application/x-tar* ]]; then
+      ok "скачивание по ссылке без входа: 200, $OFF_SIZE байт = Content-Length, имя $OFF_FILE, application/x-tar"
+    else bad "скачивание копии: HTTP $OFF_CODE, на диске ${OFF_SIZE:-?} из $OFF_BYTES, Content-Length «$(off_hdr content-length)»"; fi
+    R=$($DC python3 -I -c "$OFF_PY_COPY" "$OFF_DIR/copy.tar" "$OFF_PW1" "ВОССТАНОВЛЕНИЕ.txt" "copy.tar.gz.enc" "copy.tar.gz.enc.sha256" 2>&1)
+    if [[ "$R" == OK* ]]; then ok "копия: tar из трёх файлов, sha256 сходится, openssl открывает паролем на копию, чужим — нет, внутри база, программа с .env и опись (${R#OK } файлов)"
+    else bad "проверка содержимого копии: $R"; fi
+    off_get "$OFF_URL" "$OFF_DIR/copy2.tar"
+    [ "$OFF_CODE" = "404" ] && ok "вторая попытка по той же ссылке — 404 (ссылка одноразовая)" || bad "вторая попытка по ссылке: HTTP $OFF_CODE (ждали 404)"
+    # «скачано» отмечается после последнего байта: ждём отметку в статусе
+    if off_wait "r['copy']['today'] is True and r['copy']['last_file']=='$OFF_FILE' and r['copy']['last_bytes']==$OFF_BYTES and r['copy']['last_by']=='$ADMIN_USER'"; then
+      ok "в статусе: копия сегодня скачана ($OFF_FILE, $ADMIN_USER)"; else bad "статус не отметил скачанную копию (last_file/last_bytes/last_by)"; fi
+    req GET "/audit?limit=100"
+    if body_has "any(x['title']=='Копия на флешку скачана' and '$OFF_FILE' in (x['detail'] or '') and x['actor']=='$ADMIN_USER' for x in r)"; then
+      ok "в журнале: «Копия на флешку скачана»"; else bad "в журнале нет записи о скачанной копии"; fi
+    body_has "any(x['title']=='Неверный пароль при скачивании копии' for x in r) and any(x['title']=='Пароль на копию изменён' for x in r)" \
+      && ok "в журнале: отказ по неверному паролю входа и смена пароля на копию" || bad "в журнале нет записи об отказе или о смене пароля"
+    if echo "$BODY" | grep -qF -e "$OFF_PW0" -e "$OFF_PW1" -e "$ADMIN_PASS"; then bad "в журнале действий нашёлся пароль!"; else ok "в журнале паролей нет"; fi
+  fi
+
+  # 4. ролики: «новые», потом «все»
+  req GET "/media/${MID:-0}"; OFF_MFILE=$(body_get filename)
+  req POST "/offsite/media" -H "$JSON_O" -d '{"scope":"new"}'
+  if [ "$HTTP" = "200" ] && body_has "r['url'].startswith('/api/offsite/download?t=') and r['filename'].startswith('ds_media_new_') and r['filename'].endswith('.tar') and r['count']>=1 and r['bytes']>0 and r['missing']==0"; then
+    OFF_URL=$(body_get url); OFF_MFN=$(body_get filename); OFF_MCNT=$(body_get count)
+    ok "ролики «новые»: $OFF_MFN, $OFF_MCNT шт, ссылка выдана"
+  else
+    OFF_URL=""; bad "ролики «новые»: HTTP $HTTP $BODY"
+  fi
+  if [ -n "$OFF_URL" ]; then
+    off_get "$OFF_URL" "$OFF_DIR/media_new.tar"
+    [ "$OFF_CODE" = "200" ] && [ "$(off_hdr content-length)" = "$($DC stat -c %s "$OFF_DIR/media_new.tar" 2>/dev/null)" ] \
+      && ok "ролики «новые»: скачались, размер = Content-Length" || bad "ролики «новые»: HTTP $OFF_CODE, Content-Length «$(off_hdr content-length)»"
+    R=$($DC python3 -I -c "$OFF_PY_MEDIA" "$OFF_DIR/media_new.tar" "${OFF_MFILE:-?}" "SMOKE_media_$STAMP" 2>&1)
+    if [[ "$R" == OK* ]]; then
+      read -r _ OFF_NF OFF_NL OFF_NM <<< "$R"
+      [ "$OFF_NL" = "$OFF_MCNT" ] && [ "$OFF_NM" = "0" ] && ok "архив «новых»: файлов $OFF_NF, манифест на $OFF_NL строк = число из ответа, файл тестового ролика внутри, без пропавших" \
+        || bad "архив «новых»: в манифесте $OFF_NL строк (ждали $OFF_MCNT), без файла: $OFF_NM"
+    else bad "проверка архива «новых»: $R"; fi
+    off_get "$OFF_URL" "$OFF_DIR/media_new2.tar"
+    [ "$OFF_CODE" = "404" ] && ok "ролики: вторая попытка по ссылке — 404" || bad "ролики, вторая попытка: HTTP $OFF_CODE (ждали 404)"
+    if off_wait "r['media']['new_count']==0 and r['media']['last_at'] and r['media']['last_by']=='$ADMIN_USER'"; then
+      ok "в статусе: новых роликов нет, кто и когда скачал — на месте"; else bad "после скачивания «новых» статус всё ещё показывает новые ролики"; fi
+    req POST "/offsite/media" -H "$JSON_O" -d '{"scope":"new"}'
+    [ "$HTTP" = "409" ] && detail_has "Новых роликов нет" && ok "«новые» после скачивания — 409 «Новых роликов нет»" || bad "«новые» повторно: HTTP $HTTP (ждали 409)"
+  fi
+  req POST "/offsite/media" -H "$JSON_O" -d '{"scope":"all"}'
+  if [ "$HTTP" = "200" ] && body_has "r['filename'].startswith('ds_media_all_') and r['count']>=1 and r['missing']==0"; then
+    OFF_URL=$(body_get url); OFF_MCNT=$(body_get count)
+    off_get "$OFF_URL" "$OFF_DIR/media_all.tar"
+    R=$($DC python3 -I -c "$OFF_PY_MEDIA" "$OFF_DIR/media_all.tar" "${OFF_MFILE:-?}" "SMOKE_media_$STAMP" 2>&1)
+    if [ "$OFF_CODE" = "200" ] && [[ "$R" == OK* ]]; then
+      read -r _ OFF_NF OFF_NL OFF_NM <<< "$R"
+      [ "$OFF_NL" = "$OFF_MCNT" ] && ok "ролики «все»: $OFF_MCNT шт скачались, манифест и файл тестового ролика на месте" || bad "ролики «все»: в манифесте $OFF_NL строк (ждали $OFF_MCNT)"
+    else bad "ролики «все»: HTTP $OFF_CODE, $R"; fi
+  else bad "ролики «все»: HTTP $HTTP $BODY"; fi
+  req GET "/audit?limit=100"
+  body_has "any(x['title']=='Ролики скачаны на флешку' and x['detail'].startswith('новые, ') for x in r) and any(x['title']=='Ролики скачаны на флешку' and x['detail'].startswith('все, ') for x in r)" \
+    && ok "в журнале: «Ролики скачаны на флешку» — и новые, и все" || bad "в журнале нет записей о скачанных роликах"
+
+  # 5. итог: копия сегодня, новых роликов нет — напоминание «ok»
+  if off_wait "r['state']=='ok' and r['copy']['today'] is True and r['media']['new_count']==0"; then
+    ok "напоминание «ok»: копия сегодня и новых роликов нет"; else bad "напоминание не стало «ok» после копии и роликов"; fi
+  off_finish
+  trap - EXIT
 fi
 
 # ── 6. Уборка тестовых данных ────────────────────────────────────────────────

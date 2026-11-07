@@ -40,7 +40,18 @@
  *   7. Файлы медиатеки — только по входу: без входа ролик, миниатюра и
  *      /media/<имя> — 401, экран по X-Token качает одобренный ролик, панель —
  *      по cookie ds_media (кадр просмотра, миниатюра, «Скачать», Range → 206).
- *   8. Копит ошибки консоли, необработанные исключения и ответы HTTP ≥400.
+ *   8. «Копия на флешку»: у суперадмина на дашборде есть напоминание, в «Настройках» — блок
+ *      «Копия на флешку» с кнопками. Само скачивание идёт только при E2E_ALLOW_OFFSITE=1 (на
+ *      стенде: оно меняет пароль на копию и отметки «скачано»; ui_test.sh до и после прогона
+ *      сбрасывает пароль на копию на сервере): жёлтое напоминание → окно «Пароль на копию»
+ *      (не совпали, неверный пароль входа → 403 в окне, верный) → окно «Скачать копию» (неверный
+ *      пароль входа → 403 в окне, верный) → файл ds_copy_*.tar (три файла, sha256, пароля в
+ *      инструкции нет) → блок и напоминание сами отмечают «скачана» (опрос) → «Скачать новые
+ *      ролики» (tar с манифестом и файлом тестового ролика) → напоминание зелёное → «новых»
+ *      больше нет (409) → «Скачать все» с подтверждением. Ожидаемые 403/409 этого шага внесены в
+ *      список expected. При E2E_SHOTS_DIR=папка шаг сохраняет в неё 4 снимка экрана (жёлтое и
+ *      зелёное напоминание, блок в «Настройках», окно скачивания).
+ *   9. Копит ошибки консоли, необработанные исключения и ответы HTTP ≥400.
  *
  * Любая ошибка консоли/JS и любой ответ ≥400 — это провал прогона: именно
  * так выглядели дефекты, которые ловили руками.
@@ -62,7 +73,11 @@
  * Переменные: DS_URL (по умолч. http://nginx), ADMIN_USER, ADMIN_PASS,
  * E2E_ALLOW_BROADCAST=1 — шаги с включением общего эфира и запуском бегущей строки
  * «на все экраны» (они идут на ВСЕ экраны, только на стенде; без переменной шаги
- * пропускаются с пометкой).
+ * пропускаются с пометкой),
+ * E2E_ALLOW_OFFSITE=1 — шаги «Копия на флешку» со сменой пароля на копию и скачиванием копии и
+ * роликов (только на стенде; пароль на копию должен быть сброшен до прогона — это делает
+ * ui_test.sh; без переменной шаги пропускаются с пометкой),
+ * E2E_SHOTS_DIR — папка для снимков экрана (в контейнере; ui_test.sh монтирует папку хоста).
  */
 const puppeteer = require('puppeteer');
 
@@ -79,6 +94,9 @@ const DUP_TITLE = `E2E_дубль_${STAMP}`;
 const NL_PLAYLIST = `E2E_эфир_${STAMP}`;      // плейлист для страницы «Эфир сети» (свой, отдельно от цикла «плейлист»)
 const TK_TAG = `E2E_строка_${STAMP}`;          // метка бегущих строк и шаблонов прогона: по ней идёт уборка
 const BC_ALLOWED = process.env.E2E_ALLOW_BROADCAST === '1';
+const OFFSITE_ALLOWED = process.env.E2E_ALLOW_OFFSITE === '1';
+const OFFSITE_PASS = 'E2E-copy-pass-1';        // тестовый пароль на копию (ui_test.sh сбрасывает его до и после прогона)
+const SHOTS_DIR = process.env.E2E_SHOTS_DIR || '';     // куда класть снимки экрана (ui_test.sh монтирует папку хоста); пусто — без снимков
 
 // Разделы левого меню: [data-nav, заголовок в шапке].
 const SECTIONS = [
@@ -135,6 +153,7 @@ const problems = [];      // накопленные ошибки консоли/
 let step = 'старт';       // текущий шаг — для привязки ошибки к месту
 let dialogMode = 'dismiss';   // как отвечать на confirm/prompt
 let promptAnswer = '';
+let lastDialogText = '';       // текст последнего confirm/prompt (чтобы проверить, что спросила панель)
 
 const ok = (m) => { PASS_N++; console.log('  ✓ ' + m); };
 const bad = (m) => { FAIL_N++; console.log('  ✗ ' + m); };
@@ -341,6 +360,66 @@ function untilHourOf(untilAt) {
   return (h === 0 && m === 0 && s === 0) ? 24 : h + ((m || s) ? 1 : 0);
 }
 
+/** Файлы в tar (ustar/PAX) без распаковки: {entries: [{name, size, offset}], complete}. Имена с кириллицей
+ *  лежат в PAX-заголовке (тип x, записи «длина ключ=значение»); complete — дошли до пустых блоков конца и
+ *  все файлы лежат в буфере целиком (оборванное скачивание так не пройдёт). */
+function tarEntries(buf) {
+  const entries = [];
+  let off = 0, pax = null, ended = false;
+  while (off + 512 <= buf.length) {
+    const h = buf.subarray(off, off + 512);
+    if (h.every(b => b === 0)) { ended = true; break; }
+    const cstr = (a, b) => {
+      const part = h.subarray(a, b), z = part.indexOf(0);
+      return part.subarray(0, z < 0 ? part.length : z).toString('utf8');
+    };
+    const size = parseInt(cstr(124, 136).trim(), 8) || 0;
+    const type = String.fromCharCode(h[156]);
+    const data = off + 512;
+    if (type === 'x') {
+      for (let p = data; p < data + size;) {
+        const sp = buf.indexOf(0x20, p);
+        const len = parseInt(buf.subarray(p, sp).toString('ascii'), 10);
+        const rec = buf.subarray(sp + 1, p + len - 1).toString('utf8');     // «ключ=значение» без перевода строки
+        const eq = rec.indexOf('=');
+        if (rec.slice(0, eq) === 'path') pax = rec.slice(eq + 1);
+        p += len;
+      }
+    } else {
+      entries.push({ name: pax !== null ? pax : cstr(0, 100), size, offset: data });
+      pax = null;
+    }
+    off = data + Math.ceil(size / 512) * 512;
+  }
+  return { entries, complete: ended && entries.every(e => e.offset + e.size <= buf.length) };
+}
+
+/** Дождаться скачанного файла в папке по маске имени (недокачанный .crdownload не в счёт) и пока его размер
+ *  перестанет расти; null — не появился за timeoutMs. */
+async function waitSavedFile(fs, dir, re, timeoutMs) {
+  for (let t = 0; t < timeoutMs; t += 250) {
+    const f = fs.existsSync(dir) ? fs.readdirSync(dir).find(n => re.test(n) && !n.endsWith('.crdownload')) : null;
+    if (f) {
+      let size = -1;
+      while (fs.statSync(dir + '/' + f).size !== size) { size = fs.statSync(dir + '/' + f).size; await sleep(400); }
+      return f;
+    }
+    await sleep(250);
+  }
+  return null;
+}
+
+/** Снимок экрана для отчёта (только если задана E2E_SHOTS_DIR); сбой снимка прогон не роняет. */
+async function shot(page, name) {
+  if (!SHOTS_DIR) return;
+  try {
+    await page.screenshot({ path: `${SHOTS_DIR}/${name}.png` });
+    console.log(`    └─ снимок: ${name}.png`);
+  } catch (e) {
+    console.log(`    └─ снимок ${name} не сохранён: ${e.message.split('\n')[0]}`);
+  }
+}
+
 /** Вернуть общий эфир в состояние до прогона (если шаг его трогал).
  *  Лишних записей в журнале не плодит: состояние уже прежнее — ничего не шлёт.
  *  Флаг dirty сбрасывается только когда состояние ПОДТВЕРЖДЕНО (уже прежнее или запрос
@@ -403,6 +482,7 @@ async function restoreBroadcast(page, fx) {
     record('HTTP ' + r.status(), r.url());
   });
   page.on('dialog', async d => {
+    lastDialogText = d.message();
     if (dialogMode === 'accept') await d.accept(d.type() === 'prompt' ? promptAnswer : undefined);
     else await d.dismiss();
   });
@@ -1887,6 +1967,258 @@ async function restoreBroadcast(page, fx) {
     } finally {
       expected = [];
       try { fs.rmSync(MDL_DIR, { recursive: true, force: true }); } catch (_) { /* одноразовый контейнер */ }
+    }
+
+    // ── 10б. Копия на флешку ──────────────────────────────────────────────
+    // Без флага (ничего не меняет): у суперадмина на дашборде есть напоминание, в «Настройках» — блок
+    // с двумя карточками и кнопками. С E2E_ALLOW_OFFSITE=1 (только стенд; ui_test.sh до прогона сбрасывает
+    // пароль на копию, после — снова): жёлтое напоминание → окно «Пароль на копию» (не совпали — ошибка
+    // в окне без запроса; неверный пароль входа — 403 и ошибка в окне; верный — «задан») → окно «Скачать
+    // копию» (неверный пароль входа — 403 в окне; верный — файл ds_copy_*.tar на диске: три файла, sha256
+    // сходится, пароля в инструкции нет) → блок и напоминание сами отмечают «скачана» (опрос) → «Скачать
+    // новые ролики» с дашборда (tar с манифестом и файлом тестового ролика) → напоминание зелёное;
+    // «новых» больше нет (409); «Скачать все» с подтверждением. Снимки — в E2E_SHOTS_DIR.
+    head('Копия на флешку: напоминание, блок в «Настройках», скачивание');
+    const OFF_DIR = '/tmp/e2e_offsite_' + STAMP;
+    const bannerInfo = () => page.evaluate(() => {
+      const b = document.querySelector('#offsite-banner .banner');
+      return b ? { cls: b.className, text: b.innerText.replace(/\s+/g, ' ').trim(),
+                   acts: [...b.querySelectorAll('[data-action]')].map(x => x.dataset.action) } : null;
+    });
+    const waitBanner = () => waitUntil(page, () => !!document.querySelector('#offsite-banner .banner'), null, 15000);
+    const setField = (id, v) => page.$eval('#' + id, (el, v) => { el.value = v; }, v);
+    const winError = () => page.$eval('#oc-err', el => el.hidden ? '' : el.textContent.trim()).catch(() => '');
+    const waitWinError = (re) => waitUntil(page, (src) => {
+      const e = document.getElementById('oc-err');
+      return !!e && !e.hidden && new RegExp(src).test(e.textContent);
+    }, re.source, 15000);
+    const modalGone = (ms) => waitUntil(page, () => !document.querySelector('.modal-oc'), null, ms);
+    // Ждать, пока GET /offsite/status удовлетворит условию (отметку «скачано» сервер ставит чуть позже последнего байта)
+    const waitStatus = async (pred, ms) => {
+      for (let t = 0; t < ms; t += 500) {
+        const r = await apiCall(page, 'GET', '/offsite/status');
+        if (r.status === 200 && r.data && pred(r.data)) return true;
+        await sleep(500);
+      }
+      return false;
+    };
+    // Содержимое tar из файла: {names, files: имя → Buffer} или null, если архив не целый
+    const readTar = (name) => {
+      const buf = fs.readFileSync(OFF_DIR + '/' + name);
+      const t = tarEntries(buf);
+      if (!t.complete) return null;
+      const files = {};
+      for (const e of t.entries) files[e.name] = buf.subarray(e.offset, e.offset + e.size);
+      return { names: t.entries.map(e => e.name).sort(), files };
+    };
+    // Проверка архива роликов: манифест и файл тестового ролика на месте; возвращает текст ошибки или ''
+    const mediaTarProblem = (name) => {
+      const t = readTar(name);
+      if (!t) return 'архив не целый';
+      const man = t.files['media/MANIFEST_media.txt'];
+      if (!man) return 'нет media/MANIFEST_media.txt';
+      if (!man.toString('utf8').includes(CLIP_TITLE)) return 'в манифесте нет названия тестового ролика';
+      const clipBuf = t.files['media/' + fx.clipFile];
+      if (!clipBuf) return `нет файла media/${fx.clipFile}`;
+      if (!(clipBuf[0] === 0x89 && clipBuf.subarray(1, 4).toString() === 'PNG')) return 'тестовый ролик в архиве не PNG';
+      return '';
+    };
+    try {
+      step = 'копия на флешку: напоминание на дашборде';
+      await gotoSection(page, 'dash');
+      const b0 = await waitBanner() ? await bannerInfo() : null;
+      // innerText отдаёт заголовок уже в верхнем регистре (так он нарисован стилем), поэтому без учёта регистра
+      (b0 && /\b(warn|on)\b/.test(b0.cls) && /копия на флешку/i.test(b0.text))
+        ? ok(`на дашборде есть напоминание «Копия на флешку» (${/\bon\b/.test(b0.cls) ? 'зелёное' : 'жёлтое'})`)
+        : bad('на дашборде нет напоминания «Копия на флешку»');
+
+      step = 'копия на флешку: блок в «Настройках»';
+      await gotoSection(page, 'settings');
+      const blockReady = await waitUntil(page, () => document.querySelectorAll('#offsite-block .oc-head').length === 2, null, 15000);
+      const blockTxt = await page.$eval('#offsite-block', el => el.innerText).catch(() => '');
+      (blockReady && blockTxt.includes('Ежедневная копия') && blockTxt.includes('Ролики') && !blockTxt.includes('Не удалось загрузить'))
+        ? ok('в «Настройках» есть блок «Копия на флешку»: «Ежедневная копия» и «Ролики»')
+        : bad(`блок «Копия на флешку» в «Настройках» не нарисован: ${blockTxt.slice(0, 80) || 'пусто'}`);
+      const acts = await page.$$eval('#offsite-block [data-action^="offsite-"]', els => els.map(e => e.dataset.action));
+      (acts.includes('offsite-media-new') && acts.includes('offsite-media-all') && (acts.includes('offsite-copy') || acts.includes('offsite-password')))
+        ? ok(`в блоке есть кнопки: ${[...new Set(acts)].join(', ')}`)
+        : bad(`в блоке не хватает кнопок: ${acts.join(', ') || 'нет ни одной'}`);
+
+      if (!OFFSITE_ALLOWED) {
+        console.log('  – смена пароля на копию и скачивание копии и роликов — пропущено (задайте E2E_ALLOW_OFFSITE=1 на стенде)');
+      } else {
+        step = 'копия на флешку: чистое начало';
+        const st0 = (await apiCall(page, 'GET', '/offsite/status')).data || {};
+        if (!st0.password || st0.password.set !== false) {
+          throw new Error('пароль на копию уже задан — запускайте через ui_test.sh: он сбрасывает пароль на сервере');
+        }
+        ok('пароля на копию нет (чистое начало)');
+        if (st0.project_mounted !== true) throw new Error('project_mounted=false: копию не собрать (запустите install_server.sh)');
+
+        step = 'копия на флешку: жёлтое напоминание';
+        await gotoSection(page, 'dash');
+        const b1 = await waitBanner() ? await bannerInfo() : null;
+        (b1 && /\bwarn\b/.test(b1.cls))
+          ? ok(`жёлтое напоминание: «${b1.text.slice(0, 90)}»`)
+          : bad(`напоминание не жёлтое: ${b1 ? b1.cls : 'его нет'} (новый тестовый ролик должен делать его «warn»)`);
+        await shot(page, '1_dashboard_yellow_banner');
+
+        step = 'копия на флешку: окно «Пароль на копию»';
+        await gotoSection(page, 'settings');
+        await page.waitForSelector('#offsite-block [data-action="offsite-password"]', { timeout: 15000 });
+        await page.click('#offsite-block [data-action="offsite-password"]');
+        if (!await page.waitForSelector('.modal-oc #oc-pw-new', { timeout: 10000 }).catch(() => null)) {
+          throw new Error('окно «Пароль на копию» не открылось');
+        }
+        ok('окно «Пароль на копию» открылось');
+        // не совпали: ответ даёт само окно, запроса на сервер нет
+        await setField('oc-pw-new', OFFSITE_PASS); await setField('oc-pw-new2', OFFSITE_PASS + 'x'); await setField('oc-pw-login', PASS);
+        await page.click('#oc-submit');
+        await waitWinError(/не совпадают/)
+          ? ok('пароли не совпали — ошибка в окне')
+          : bad(`пароли не совпали, а в окне: «${await winError()}»`);
+        // неверный пароль входа: 403 от сервера, текст — в окне, окно остаётся
+        expected = [/^HTTP 403: .*\/api\/offsite\/password$/, /^console: .*status of 403/];
+        await setField('oc-pw-new2', OFFSITE_PASS); await setField('oc-pw-login', 'wrong-' + PASS);
+        await page.click('#oc-submit');
+        const wrongLogin = await waitWinError(/Неверный пароль входа/);
+        await sleep(300);
+        expected = [];
+        (wrongLogin && await page.$('.modal-oc'))
+          ? ok('неверный пароль входа — ошибка в окне (403), окно осталось открытым')
+          : bad(`неверный пароль входа: в окне «${await winError()}»`);
+        // верный
+        await setField('oc-pw-login', PASS);
+        await page.click('#oc-submit');
+        await modalGone(15000) ? ok('пароль на копию сохранён, окно закрылось') : bad(`окно не закрылось: «${await winError()}»`);
+        const pwShown = await waitUntil(page, () => {
+          const b = document.getElementById('offsite-block');
+          return !!b && /задан \d{2}\.\d{2}\.\d{4}/.test(b.innerText) && !!b.querySelector('[data-action="offsite-copy"]');
+        }, null, 15000);
+        pwShown ? ok('в блоке: пароль на копию задан, появилась кнопка «Скачать копию»') : bad('блок не показал, что пароль на копию задан');
+        await page.$eval('#offsite-block', el => el.scrollIntoView({ block: 'start' }));
+        await sleep(400);
+        await shot(page, '2_settings_offsite_block');
+
+        step = 'копия на флешку: окно «Скачать копию»';
+        await page.click('#offsite-block [data-action="offsite-copy"]');
+        if (!await page.waitForSelector('.modal-oc #oc-login', { timeout: 10000 }).catch(() => null)) {
+          throw new Error('окно «Скачать копию на флешку» не открылось');
+        }
+        const winTxt = await page.$eval('.modal-oc', el => el.innerText);
+        winTxt.includes('Скачать копию на флешку') && /ds_copy_\d{4}-\d{2}-\d{2}_\d{4}\.tar/.test(winTxt)
+          ? ok('окно «Скачать копию на флешку»: пароль входа и имя файла ds_copy_….tar')
+          : bad('окно «Скачать копию на флешку» не то');
+        await setField('oc-login', PASS);
+        await sleep(700);                             // окно выезжает с анимацией: снимаем уже готовое
+        await shot(page, '3_copy_window');            // окно с введённым паролем, до проверки ошибки
+        expected = [/^HTTP 403: .*\/api\/offsite\/copy$/, /^console: .*status of 403/];
+        await setField('oc-login', 'wrong-' + PASS);
+        await page.click('#oc-submit');
+        const wrongCopy = await waitWinError(/Неверный пароль входа/);
+        await sleep(300);
+        expected = [];
+        (wrongCopy && await page.$('.modal-oc'))
+          ? ok('копия: неверный пароль входа — ошибка в окне (403), копия не собиралась')
+          : bad(`копия, неверный пароль входа: в окне «${await winError()}»`);
+        await setField('oc-login', PASS);
+
+        step = 'копия на флешку: скачивание копии';
+        fs.mkdirSync(OFF_DIR, { recursive: true });
+        await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: OFF_DIR });
+        await page.click('#oc-submit');
+        await modalGone(180000) ? ok('копия собрана, окно закрылось (скачивание началось)') : bad(`окно не закрылось за 3 минуты: «${await winError()}»`);
+        const copyFile = await waitSavedFile(fs, OFF_DIR, /^ds_copy_.*\.tar$/, 60000);
+        if (!copyFile) {
+          bad('файл копии не появился на диске');
+        } else {
+          const t = readTar(copyFile);
+          const ENC = 'copy.tar.gz.enc', SHA = ENC + '.sha256', INS = 'ВОССТАНОВЛЕНИЕ.txt';
+          if (!t) {
+            bad(`${copyFile}: tar не целый`);
+          } else if (JSON.stringify(t.names) !== JSON.stringify([ENC, SHA, INS].sort())) {
+            bad(`${copyFile}: в tar не те файлы: ${t.names.join(', ')}`);
+          } else {
+            ok(`«${copyFile}» скачан (${fs.statSync(OFF_DIR + '/' + copyFile).size} байт): в tar три файла — инструкция, запертая часть, sha256`);
+            const sha = require('crypto').createHash('sha256').update(t.files[ENC]).digest('hex');
+            const shaLine = t.files[SHA].toString('ascii').trim().split(/\s+/);
+            (shaLine[0] === sha && shaLine[1] === ENC && t.files[ENC].subarray(0, 8).toString('latin1') === 'Salted__')
+              ? ok('sha256 запертой части сходится, формат openssl (Salted__)') : bad('sha256 запертой части не сошлась или формат не openssl');
+            const ins = t.files[INS].toString('utf8');
+            (ins.includes('openssl enc -d') && !ins.includes(OFFSITE_PASS))
+              ? ok('в инструкции есть команда расшифровки, пароля на копию нет') : bad('инструкция: нет команды расшифровки или в ней пароль');
+          }
+          // «скачана» сервер отмечает после последнего байта; блок и напоминание узнают об этом опросом
+          await waitStatus(d => d.copy.today && d.copy.last_file === copyFile, 30000)
+            ? ok('сервер отметил копию скачанной') : bad('сервер не отметил копию скачанной');
+          const blockMarked = await waitUntil(page, () => {
+            const b = document.getElementById('offsite-block');
+            return !!b && /сегодня, \d{2}:\d{2}/.test(b.innerText);
+          }, null, 25000);
+          blockMarked ? ok('блок сам показал «Последнее скачивание: сегодня» (опрос)') : bad('блок не показал последнее скачивание за 25 с');
+        }
+
+        step = 'копия на флешку: напоминание после копии';
+        await gotoSection(page, 'dash');
+        const b2 = await waitBanner() ? await bannerInfo() : null;
+        (b2 && /\bwarn\b/.test(b2.cls) && b2.text.includes('Копия сегодня скачана, а новые ролики — нет')
+          && /новых роликов с тех пор: \d+/.test(b2.text) && b2.acts.includes('offsite-media-new'))
+          ? ok('после копии напоминание: «Копия сегодня скачана, а новые ролики — нет» и кнопка «Скачать новые ролики»')
+          : bad(`напоминание после копии не то: ${b2 ? b2.text.slice(0, 120) + ' [' + b2.acts.join(',') + ']' : 'его нет'}`);
+
+        step = 'копия на флешку: скачать новые ролики';
+        await page.click('#offsite-banner [data-action="offsite-media-new"]');
+        const newFile = await waitSavedFile(fs, OFF_DIR, /^ds_media_new_.*\.tar$/, 60000);
+        if (!newFile) {
+          bad('архив новых роликов не появился на диске');
+        } else {
+          const prob = mediaTarProblem(newFile);
+          prob ? bad(`${newFile}: ${prob}`)
+               : ok(`«${newFile}» скачан: манифест и файл тестового ролика на месте`);
+        }
+        await waitStatus(d => d.media.new_count === 0 && !!d.media.last_at, 30000)
+          ? ok('сервер отметил ролики скачанными: новых нет') : bad('сервер не отметил ролики скачанными');
+        // напоминание само становится зелёным (опрос после скачивания), без перезагрузки страницы
+        const green = await waitUntil(page, () => !!document.querySelector('#offsite-banner .banner.on'), null, 25000);
+        const b3 = green ? await bannerInfo() : null;
+        (b3 && b3.text.includes('Сегодня скачана в') && b3.text.includes('Новые ролики тоже скачаны') && b3.acts.length === 0)
+          ? ok(`напоминание стало зелёным: «${b3.text.slice(0, 80)}»`) : bad('напоминание не стало зелёным после копии и роликов');
+        await sleep(300);
+        await shot(page, '4_dashboard_green_banner');
+
+        step = 'копия на флешку: «новых» больше нет';
+        expected = [/^HTTP 409: .*\/api\/offsite\/media$/, /^console: .*status of 409/];
+        const again = await apiCall(page, 'POST', '/offsite/media', { json: { scope: 'new' } });
+        await sleep(300);
+        expected = [];
+        (again.status === 409 && /Новых роликов нет/.test(String((again.data || {}).detail)))
+          ? ok('«новые» повторно — 409 «Новых роликов нет»') : bad(`«новые» повторно: HTTP ${again.status}`);
+
+        step = 'копия на флешку: скачать все ролики';
+        await gotoSection(page, 'settings');
+        const ALL = '#offsite-block [data-action="offsite-media-all"]';
+        await waitUntil(page, (sel) => !!document.querySelector(sel + ':not([disabled])'), ALL, 25000)
+          ? ok('кнопка «Скачать все» доступна') : bad('кнопка «Скачать все» осталась занятой');
+        dialogMode = 'accept'; lastDialogText = '';
+        await page.click(ALL);
+        const allFile = await waitSavedFile(fs, OFF_DIR, /^ds_media_all_.*\.tar$/, 60000);
+        dialogMode = 'dismiss';
+        /Скачать все ролики: \d+ шт, /.test(lastDialogText)
+          ? ok(`панель спросила подтверждение: «${lastDialogText.split('\n')[0]}»`) : bad(`подтверждение «Скачать все» не то: «${lastDialogText.slice(0, 80)}»`);
+        if (!allFile) {
+          bad('архив всех роликов не появился на диске');
+        } else {
+          const prob = mediaTarProblem(allFile);
+          prob ? bad(`${allFile}: ${prob}`) : ok(`«${allFile}» скачан: манифест и файл тестового ролика на месте`);
+        }
+      }
+    } catch (e) {
+      bad('шаг «копия на флешку» прерван на «' + step + '»: ' + e.message.split('\n')[0]);
+    } finally {
+      expected = [];
+      dialogMode = 'dismiss';
+      await closeModals(page).catch(() => {});
+      try { fs.rmSync(OFF_DIR, { recursive: true, force: true }); } catch (_) { /* одноразовый контейнер */ }
     }
 
   } catch (e) {
