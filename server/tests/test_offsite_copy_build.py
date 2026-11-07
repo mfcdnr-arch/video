@@ -235,8 +235,8 @@ def test_instruction_covers_restore_steps(env, monkeypatch):
         "bash install_server.sh",
         "docker compose stop api celery",
         'DROP DATABASE db_y', 'CREATE DATABASE db_y OWNER usr_x',   # значения из окружения
-        "docker exec ds_postgres psql -U usr_x -d postgres",
-        "docker exec -i ds_postgres psql -U usr_x -d db_y -q",
+        "docker exec ds_postgres psql -v ON_ERROR_STOP=1 -U usr_x -d postgres",
+        "docker exec -i ds_postgres psql -v ON_ERROR_STOP=1 -U usr_x -d db_y -q",
         "docker compose start api celery",
         "docker cp", "ds_api:/data/media/", "ds_api:/data/backups/documents/",
         "ds_api:/data/agent_updates/",
@@ -252,6 +252,68 @@ def test_instruction_covers_restore_steps(env, monkeypatch):
     assert len(re.findall(r"^ШАГ \d", text, flags=re.M)) >= 5
     assert not any(ord(c) > 0xFFFF for c in text)
     assert "\r" not in text
+
+
+def _step(text, n):
+    """Текст шага N инструкции: от заголовка «ШАГ N.» до следующего «ШАГ»."""
+    start = text.index(f"ШАГ {n}.")
+    nxt = re.search(r"^ШАГ \d", text[start + 1:], flags=re.M)
+    return text[start: start + 1 + nxt.start()] if nxt else text[start:]
+
+
+def test_instruction_db_step_is_safe_to_paste_and_fails_loudly(env, monkeypatch):
+    """Шаг базы: блок вставляется целиком и при первой ошибке дальше не идёт; миграции - до старта api."""
+    monkeypatch.setenv("POSTGRES_USER", "usr_x")
+    monkeypatch.setenv("POSTGRES_DB", "db_y")
+    text = outer_members(build(env))[INSTRUCTION].decode("utf-8")
+    step = _step(text, 4)
+    # DROP не спотыкается о забытые подключения (PostgreSQL 15)
+    assert 'DROP DATABASE db_y WITH (FORCE)' in step
+    # оба psql (пересоздание и заливка дампа) останавливаются на первой же ошибке
+    psql_lines = [ln for ln in step.splitlines() if "psql" in ln]
+    assert len(psql_lines) == 2
+    assert all("-v ON_ERROR_STOP=1" in ln for ln in psql_lines)
+    restore_line = next(ln for ln in psql_lines if "gunzip" in ln)
+    assert "-d db_y -q" in restore_line
+    # конвейер gunzip | psql: без pipefail сбой gunzip (нет дампа) выглядел бы как успех
+    assert "set -o pipefail" in restore_line
+    # порядок: остановить -> пересоздать -> залить -> миграции -> запустить -> проверка
+    marks = ["docker compose stop api celery", "DROP DATABASE", "gunzip -c", "bash migrate.sh",
+             "docker compose start api celery"]
+    pos = [step.index(m) for m in marks]
+    assert pos == sorted(pos), pos
+    assert text.index("curl -s http://localhost:8000/health") > text.index(marks[-1])
+    # блок собран цепочкой &&: после ошибки следующая команда не запускается; итог виден в конце
+    block = [ln.strip() for ln in step.splitlines()
+             if ln.strip() and any(m in ln for m in marks + ["cd ~/digital-signage", "echo "])]
+    assert block[0].startswith("cd ~/digital-signage")
+    assert all(ln.endswith("&& \\") for ln in block[:-1]), block
+    assert "||" in block[-1] and "ОШИБКА" in block[-1]
+    # подсказка про «is being accessed by other users» опирается на FORCE
+    assert "is being accessed by other users" in text
+    assert "WITH (FORCE)" in text[text.index("ЕСЛИ ЧТО-ТО НЕ ПОЛУЧИЛОСЬ"):]
+
+
+def test_instruction_prerequisites_usb_ports_docker(env):
+    """Шаги 1-2: порты, Docker (проверки, группа/sudo в конвейере, свой гид копии), поиск флешки."""
+    text = outer_members(build(env))[INSTRUCTION].decode("utf-8")
+    step1, step2 = _step(text, 1), _step(text, 2)
+    # порты новой машины: панель и время для мини-ПК
+    assert "80/tcp" in step1 and "123/udp" in step1
+    assert HOST in step1
+    # Docker: проверки и собственный гид копии с требованиями
+    for needle in ("docker --version", "docker compose version", "docker info",
+                   "program/docs/Инструкции/01_УСТАНОВКА_СЕРВЕР.md", "docs.docker.com"):
+        assert needle in step1, needle
+    # permission denied: группа docker, а для sudo - явный случай с конвейером
+    assert "sudo usermod -aG docker $USER" in step1
+    assert "gunzip -c ... | sudo docker exec -i" in step1
+    assert "sudo bash install_server.sh" in step1 and "sudo bash migrate.sh" in step1
+    # флешка: смотрим подключение, а не угадываем /media/$USER
+    assert "lsblk -o NAME,SIZE,LABEL,MOUNTPOINT" in step2
+    assert "findmnt -t vfat,exfat,ntfs,fuseblk" in step2
+    assert "ls /media/$USER" not in text
+    assert "файловом менеджере" in step2
 
 
 def test_instruction_defaults_for_db_names(env, monkeypatch):
