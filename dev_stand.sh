@@ -67,6 +67,8 @@ up(){
         echo "          (SMOKE_ALLOW_BROADCAST=1 включает шаг «Общий эфир» — он идёт на ВСЕ экраны, только на стенде)"
         echo "   E2E:   E2E_ALLOW_BROADCAST=1 ADMIN_PASS=\$(cat .dev_admin_pass) DS_URL=http://nginx bash ui_test.sh"
         echo "          (E2E_ALLOW_BROADCAST=1 — то же для шага «Эфир сети: включить общий эфир»)"
+        echo "   Копия на флешку: SMOKE_ALLOW_OFFSITE=1 / E2E_ALLOW_OFFSITE=1 (так же, как выше) — полный цикл: пароль, копия, ролики;"
+        echo "          сбрасывает пароль на копию и двигает отметки «скачано», только на этом стенде (dsdev)"
     else
         die "панель не отвечает на localhost:$PORT/health (docker compose -p dsdev logs api nginx)"
     fi
