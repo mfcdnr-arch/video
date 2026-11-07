@@ -19,6 +19,7 @@ now_msk), а не NOW() Postgres: контейнер БД живёт в UTC, и 
 
 Функции не делают commit — транзакцией управляет вызывающий (роутер).
 """
+import gzip
 import hashlib
 import io
 import json
@@ -29,6 +30,7 @@ import shutil
 import stat
 import subprocess
 import tarfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -305,31 +307,85 @@ def _remove_quiet(path: str) -> None:
         pass
 
 
+# pg_dump в образе api новее сервера PostgreSQL 15: он пишет в шапку дампа `SET transaction_timeout = 0;`,
+# а PostgreSQL 15 такого параметра не знает («unrecognized configuration parameter»). Инструкция
+# восстановления заливает дамп через `psql -v ON_ERROR_STOP=1`, и без правки она встала бы на этой строке.
+# Параметр — только «снять лимит по умолчанию», так что строку просто не пишем в копию. Правим строго
+# шапку: пока идут пустые строки, `--`-комментарии, `SET …`, `SELECT pg_catalog.set_config(…)` и команды
+# psql (`\restrict …`); на первом настоящем операторе шапка кончается, и дальше всё идёт байт в байт —
+# те же слова внутри данных или тела функции это содержимое базы, его трогать нельзя.
+_DUMP_UNSUPPORTED_LINE = b"SET transaction_timeout = 0;"
+_DUMP_PREAMBLE_PREFIXES = (b"--", b"SET ", b"SELECT pg_catalog.set_config(", b"\\")
+_DUMP_LINE_MAX = 64 * 1024              # строка шапки короткая; длиннее — это уже не шапка
+_DUMP_CHUNK = 1024 * 1024               # остальной дамп копируем кусками: память не растёт с размером базы
+_DUMP_STDERR_KEEP = 64 * 1024           # от stderr pg_dump нужно только начало для текста ошибки
+
+
+def _is_dump_preamble_line(line: bytes) -> bool:
+    body = line.rstrip(b"\r\n")
+    return body == b"" or body.startswith(_DUMP_PREAMBLE_PREFIXES)
+
+
+def _copy_dump_stream(src, dst) -> None:
+    """Переписать дамп из src в dst, выбросив из шапки строку `SET transaction_timeout = 0;`."""
+    while True:
+        line = src.readline(_DUMP_LINE_MAX)
+        if not line:
+            return
+        cut_mid_line = len(line) >= _DUMP_LINE_MAX and not line.endswith(b"\n")
+        if cut_mid_line or not _is_dump_preamble_line(line):
+            dst.write(line)             # первый оператор: шапка кончилась
+            break
+        if line.rstrip(b"\r\n") != _DUMP_UNSUPPORTED_LINE:
+            dst.write(line)
+    shutil.copyfileobj(src, dst, _DUMP_CHUNK)
+
+
+def _drain_stderr(pipe, box: list) -> None:
+    """Вычитывать stderr pg_dump в фоне: иначе при толстом stderr он встанет на полной трубе, пока мы
+    ждём его stdout. Храним только начало, остальное выбрасываем."""
+    kept = pipe.read(_DUMP_STDERR_KEEP)
+    box.append(kept)
+    while pipe.read(_DUMP_CHUNK):
+        pass
+
+
 def _pg_dump_gz(dst_path: str) -> None:
-    """Снять дамп БД в dst_path: `pg_dump "$DATABASE_URL" | gzip`. Любая беда — RuntimeError с текстом
+    """Снять дамп БД в dst_path: `pg_dump "$DATABASE_URL"`, сжатый gzip (уровень 6, как у утилиты gzip),
+    без строки `SET transaction_timeout = 0;` в шапке (см. выше). Любая беда — RuntimeError с текстом
     stderr (до 300 символов, пароль БД из адреса вычищен); недописанный файл удаляется.
 
     Модульная функция, а не вложенная: тесты подменяют её, чтобы не нужен был настоящий Postgres.
     """
     ok = False
     try:
-        with open(dst_path, "wb") as out:
-            try:
-                dump = subprocess.Popen(["pg_dump", DATABASE_URL],
-                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            except FileNotFoundError:
-                raise RuntimeError("pg_dump не найден на сервере")
-            try:
-                gz = subprocess.Popen(["gzip"], stdin=dump.stdout, stdout=out)
-            except FileNotFoundError:
-                dump.kill()
-                dump.wait()
-                raise RuntimeError("gzip не найден на сервере")
-            dump.stdout.close()                 # чтобы gzip увидел конец потока, когда pg_dump закончит
-            _, err = dump.communicate()
-            gz.wait()
-        if dump.returncode != 0 or gz.returncode != 0:
-            msg = err.decode(errors="ignore")
+        try:
+            dump = subprocess.Popen(["pg_dump", DATABASE_URL],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except FileNotFoundError:
+            raise RuntimeError("pg_dump не найден на сервере")
+        err_box: list = []
+        drain = threading.Thread(target=_drain_stderr, args=(dump.stderr, err_box), daemon=True)
+        drain.start()
+        write_error = None
+        try:
+            with gzip.open(dst_path, "wb", compresslevel=6) as out:
+                _copy_dump_stream(dump.stdout, out)
+        except BaseException as e:
+            dump.kill()                 # поток не дочитан: pg_dump завис бы на полной трубе
+            if not isinstance(e, OSError):
+                raise
+            write_error = e             # нет места, нет папки: отчитаемся тем же RuntimeError
+        finally:
+            dump.stdout.close()
+            dump.wait()
+            drain.join()
+            dump.stderr.close()
+        if write_error is not None:
+            reason = write_error.strerror or type(write_error).__name__
+            raise RuntimeError(f"Ошибка pg_dump: не удалось записать дамп ({reason})")
+        if dump.returncode != 0:
+            msg = (err_box[0] if err_box else b"").decode(errors="ignore")
             # пароль БД стоит в адресе подключения; если pg_dump его где-то процитировал — прячем
             raw_pw = urlsplit(DATABASE_URL).password
             for secret in ({raw_pw, unquote(raw_pw)} if raw_pw else ()):

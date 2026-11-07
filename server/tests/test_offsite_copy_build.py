@@ -740,3 +740,159 @@ def test_pg_dump_gz_missing_binary(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path / "пусто"))
     with pytest.raises(RuntimeError, match="не найден"):
         store._pg_dump_gz(str(tmp_path / "out.sql.gz"))
+
+
+# --- дамп для PostgreSQL 15: без строки transaction_timeout ----------------------------------
+# pg_dump 17 в образе api пишет в начало дампа `SET transaction_timeout = 0;`, а PostgreSQL 15 такой
+# параметр не знает; инструкция заливает дамп с ON_ERROR_STOP, и восстановление встаёт на этой строке.
+# Поэтому из ШАПКИ дампа убирается ровно эта строка, всё остальное идёт байт в байт.
+
+TT = "SET transaction_timeout = 0;"
+
+PREAMBLE = (
+    "--\n"
+    "-- PostgreSQL database dump\n"
+    "--\n"
+    "\n"
+    "\\restrict aBcD1234xyz\n"
+    "\n"
+    "-- Dumped from database version 15.18\n"
+    "-- Dumped by pg_dump version 17.10\n"
+    "\n"
+    "SET statement_timeout = 0;\n"
+    "SET lock_timeout = 0;\n"
+    "SET idle_in_transaction_session_timeout = 0;\n"
+    f"{TT}\n"
+    "SET client_encoding = 'UTF8';\n"
+    "SET standard_conforming_strings = on;\n"
+    "SELECT pg_catalog.set_config('search_path', '', false);\n"
+    "SET check_function_bodies = false;\n"
+    "SET row_security = off;\n"
+    "\n"
+)
+
+
+def _dump_from(tmp_path, monkeypatch, payload: bytes, *, script_tail=""):
+    """Поддельный pg_dump, который выдаёт payload как есть (cat из файла), затем script_tail."""
+    src = tmp_path / "payload.sql"
+    src.write_bytes(payload)
+    bindir = _fake_bin(tmp_path, f"#!/bin/sh\ncat '{src}'\n{script_tail}")
+    monkeypatch.setenv("PATH", bindir + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(store, "DATABASE_URL", "postgresql://u:pw@h:5432/d")
+
+
+def _run_dump(tmp_path) -> bytes:
+    dst = tmp_path / "out.sql.gz"
+    store._pg_dump_gz(str(dst))
+    return gzip.decompress(dst.read_bytes())
+
+
+def test_pg_dump_gz_drops_only_transaction_timeout_line_from_preamble(tmp_path, monkeypatch):
+    body = ("--\n-- Name: media; Type: TABLE; Schema: public; Owner: display_user\n--\n\n"
+            "CREATE TABLE public.media (\n    id integer NOT NULL,\n    title text\n);\n\n"
+            "COPY public.media (id, title) FROM stdin;\n1\tролик\n\\.\n\n")
+    text_in = PREAMBLE + body
+    _dump_from(tmp_path, monkeypatch, text_in.encode())
+    out = _run_dump(tmp_path)
+    assert out == text_in.replace(TT + "\n", "", 1).encode()
+    assert b"transaction_timeout" not in out
+    # остальная шапка на месте: ничего лишнего не пропало
+    for keep in ("SET statement_timeout = 0;", "\\restrict aBcD1234xyz",
+                 "SELECT pg_catalog.set_config('search_path', '', false);", "SET row_security = off;"):
+        assert keep.encode() in out
+
+
+def test_pg_dump_gz_keeps_transaction_timeout_text_after_preamble(tmp_path, monkeypatch):
+    # те же слова позже — внутри тела функции и данных COPY — это содержимое базы, его не трогаем
+    body = ("--\n-- Name: notes; Type: TABLE\n--\n\n"
+            "CREATE TABLE public.notes (id integer, body text);\n\n"
+            f"CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    {TT}\nEND;\n$$;\n\n"
+            f"COPY public.notes (id, body) FROM stdin;\n1\t{TT}\n2\tдругое\n"
+            f"{TT}\n\\.\n\n"
+            f"{TT}\n")
+    text_in = PREAMBLE + body
+    _dump_from(tmp_path, monkeypatch, text_in.encode())
+    out = _run_dump(tmp_path)
+    assert out == text_in.replace(TT + "\n", "", 1).encode()      # убрана только первая, из шапки
+    assert out.count(TT.encode()) == 4
+
+
+def test_pg_dump_gz_first_statement_ends_the_preamble(tmp_path, monkeypatch):
+    # строка сразу за первым оператором — уже не шапка, даже если стоит среди SET-ов
+    text_in = "SET lock_timeout = 0;\nCREATE TABLE t (id int);\n" + TT + "\nSET row_security = off;\n"
+    _dump_from(tmp_path, monkeypatch, text_in.encode())
+    assert _run_dump(tmp_path) == text_in.encode()
+
+
+def test_pg_dump_gz_dump_without_the_line_is_unchanged(tmp_path, monkeypatch):
+    text_in = PREAMBLE.replace(TT + "\n", "") + "CREATE TABLE t (id int);\n"
+    _dump_from(tmp_path, monkeypatch, text_in.encode())
+    assert _run_dump(tmp_path) == text_in.encode()
+
+
+def test_pg_dump_gz_preamble_only_and_empty_output(tmp_path, monkeypatch):
+    _dump_from(tmp_path, monkeypatch, PREAMBLE.encode())          # шапка без единого оператора
+    assert _run_dump(tmp_path) == PREAMBLE.replace(TT + "\n", "", 1).encode()
+    _dump_from(tmp_path, monkeypatch, b"")
+    assert _run_dump(tmp_path) == b""
+
+
+def test_pg_dump_gz_last_line_without_newline_is_kept(tmp_path, monkeypatch):
+    _dump_from(tmp_path, monkeypatch, (PREAMBLE + "SELECT 1;").encode())
+    assert _run_dump(tmp_path) == PREAMBLE.replace(TT + "\n", "", 1).encode() + b"SELECT 1;"
+
+
+def test_pg_dump_gz_large_body_passes_through_intact(tmp_path, monkeypatch):
+    import random
+    rnd = random.Random(20261104)
+    # 6 МиБ случайных байт (в том числе переводы строк и нули) и одна строка длиннее 1 МиБ:
+    # так видно, что поток идёт кусками, ничего не теряется и не склеивается
+    body = (b"CREATE TABLE big (id int);\nCOPY big (id) FROM stdin;\n"
+            + rnd.randbytes(6 * 1024 * 1024)
+            + b"\n" + b"x" * (1024 * 1024 + 7) + b"\n\\.\n")
+    payload = PREAMBLE.encode() + body
+    _dump_from(tmp_path, monkeypatch, payload)
+    out = _run_dump(tmp_path)
+    expected = payload.replace((TT + "\n").encode(), b"", 1)
+    assert len(out) == len(expected)
+    assert hashlib.sha256(out).hexdigest() == hashlib.sha256(expected).hexdigest()
+
+
+def test_pg_dump_gz_failure_after_output_removes_file_and_reports_stderr(tmp_path, monkeypatch):
+    _dump_from(tmp_path, monkeypatch, (PREAMBLE + "CREATE TABLE t (id int);\n").encode(),
+               script_tail="echo 'pg_dump: error: connection lost' >&2\nexit 3\n")
+    dst = tmp_path / "out.sql.gz"
+    with pytest.raises(RuntimeError, match="Ошибка pg_dump: pg_dump: error: connection lost"):
+        store._pg_dump_gz(str(dst))
+    assert not dst.exists()
+
+
+_NOISY_STDERR = ("i=0\nwhile [ $i -lt 16384 ]; do printf 'pg_dump: s3cr3tpw %060d\\n' $i >&2; "
+                 "i=$((i+1)); done\n")
+
+
+def test_pg_dump_gz_huge_stderr_does_not_deadlock(tmp_path, monkeypatch):
+    # stderr в мегабайт при успешном дампе: если не вычитывать его параллельно, pg_dump встанет на
+    # полной трубе, а мы — на ожидании stdout
+    _dump_from(tmp_path, monkeypatch, (PREAMBLE + "SELECT 1;\n").encode(), script_tail=_NOISY_STDERR)
+    out = _run_dump(tmp_path)
+    assert out.endswith(b"SELECT 1;\n")
+
+
+def test_pg_dump_gz_huge_stderr_on_failure_is_short_and_scrubbed(tmp_path, monkeypatch):
+    _dump_from(tmp_path, monkeypatch, b"-- x\n", script_tail=_NOISY_STDERR + "exit 1\n")
+    monkeypatch.setattr(store, "DATABASE_URL", "postgresql://u:s3cr3tpw@h:5432/d")
+    dst = tmp_path / "out.sql.gz"
+    with pytest.raises(RuntimeError) as ei:
+        store._pg_dump_gz(str(dst))
+    assert "s3cr3tpw" not in str(ei.value)
+    assert len(str(ei.value)) <= 300 + 60
+    assert not dst.exists()
+
+
+def test_pg_dump_gz_unwritable_destination_is_runtime_error(tmp_path, monkeypatch):
+    _dump_from(tmp_path, monkeypatch, (PREAMBLE + "SELECT 1;\n").encode())
+    dst = tmp_path / "нет-такой-папки" / "out.sql.gz"
+    with pytest.raises(RuntimeError, match="Ошибка pg_dump"):
+        store._pg_dump_gz(str(dst))
+    assert not dst.exists()
