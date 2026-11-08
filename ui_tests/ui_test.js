@@ -2042,6 +2042,10 @@ async function restoreBroadcast(page, fx) {
       (blockReady && blockTxt.includes('Ежедневная копия') && blockTxt.includes('Ролики') && !blockTxt.includes('Не удалось загрузить'))
         ? ok('в «Настройках» есть блок «Копия на флешку»: «Ежедневная копия» и «Ролики»')
         : bad(`блок «Копия на флешку» в «Настройках» не нарисован: ${blockTxt.slice(0, 80) || 'пусто'}`);
+      // панель ходит через nginx: со свежим nginx.conf (location /api/offsite/) предупреждения быть не должно
+      !blockTxt.includes('nginx не обновлён')
+        ? ok('предупреждения «nginx не обновлён для копии на флешку» нет (proxy_ok через nginx)')
+        : bad('в блоке «nginx не обновлён для копии на флешку»: nginx со старым nginx.conf (docker compose up -d --force-recreate nginx)');
       const acts = await page.$$eval('#offsite-block [data-action^="offsite-"]', els => els.map(e => e.dataset.action));
       (acts.includes('offsite-media-new') && acts.includes('offsite-media-all') && (acts.includes('offsite-copy') || acts.includes('offsite-password')))
         ? ok(`в блоке есть кнопки: ${[...new Set(acts)].join(', ')}`)

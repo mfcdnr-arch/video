@@ -22,7 +22,10 @@ from deps import pwd_context
 N = datetime(2026, 11, 4, 9, 30)
 SERVER = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MIGRATION = os.path.join(SERVER, "migrations", "035_offsite_copy.sql")
-COMPOSE = os.path.join(os.path.dirname(SERVER), "docker-compose.yml")
+# docker-compose.yml — рядом с server/ (запуск на хосте) или в /srv/project: туда корень проекта
+# смонтирован в ds_api, и run_tests.sh видит его оттуда. Нигде нет — тест пропускается.
+COMPOSE = next((p for p in (os.path.join(os.path.dirname(SERVER), "docker-compose.yml"),
+                            "/srv/project/docker-compose.yml") if os.path.exists(p)), None)
 
 # Колонки состояния без id — ровно ключи load_state (и колонки миграции 035).
 STATE_KEYS = {
@@ -143,8 +146,8 @@ def test_load_state_keys_match_migration_columns():
     assert set(store.load_state(OffsiteDB(state=state_row()))) == cols
 
 
-@pytest.mark.skipif(not os.path.exists(COMPOSE),
-                    reason="в контейнере ds_api / тестовом образе docker-compose.yml не виден")
+@pytest.mark.skipif(COMPOSE is None,
+                    reason="docker-compose.yml не виден (нет ни рядом с server/, ни в /srv/project)")
 def test_migration_listed_in_compose_initdb_once_after_034():
     with open(COMPOSE, encoding="utf-8") as f:
         text = f.read()

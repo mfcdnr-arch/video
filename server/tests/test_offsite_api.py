@@ -12,6 +12,7 @@ World — «база» с состоянием (одна строка offsite_co
 на копию можно только зная текущий (кроме случая «ключ сервера сменился»).
 """
 import asyncio
+import errno
 import gc
 import io
 import json
@@ -366,7 +367,7 @@ def test_status_shape_and_warn(client, world, env):
     r = client.get("/offsite/status", headers=bearer())
     assert r.status_code == 200
     j = r.json()
-    assert set(j) == {"password", "copy", "media", "state", "project_mounted"}
+    assert set(j) == {"password", "copy", "media", "state", "project_mounted", "proxy_ok"}
     assert j["password"] == {"set": False, "set_at": None, "set_by": None, "needs_reset": False}
     assert j["copy"] == {"last_at": None, "last_by": None, "last_file": None,
                          "last_bytes": None, "today": False}
@@ -374,6 +375,19 @@ def test_status_shape_and_warn(client, world, env):
                           "last_at": None, "last_by": None}
     assert j["state"] == "warn"                     # копии ещё не было
     assert j["project_mounted"] is True
+    assert j["proxy_ok"] is False                   # напрямую, не через nginx
+
+
+@pytest.mark.parametrize("headers,expected", [
+    ({"X-DS-Offsite": "1"}, True),                  # пришёл через location /api/offsite/ (nginx.conf)
+    ({}, False),                                    # nginx со старым конфигом (или запрос мимо nginx)
+    ({"X-DS-Offsite": "0"}, False),
+    ({"X-DS-Offsite": "yes"}, False),
+    ({"X-DS-Accel": "1"}, False),                   # метка общей локации /api/ — не наша
+])
+def test_status_proxy_ok_follows_nginx_header(client, headers, expected):
+    r = client.get("/offsite/status", headers={**bearer(), **headers})
+    assert r.status_code == 200 and r.json()["proxy_ok"] is expected
 
 
 def test_status_reports_everything_and_ok_after_todays_copy(client, world, env):
@@ -567,7 +581,7 @@ def test_copy_not_mounted_503(client, world, env):
     assert tmp_is_empty(env) and env.redis.data == {}
 
 
-def test_copy_build_failure_500_with_text(client, world, env, monkeypatch):
+def test_copy_build_failure_500_with_text(client, world, env, monkeypatch, caplog):
     with_copy_password(world)
 
     def boom(dst_path):
@@ -576,17 +590,80 @@ def test_copy_build_failure_500_with_text(client, world, env, monkeypatch):
     r = post_copy(client)
     assert r.status_code == 500 and r.json()["detail"] == "Ошибка pg_dump: connection refused"
     assert tmp_is_empty(env) and env.redis.data == {}
+    # сбой сборки виден в логе api тем же текстом (раньше ошибка уходила только в ответ)
+    errors = [rec for rec in caplog.records if rec.levelname == "ERROR"]
+    assert [rec.getMessage() for rec in errors] == \
+        ["Копия на флешку: сборка не удалась: Ошибка pg_dump: connection refused"]
 
 
-def test_copy_disk_error_is_500_too(client, world, env, monkeypatch):
+def test_copy_disk_error_is_500_in_russian_and_logged(client, world, env, monkeypatch, caplog):
+    """Нет места на диске: панель показывает текст без единой русской буквы как «Сервер ответил ошибкой»,
+    поэтому сервер сам пишет по-русски — причина (strerror) и файл — и то же самое в лог."""
+    with_copy_password(world)
+    where = str(env.out / "build" / "copy.tar.gz.enc")
+
+    def boom(*a, **kw):
+        raise OSError(errno.ENOSPC, "No space left on device", where)
+    monkeypatch.setattr(store, "encrypt_file_openssl", boom)
+    r = post_copy(client)
+    text = f"Не удалось собрать копию: No space left on device ({where})"
+    assert r.status_code == 500 and r.json()["detail"] == text
+    assert COPY_PW not in r.text and tmp_is_empty(env)
+    assert f"Копия на флешку: {text}" in [rec.getMessage() for rec in caplog.records if rec.levelname == "ERROR"]
+    assert not offsite._build_lock.locked()
+
+
+@pytest.mark.parametrize("exc,detail", [
+    # одно сообщение без errno: strerror нет — только имя класса, сам текст (а в нём пароль) не берём
+    (OSError(f"disk error near {COPY_PW}"), "Не удалось собрать копию: OSError"),
+    (PermissionError(f"denied {COPY_PW}"), "Не удалось собрать копию: PermissionError"),
+    (OSError(errno.EIO, "Input/output error", "/data/media/x.pdf"),
+     "Не удалось собрать копию: Input/output error (/data/media/x.pdf)"),
+    (FileNotFoundError(errno.ENOENT, "No such file or directory"),
+     "Не удалось собрать копию: No such file or directory"),
+])
+def test_copy_os_error_text_never_uses_args(client, world, env, monkeypatch, caplog, exc, detail):
+    """Из OSError в ответ и лог идут только strerror и имя файла. str(e) / e.args, где могло оказаться
+    что угодно, — нет."""
     with_copy_password(world)
 
     def boom(*a, **kw):
-        raise OSError("No space left on device")
+        raise exc
     monkeypatch.setattr(store, "encrypt_file_openssl", boom)
     r = post_copy(client)
-    assert r.status_code == 500 and "No space left on device" in r.json()["detail"]
-    assert COPY_PW not in r.text and tmp_is_empty(env)
+    assert r.status_code == 500 and r.json()["detail"] == detail
+    assert COPY_PW not in r.text and COPY_PW not in caplog.text
+    assert tmp_is_empty(env)
+
+
+@pytest.mark.parametrize("exc", [ValueError("I/O operation on closed file"), RuntimeError("boom")])
+def test_copy_foreign_english_error_is_named_in_russian(client, world, env, monkeypatch, caplog, exc):
+    """Не наш (английский) текст панель заменила бы на «Сервер ответил ошибкой»: сервер называет сбой
+    по-русски, а сам текст — в логе."""
+    with_copy_password(world)
+
+    def boom(*a, **kw):
+        raise exc
+    monkeypatch.setattr(store, "encrypt_file_openssl", boom)
+    r = post_copy(client)
+    assert r.status_code == 500
+    assert r.json()["detail"] == f"Не удалось собрать копию: {type(exc).__name__} (подробности — в логе api)"
+    assert f"Копия на флешку: сборка не удалась: {exc}" in caplog.text
+    assert tmp_is_empty(env)
+
+
+def test_copy_commits_request_transaction_before_the_build(client, world, env, monkeypatch):
+    """Сессия запроса не держит транзакцию все минуты дампа: к началу сборки она уже закоммичена."""
+    with_copy_password(world)
+    seen = {}
+    real = store.build_copy
+
+    def spy(db, **kw):
+        seen["commits"], seen["pending"] = db.commits, list(db.pending)
+        return real(db, **kw)
+    monkeypatch.setattr(store, "build_copy", spy)
+    assert post_copy(client).status_code == 200
+    assert seen == {"commits": 1, "pending": []}
 
 
 def test_copy_cleans_stale_dirs_before_build(client, world, env):
@@ -628,7 +705,8 @@ def test_copy_link_downloads_once_and_marks_done(client, world, env):
     assert (st["last_copy_at"], st["last_copy_by"], st["last_copy_file"], st["last_copy_bytes"]) == \
         (NOW, "boss", j["filename"], j["bytes"])
     assert [a[:2] for a in world.audit] == [("backup", "Копия на флешку скачана")]
-    assert re.fullmatch(re.escape(j["filename"]) + r", \d+\.\d МБ", world.audit[0][2])
+    assert world.audit[0][2] == f'{j["filename"]}, {offsite._size_text(j["bytes"])}'
+    assert re.fullmatch(re.escape(j["filename"]) + r", (\d+ КБ|\d+,\d [МГ]Б)", world.audit[0][2])
     assert world.audit[0][3] == "boss"
     assert client.get("/offsite/status", headers=bearer()).json()["copy"]["today"] is True
     assert tmp_is_empty(env)                                        # папка копии стёрта
@@ -809,6 +887,69 @@ def test_copy_client_disconnect_through_asgi(client, world, env, monkeypatch):
     assert tmp_is_empty(env)
 
 
+def _app_with_passthrough_middleware(client):
+    """То же приложение, но с `@app.middleware("http")`, как в main.py (advertiser_guard). Такая
+    прослойка (BaseHTTPMiddleware) гонит тело ответа через свой поток: если какая-нибудь версия Starlette
+    начнёт вычитывать поток вперёд клиента, «скачано» отметилось бы до обрыва — этот тест это поймает."""
+    app = FastAPI()
+    app.include_router(offsite.router)
+    app.dependency_overrides.update(client.app.dependency_overrides)
+
+    @app.middleware("http")
+    async def passthrough(request, call_next):
+        return await call_next(request)
+    return app
+
+
+@pytest.mark.parametrize("kind", ["copy", "media"])
+def test_client_disconnect_through_http_middleware_does_not_mark(client, world, env, monkeypatch, kind):
+    monkeypatch.setattr(offsite, "CHUNK", 512)
+    if kind == "copy":
+        with_copy_password(world)
+        j = post_copy(client).json()
+        total = j["bytes"]
+    else:
+        for i in (1, 2, 3):
+            add_media(world, env, i, 20_000)
+        j = post_media(client, "new").json()
+        total = 60_000
+    app = _app_with_passthrough_middleware(client)
+    sent = _asgi_get_then_disconnect(app, "/offsite/download", "t=" + token_of(j["url"]), 2)
+    gc.collect()
+    bodies = [m for m in sent if m["type"] == "http.response.body"]
+    assert sent[0]["status"] == 200
+    assert 0 < sum(len(m["body"]) for m in bodies) < total          # поток оборван на середине
+    assert world.audit == []                                        # ни «копия скачана», ни «ролики скачаны»
+    st = world.mine()
+    assert st["last_copy_at"] is None and st["last_media_at"] is None and st["media_watermark"] == 0
+    assert tmp_is_empty(env)
+
+
+def test_full_download_through_http_middleware_marks(client, world, env, monkeypatch):
+    """И обратное: через ту же прослойку полностью отданный файл отмечается (тест выше не пуст по построению)."""
+    monkeypatch.setattr(offsite, "CHUNK", 512)
+    with_copy_password(world)
+    j = post_copy(client).json()
+    g = TestClient(_app_with_passthrough_middleware(client)).get("/offsite/download",
+                                                                params={"t": token_of(j["url"])})
+    assert g.status_code == 200 and len(g.content) == j["bytes"]
+    assert world.state["last_copy_at"] == NOW and world.titles() == ["Копия на флешку скачана"]
+
+
+# --- размер словами: как в панели -------------------------------------------------------------
+
+@pytest.mark.parametrize("size,text", [
+    (0, "0 КБ"), (None, "0 КБ"), (1, "1 КБ"), (511, "1 КБ"), (1536, "2 КБ"),     # не «0,0 МБ»
+    (6000, "6 КБ"), (104857, "102 КБ"),                                           # до 0,1 МБ — КБ
+    (104858, "0,1 МБ"), (1048576, "1,0 МБ"), (640 * 1048576, "640,0 МБ"),
+    (int(1023.94 * 1048576), "1023,9 МБ"), (int(1023.96 * 1048576), "1,0 ГБ"),   # 1024,0 МБ — уже ГБ
+    (int(18.6 * 1073741824), "18,6 ГБ"),
+    (int(1.25 * 1048576), "1,3 МБ"),                                              # половина — вверх, как Math.round
+])
+def test_size_text_matches_panel_format(size, text):
+    assert offsite._size_text(size) == text
+
+
 # --- ролики -----------------------------------------------------------------------------------
 
 def test_media_new_flow_moves_watermark(client, world, env):
@@ -847,7 +988,7 @@ def test_media_new_flow_moves_watermark(client, world, env):
     assert (st["last_media_at"], st["last_media_by"], st["last_media_scope"],
             st["last_media_count"], st["last_media_bytes"]) == (NOW, "boss", "new", 3, 6000)
     assert [a[:2] for a in world.audit] == [("backup", "Ролики скачаны на флешку")]
-    assert re.fullmatch(r"новые, 3 шт, \d+\.\d МБ, id 1–3", world.audit[0][2])
+    assert world.audit[0][2] == "новые, 3 шт, 6 КБ, id 1–3"                # 6000 байт — как в панели
     j = client.get("/offsite/status", headers=bearer()).json()
     assert j["media"]["new_count"] == 0 and j["media"]["last_by"] == "boss"
     assert j["media"]["last_at"] == "2026-11-04T09:30:15"
@@ -882,7 +1023,7 @@ def test_media_all_flow(client, world, env):
                                               "media/clip2.mp4", "media/clip3.mp4"]
     assert world.state["media_watermark"] == 3                      # назад не откатывается
     assert world.state["last_media_scope"] == "all"
-    assert re.fullmatch(r"все, 3 шт, \d+\.\d МБ, id 1–3", world.audit[0][2])
+    assert world.audit[0][2] == "все, 3 шт, 1 КБ, id 1–3"
 
 
 def test_media_interrupted_keeps_watermark(client, world, env, monkeypatch):
@@ -912,7 +1053,7 @@ def test_media_uploaded_during_download_stays_new(client, world, env):
     assert world.state["media_watermark"] == 3                      # не 4: ролика 4 на флешке нет
     j = client.get("/offsite/status", headers=bearer()).json()
     assert j["media"]["new_count"] == 1
-    assert re.fullmatch(r"новые, 3 шт, \d+\.\d МБ, id 1–3", world.audit[0][2])
+    assert world.audit[0][2] == "новые, 3 шт, 1 КБ, id 1–3"
 
 
 def test_media_missing_file_skipped(client, world, env):
@@ -937,7 +1078,7 @@ def test_media_missing_file_skipped(client, world, env):
     assert world.state["last_media_count"] == 2
     assert world.state["last_media_bytes"] == 400
     # потерянное видно и в журнале, не только в манифесте
-    assert re.fullmatch(r"новые, 2 шт, \d+\.\d МБ, id 1–3, нет файла: 1", world.audit[0][2])
+    assert world.audit[0][2] == "новые, 2 шт, 1 КБ, id 1–3, нет файла: 1"
 
 
 def test_media_non_regular_file_counts_as_missing(client, world, env):
@@ -1270,7 +1411,7 @@ def test_media_partial_loss_is_counted_in_post_and_audit(client, world, env):
     assert (m["count"], m["missing"]) == (3, 2)
     g = get_download(client, m["url"])
     assert g.status_code == 200
-    assert re.fullmatch(r"новые, 1 шт, \d+\.\d МБ, id 1–3, нет файла: 2", world.audit[0][2])
+    assert world.audit[0][2] == "новые, 1 шт, 1 КБ, id 1–3, нет файла: 2"
     assert world.state["media_watermark"] == 3 and world.state["last_media_count"] == 1
 
 
@@ -1308,7 +1449,10 @@ def test_reset_script_reports_db_error(monkeypatch, capsys):
 # --- проводка ---------------------------------------------------------------------------------
 
 SERVER = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NGINX = os.path.join(os.path.dirname(SERVER), "nginx.conf")
+# nginx.conf — рядом с server/ (запуск на хосте) или в /srv/project: туда корень проекта смонтирован
+# в ds_api, и run_tests.sh видит его оттуда. Нигде нет — тест пропускается.
+NGINX = next((p for p in (os.path.join(os.path.dirname(SERVER), "nginx.conf"), "/srv/project/nginx.conf")
+              if os.path.exists(p)), None)
 
 
 def test_router_is_wired_in_main():
@@ -1326,8 +1470,8 @@ def test_routes_are_registered():
                      ("POST", "/offsite/media"), ("GET", "/offsite/download")}
 
 
-@pytest.mark.skipif(not os.path.exists(NGINX),
-                    reason="nginx.conf не смонтирован в контейнер тестов — проверяется на хосте")
+@pytest.mark.skipif(NGINX is None,
+                    reason="nginx.conf не виден (нет ни рядом с server/, ни в /srv/project) — проверяется на хосте")
 def test_nginx_offsite_location_before_api_and_unbuffered():
     with open(NGINX, encoding="utf-8") as f:
         text = f.read()
@@ -1337,7 +1481,14 @@ def test_nginx_offsite_location_before_api_and_unbuffered():
     block = text[i_off:text.index("\n        }\n", i_off)]
     for needle in ("rewrite ^/api/(.*)$ /$1 break;", "proxy_pass $ds_api;", "proxy_buffering off;",
                    "proxy_read_timeout 3600s;", "send_timeout 300s;", "proxy_http_version 1.1;", "proxy_set_header Host $host;",
-                   "proxy_set_header X-Real-IP $remote_addr;"):
+                   "proxy_set_header X-Real-IP $remote_addr;",
+                   # метка «пришло через эту локацию» — по ней статус отвечает proxy_ok
+                   "proxy_set_header X-DS-Offsite 1;"):
         assert needle in block, needle
     assert "proxy_read_timeout 300s" not in block       # сборка копии дольше 5 минут не должна давать 504
     assert "X-DS-Accel" not in block        # этот роутер X-Accel-Redirect не отдаёт
+    # метку ставит только эта локация (в коде конфига, не считая комментариев, она одна): иначе proxy_ok
+    # был бы «да» и для запроса, прошедшего через общую /api/
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    assert code.count("proxy_set_header X-DS-Offsite") == 1
+    assert offsite.PROXY_HEADER == "x-ds-offsite"

@@ -18,7 +18,8 @@
 #                  SMOKE_ALLOW_OFFSITE=1 — полный цикл «Копии на флешку»: СБРАСЫВАЕТ пароль на
 #                  копию и задаёт тестовый (SMOKE-copy-pass-1), собирает и скачивает копию и
 #                  ролики (двигает отметку «последняя копия» и «водяной знак» роликов),
-#                  проверяет tar с тремя файлами и расшифровку, пишет в журнал; в конце снова
+#                  проверяет tar с тремя файлами и расшифровку, заливает дамп из копии во
+#                  временную базу (и удаляет её), пишет в журнал; в конце снова
 #                  сбрасывает пароль на копию — поэтому только на стенде: шаг сам отказывает
 #                  (проверка проваливается), если контейнер ds_api не из compose-проекта dsdev
 #
@@ -1088,15 +1089,17 @@ fi
 # браузер качает её без заголовка Authorization, поэтому «входом» служит сам токен.
 # Без флага (ничего не меняет, безопасно и на боевом сервере): статус и выдача ссылок без входа и по
 # токену экрана — 401; по входу статус — 200 со всеми ключами, без пароля, «ok/warn» согласован с
-# «копия сегодня и новых роликов нет»; ссылка скачивания с чужим или пустым кодом — 404; неверный
-# объём роликов — 400.
+# «копия сегодня и новых роликов нет»; proxy_ok напрямую в API — false, через nginx — true (иначе nginx
+# со старым nginx.conf); ссылка скачивания с чужим или пустым кодом — 404; неверный объём роликов — 400.
 # С SMOKE_ALLOW_OFFSITE=1 (только стенд dsdev: меняет пароль на копию и отметки «скачано»; до первого
 # изменения проверяется метка compose-проекта контейнера ds_api, не dsdev — отказ и провал проверки):
 # пароль на копию сбрасывается на сервере и задаётся заново (неверный пароль входа → 403, не совпали → 400, слабый → 400,
 # смена без текущего → 403); копия без пароля → 409, с неверным паролем входа → 403; копия собирается,
 # ссылка отдаёт НЕсжатый tar ровно из трёх файлов (инструкция с командой расшифровки как на сервере,
 # запертая часть, sha256), сумма сходится, запертая часть открывается openssl паролем на копию и не открывается чужим, внутри база, программа с .env и
-# опись; второй заход по ссылке → 404; «скачано» попало в статус и в журнал (пароля в журнале нет);
+# опись; дамп из копии заливается во временную базу smoke_restore_<время> на ds_postgres (gunzip | psql
+# -v ON_ERROR_STOP=1, как в ВОССТАНОВЛЕНИЕ.txt), users в ней = users из MANIFEST.txt, затем база удаляется
+# (и при обрыве); второй заход по ссылке → 404; «скачано» попало в статус и в журнал (пароля в журнале нет);
 # ролики «новые» — tar с манифестом и файлом тестового ролика («нет файла» в манифесте = missing из ответа),
 # после скачивания «новых» нет (409), «все» — тоже скачиваются; напоминание в итоге «ok». В конце пароль на копию снова сбрасывается (и при обрыве
 # скрипта): стенд остаётся без пароля. Отметка «последняя копия» и «водяной знак» роликов остаются.
@@ -1113,10 +1116,21 @@ for OP in password copy media; do
   [ "$C" = "401" ] && ok "POST /offsite/$OP без входа — 401" || bad "POST /offsite/$OP без входа: HTTP $C"
 done
 req GET "/offsite/status"
-if [ "$HTTP" = "200" ] && body_has "set(r)=={'password','copy','media','state','project_mounted'} and set(r['password'])=={'set','set_at','set_by','needs_reset'} and set(r['copy'])=={'last_at','last_by','last_file','last_bytes','today'} and set(r['media'])=={'new_count','new_bytes','all_count','all_bytes','last_at','last_by'} and isinstance(r['password']['set'],bool) and isinstance(r['project_mounted'],bool)"; then
+if [ "$HTTP" = "200" ] && body_has "set(r)=={'password','copy','media','state','project_mounted','proxy_ok'} and set(r['password'])=={'set','set_at','set_by','needs_reset'} and set(r['copy'])=={'last_at','last_by','last_file','last_bytes','today'} and set(r['media'])=={'new_count','new_bytes','all_count','all_bytes','last_at','last_by'} and isinstance(r['password']['set'],bool) and isinstance(r['project_mounted'],bool)"; then
   ok "статус копии по входу: все ключи на месте, пароля в ответе нет"; else bad "статус копии: HTTP $HTTP, ключи не те"; fi
 if body_has "r['state'] in ('ok','warn') and (r['state']=='ok')==(r['copy']['today'] and r['media']['new_count']==0)"; then
   ok "напоминание «ok/warn» согласовано: ok только когда копия сегодня и новых роликов нет"; else bad "напоминание не сходится с «копия сегодня» и «новые ролики»"; fi
+# proxy_ok: метку X-DS-Offsite ставит только location /api/offsite/ в nginx.conf. Напрямую в API (как ходит
+# этот скрипт) — false; через nginx — true, иначе nginx живёт со старой копией конфига: ответы буферизуются
+# («скачано» раньше, чем файл дошёл) и долгая сборка копии упирается в 504
+body_has "r['proxy_ok'] is False" && ok "статус копии напрямую в API (мимо nginx) — proxy_ok=false" || bad "статус напрямую в API: proxy_ok не false"
+NB=$($DC curl -s "$NGX/api/offsite/status" -H "Authorization: Bearer $TOKEN" 2>/dev/null)
+if echo "$NB" | python3 -c "import sys,json; sys.exit(0 if json.load(sys.stdin).get('proxy_ok') is True else 1)" 2>/dev/null; then
+  ok "статус копии через nginx — proxy_ok=true (локация /api/offsite/ на месте)"
+else
+  bad "через nginx proxy_ok не true — nginx со старым nginx.conf"
+  echo "    └─ docker compose up -d --force-recreate nginx"
+fi
 C=$(code_as "/offsite/download?t=xxx"); [ "$C" = "404" ] && ok "ссылка с чужим кодом — 404 (входа не требует)" || bad "ссылка с чужим кодом: HTTP $C"
 C=$(code_as "/offsite/download"); [ "$C" = "404" ] && ok "ссылка без кода — 404" || bad "ссылка без кода: HTTP $C"
 req POST "/offsite/media" -H "$JSON_O" -d '{"scope":"zzz"}'
@@ -1124,8 +1138,8 @@ req POST "/offsite/media" -H "$JSON_O" -d '{"scope":"zzz"}'
 
 # Скрипты проверки архивов — внутри ds_api (там есть python3, tarfile и openssl)
 OFF_PY_COPY='
-import sys, tarfile, hashlib, subprocess, tempfile, os, shutil
-path, pw, instr, enc_name, sha_name, decrypt_cmd = sys.argv[1:7]
+import sys, tarfile, hashlib, subprocess, tempfile, os, shutil, re
+path, pw, instr, enc_name, sha_name, decrypt_cmd, dump_out = sys.argv[1:8]
 try:
     t = tarfile.open(path, "r:")      # только несжатый tar: сжатый gzip-ом здесь не открывается
 except Exception as e:
@@ -1157,11 +1171,18 @@ try:
         print("копия открылась чужим паролем"); sys.exit(0)
     good = os.path.join(d, "inner.tar.gz")
     if dec(pw, good) != 0: print("копия не открылась паролем на копию"); sys.exit(0)
-    names = tarfile.open(good, "r:gz").getnames()
+    inner = tarfile.open(good, "r:gz")
+    names = inner.getnames()
     if "MANIFEST.txt" not in names: print("внутри нет MANIFEST.txt"); sys.exit(0)
-    if not any(n.startswith("db/backup_") and n.endswith(".sql.gz") for n in names): print("внутри нет дампа базы"); sys.exit(0)
+    dumps = [n for n in names if n.startswith("db/backup_") and n.endswith(".sql.gz")]
+    if len(dumps) != 1: print("внутри не один дамп базы: " + ascii(dumps)); sys.exit(0)
     if "program/.env" not in names: print("внутри нет program/.env"); sys.exit(0)
-    print("OK %d" % len(names))
+    # дамп — наружу (его зальют во временную базу), контрольное число users — из описи
+    with inner.extractfile(dumps[0]) as src, open(dump_out, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+    m = re.search(r"^\s*users:\s*(\d+)\b", inner.extractfile("MANIFEST.txt").read().decode("utf-8"), re.M)
+    if not m: print("в MANIFEST.txt нет контрольного числа users"); sys.exit(0)
+    print("OK %d %s" % (len(names), m.group(1)))
 finally:
     shutil.rmtree(d, ignore_errors=True)
 '
@@ -1197,7 +1218,20 @@ else
   [[ "$OFF_DECRYPT" == *"-aes-256-cbc -pbkdf2 -md sha256 -iter 200000"* ]] && ok "команда расшифровки взята с сервера: $OFF_DECRYPT" \
     || bad "команду расшифровки с сервера прочитать не удалось или она другая: «$OFF_DECRYPT»"
   OFF_DIR="/tmp/smoke_offsite_$STAMP"; OFF_DIRTY=1
+  # Временная база для заливки дампа из копии (как шаг 4 ВОССТАНОВЛЕНИЕ.txt, но не в рабочую базу стенда).
+  # Пользователь и база — из окружения контейнера ds_postgres; psql внутри контейнера ходит без пароля.
+  OFF_SCRATCH="smoke_restore_$STAMP"; OFF_SCRATCH_MADE=0
+  OFF_PGU=$(docker exec ds_postgres printenv POSTGRES_USER 2>/dev/null); OFF_PGD=$(docker exec ds_postgres printenv POSTGRES_DB 2>/dev/null)
+  off_pg(){ docker exec ds_postgres psql -v ON_ERROR_STOP=1 -U "$OFF_PGU" -d "$OFF_PGD" -q "$@"; }
+  off_drop_scratch(){ # временную базу — удалить (и при обрыве скрипта)
+    if [ "$OFF_SCRATCH_MADE" = "1" ]; then
+      OFF_SCRATCH_MADE=0
+      off_pg -c "DROP DATABASE IF EXISTS $OFF_SCRATCH WITH (FORCE)" >/dev/null 2>&1 \
+        && ok "временная база $OFF_SCRATCH удалена" || bad "временная база $OFF_SCRATCH не удалилась (DROP DATABASE … WITH (FORCE) вручную)"
+    fi
+  }
   off_finish(){ # пароль на копию — снова сбросить (и при обрыве скрипта), убрать скачанные тестовые файлы
+    off_drop_scratch
     if [ "$OFF_DIRTY" = "1" ]; then
       OFF_DIRTY=0
       if $DC python /app/reset_offsite_password.py >/dev/null 2>&1; then
@@ -1272,9 +1306,28 @@ else
        && [[ "$(off_hdr content-disposition)" == *"filename=\"$OFF_FILE\""* ]] && [[ "$(off_hdr content-type)" == application/x-tar* ]]; then
       ok "скачивание по ссылке без входа: 200, $OFF_SIZE байт = Content-Length, имя $OFF_FILE, application/x-tar"
     else bad "скачивание копии: HTTP $OFF_CODE, на диске ${OFF_SIZE:-?} из $OFF_BYTES, Content-Length «$(off_hdr content-length)»"; fi
-    R=$($DC python3 -I -c "$OFF_PY_COPY" "$OFF_DIR/copy.tar" "$OFF_PW1" "ВОССТАНОВЛЕНИЕ.txt" "copy.tar.gz.enc" "copy.tar.gz.enc.sha256" "$OFF_DECRYPT" 2>&1)
-    if [[ "$R" == OK* ]]; then ok "копия: несжатый tar из трёх файлов, sha256 сходится, в инструкции команда расшифровки как на сервере, openssl открывает паролем на копию, чужим — нет, внутри база, программа с .env и опись (${R#OK } файлов)"
+    R=$($DC python3 -I -c "$OFF_PY_COPY" "$OFF_DIR/copy.tar" "$OFF_PW1" "ВОССТАНОВЛЕНИЕ.txt" "copy.tar.gz.enc" "copy.tar.gz.enc.sha256" "$OFF_DECRYPT" "$OFF_DIR/restore.sql.gz" 2>&1)
+    OFF_MUSERS=""
+    if [[ "$R" == OK* ]]; then
+      read -r _ OFF_NFILES OFF_MUSERS <<< "$R"
+      ok "копия: несжатый tar из трёх файлов, sha256 сходится, в инструкции команда расшифровки как на сервере, openssl открывает паролем на копию, чужим — нет, внутри база, программа с .env и опись ($OFF_NFILES файлов)"
     else bad "проверка содержимого копии: $R"; fi
+    # Дамп из копии реально заливается в PostgreSQL 15 стенда тем же способом, что в ВОССТАНОВЛЕНИЕ.txt
+    # (gunzip | psql -v ON_ERROR_STOP=1), — во временную базу. Так ловится расхождение версий pg_dump в
+    # образе api и PostgreSQL (как было со строкой transaction_timeout) до того, как копия понадобится.
+    if [ -n "$OFF_MUSERS" ]; then
+      if [ -n "$OFF_PGU" ] && [ -n "$OFF_PGD" ] && off_pg -c "CREATE DATABASE $OFF_SCRATCH OWNER $OFF_PGU" >/dev/null 2>&1; then
+        OFF_SCRATCH_MADE=1
+        OFF_ERR=$( { $DC cat "$OFF_DIR/restore.sql.gz" | gunzip -c | docker exec -i ds_postgres psql -v ON_ERROR_STOP=1 -U "$OFF_PGU" -d "$OFF_SCRATCH" -q >/dev/null; } 2>&1 ); OFF_RC=$?
+        if [ "$OFF_RC" -eq 0 ]; then
+          ok "дамп из копии залился в PostgreSQL стенда (gunzip | psql -v ON_ERROR_STOP=1, временная база $OFF_SCRATCH)"
+          OFF_U=$(docker exec ds_postgres psql -U "$OFF_PGU" -d "$OFF_SCRATCH" -tAc "SELECT count(*) FROM users" 2>/dev/null)
+          [ "$OFF_U" = "$OFF_MUSERS" ] && ok "контрольное число сошлось: users во временной базе = $OFF_U, как в MANIFEST.txt" \
+            || bad "контрольное число users: во временной базе «$OFF_U», в MANIFEST.txt $OFF_MUSERS"
+        else bad "дамп из копии не залился в PostgreSQL (код $OFF_RC): $(echo "$OFF_ERR" | head -c 300)"; fi
+      else bad "временная база $OFF_SCRATCH не создалась (POSTGRES_USER/POSTGRES_DB из ds_postgres: «$OFF_PGU»/«$OFF_PGD»)"; fi
+      off_drop_scratch
+    fi
     off_get "$OFF_URL" "$OFF_DIR/copy2.tar"
     [ "$OFF_CODE" = "404" ] && ok "вторая попытка по той же ссылке — 404 (ссылка одноразовая)" || bad "вторая попытка по ссылке: HTTP $OFF_CODE (ждали 404)"
     # «скачано» отмечается после последнего байта: ждём отметку в статусе

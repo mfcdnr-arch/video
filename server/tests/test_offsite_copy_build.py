@@ -42,12 +42,18 @@ OUTER_NAMES = [INSTRUCTION, "copy.tar.gz.enc", "copy.tar.gz.enc.sha256"]
 
 
 class BuildDB:
-    """Сессия-мок: контрольные числа одним запросом и строки «Документов» медиатеки."""
+    """Сессия-мок: контрольные числа одним запросом и строки «Документов» медиатеки.
+    commit() пишется в calls как «COMMIT»: видно, где сборка закрыла транзакцию."""
 
     def __init__(self, docs=(), counts=None):
         self.docs = list(docs)
         self.counts = counts or COUNTS
         self.calls = []
+        self.commits = 0
+
+    def commit(self):
+        self.commits += 1
+        self.calls.append("COMMIT")
 
     def execute(self, query, params=None):
         q = " ".join(str(query).split())
@@ -85,6 +91,9 @@ def _write(path, data=b"x", mode=None):
 def _fake_pg_dump(dst_path):
     with gzip.open(dst_path, "wb") as f:
         f.write(b"-- dump")
+
+
+REAL_PG_DUMP_GZ = store._pg_dump_gz     # настоящий: фикстура env подменяет его поддельным
 
 
 @pytest.fixture
@@ -145,8 +154,8 @@ def default_docs():
     ]
 
 
-def build(env, docs=None, who="admin", host=HOST, password=PASSWORD, now=NOW):
-    db = BuildDB(default_docs() if docs is None else docs)
+def build(env, docs=None, who="admin", host=HOST, password=PASSWORD, now=NOW, db=None):
+    db = db or BuildDB(default_docs() if docs is None else docs)
     return store.build_copy(db, who=who, host=host, password=password, now=now)
 
 
@@ -234,7 +243,7 @@ def test_instruction_covers_restore_steps(env, monkeypatch):
         "sha256sum -c copy.tar.gz.enc.sha256",
         "bash install_server.sh",
         "docker compose stop api celery",
-        'DROP DATABASE db_y', 'CREATE DATABASE db_y OWNER usr_x',   # значения из окружения
+        'DROP DATABASE IF EXISTS db_y', 'CREATE DATABASE db_y OWNER usr_x',   # значения из окружения
         "docker exec ds_postgres psql -v ON_ERROR_STOP=1 -U usr_x -d postgres",
         "docker exec -i ds_postgres psql -v ON_ERROR_STOP=1 -U usr_x -d db_y -q",
         "docker compose start api celery",
@@ -267,8 +276,10 @@ def test_instruction_db_step_is_safe_to_paste_and_fails_loudly(env, monkeypatch)
     monkeypatch.setenv("POSTGRES_DB", "db_y")
     text = outer_members(build(env))[INSTRUCTION].decode("utf-8")
     step = _step(text, 4)
-    # DROP не спотыкается о забытые подключения (PostgreSQL 15)
-    assert 'DROP DATABASE db_y WITH (FORCE)' in step
+    # DROP не спотыкается о забытые подключения (PostgreSQL 15) и о то, что базы уже нет: прошлый
+    # заход оборвался между DROP и CREATE — блок всё равно повторяется целиком
+    assert 'DROP DATABASE IF EXISTS db_y WITH (FORCE)' in step
+    assert step.count("DROP DATABASE") == 1
     # оба psql (пересоздание и заливка дампа) останавливаются на первой же ошибке
     psql_lines = [ln for ln in step.splitlines() if "psql" in ln]
     assert len(psql_lines) == 2
@@ -518,13 +529,81 @@ def test_file_vanishing_midway_cleans_up(env, monkeypatch):
     assert _tmp_is_empty(env)
 
 
-def test_password_never_in_exception_text(env, monkeypatch):
+def test_passwords_scrubbed_from_build_error_text(env, monkeypatch):
+    """Настоящий _pg_dump_gz с поддельной утилитой, которая падает и печатает в stderr и пароль БД, и
+    пароль на копию: в тексте исключения сборки (его роутер покажет в панели и запишет в лог) — ни того,
+    ни другого, а на диске ничего не осталось."""
+    db_pw = "db-s3cr3t-0123456789"
+    script = f"#!/bin/sh\necho 'pg_dump: error: auth failed for {db_pw} near {PASSWORD}' >&2\nexit 1\n"
+    bindir = _fake_bin(env.tmp, script)
+    monkeypatch.setenv("PATH", bindir + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(store, "DATABASE_URL", f"postgresql://u:{db_pw}@h:5432/d")
+    monkeypatch.setattr(store, "_pg_dump_gz", REAL_PG_DUMP_GZ)
+    with pytest.raises(RuntimeError) as ei:
+        build(env)
+    msg = str(ei.value)
+    assert msg.startswith("Ошибка pg_dump: pg_dump: error: auth failed for")
+    assert db_pw not in msg and PASSWORD not in msg
+    assert msg.count("***") == 2
+    assert ei.value.__cause__ is None and ei.value.__suppress_context__      # исходный текст не всплывёт
+    assert _tmp_is_empty(env)
+
+
+@pytest.mark.parametrize("exc", [ValueError, RuntimeError])
+def test_copy_password_in_any_error_text_is_replaced(env, monkeypatch, exc):
     def boom(*a, **kw):
-        raise RuntimeError("шифрование не удалось")
+        raise exc(f"шифрование не удалось: {PASSWORD}")
     monkeypatch.setattr(store, "encrypt_file_openssl", boom)
     with pytest.raises(RuntimeError) as ei:
         build(env)
-    assert PASSWORD not in str(ei.value)
+    assert str(ei.value) == "шифрование не удалось: ***"
+    assert _tmp_is_empty(env)
+
+
+def test_error_text_without_password_is_left_as_is(env, monkeypatch):
+    def boom(*a, **kw):
+        raise ValueError("соль не той длины")
+    monkeypatch.setattr(store, "encrypt_file_openssl", boom)
+    with pytest.raises(ValueError, match="^соль не той длины$"):
+        build(env)
+
+
+# --- .env должен лечь в копию ---------------------------------------------------------------
+
+@pytest.mark.parametrize("target", ["inside", "outside"])
+def test_symlinked_env_is_refused_not_skipped(env, target):
+    """_check_project смотрит сквозь симлинк, а в копию симлинки не идут: без проверки .env молча
+    пропал бы из копии, и на новой машине install_server.sh создал бы новые пароли."""
+    real = (env.project / "env.real") if target == "inside" else (env.tmp / "outside" / "env.real")
+    _write(real, ENV_BYTES)
+    (env.project / ".env").unlink()
+    os.symlink(real, env.project / ".env")
+    assert store.project_mounted() is True              # «подключён» — проверка проекта не спасла бы
+    with pytest.raises(RuntimeError) as ei:
+        build(env)
+    assert str(ei.value) == "В папке программы нет обычного файла .env — копия без паролей бесполезна"
+    assert str(ei.value) == store.MSG_NO_ENV
+    assert _tmp_is_empty(env)
+
+
+# --- транзакция БД не висит всю сборку ------------------------------------------------------
+
+def test_build_commits_right_after_reading_from_db(env, monkeypatch):
+    """Контрольные числа и «Документы» прочитаны — транзакция закрыта ещё до архивации и шифрования
+    (иначе сессия простояла бы «idle in transaction» все минуты сборки)."""
+    db = BuildDB(default_docs())
+    seen = {}
+    real_encrypt = store.encrypt_file_openssl
+
+    def spy(*a, **kw):
+        seen["commits_at_encrypt"] = db.commits
+        return real_encrypt(*a, **kw)
+    monkeypatch.setattr(store, "encrypt_file_openssl", spy)
+    build(env, db=db)
+    assert db.commits == 1 and seen == {"commits_at_encrypt": 1}
+    assert db.calls[-1] == "COMMIT"                     # после него к базе больше не обращались
+    assert any("count(*)" in c for c in db.calls[:-1])
+    assert any("status = 'document'" in c for c in db.calls[:-1])
 
 
 def test_empty_password_rejected_before_anything_is_written(env):
@@ -682,12 +761,21 @@ def test_project_mounted_flag(env):
 
 # --- монтирование проекта в compose ---------------------------------------------------------
 
-COMPOSE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-                       "docker-compose.yml")
+def project_file(name):
+    """Файл из корня проекта: рядом с server/ (запуск на хосте) или в /srv/project — туда корень
+    смонтирован в ds_api, и run_tests.sh видит его оттуда. Нигде нет — None (тест пропускается)."""
+    for root in (os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "/srv/project"):
+        path = os.path.join(root, name)
+        if os.path.exists(path):
+            return path
+    return None
 
 
-@pytest.mark.skipif(not os.path.exists(COMPOSE),
-                    reason="docker-compose.yml не смонтирован в контейнер тестов — проверяется на хосте")
+COMPOSE = project_file("docker-compose.yml")
+
+
+@pytest.mark.skipif(COMPOSE is None,
+                    reason="docker-compose.yml не виден (нет ни рядом с server/, ни в /srv/project) — проверяется на хосте")
 def test_compose_mounts_project_read_only_into_api_only():
     """Копия берёт программу и .env из /srv/project: монтирование есть у api и только на чтение."""
     with open(COMPOSE, encoding="utf-8") as f:
@@ -709,15 +797,45 @@ def _fake_bin(tmp_path, script):
     return str(bindir)
 
 
+# Поддельный pg_dump печатает в дамп свои аргументы и PGPASSWORD: видно, что ему передали
+_ARGS_AND_ENV = "#!/bin/sh\nfor a in \"$@\"; do echo \"-- arg $a\"; done\necho \"-- PGPASSWORD=$PGPASSWORD\"\n"
+
+
 def test_pg_dump_gz_ok(tmp_path, monkeypatch):
-    if not shutil.which("gzip"):
-        pytest.skip("нет gzip")
-    bindir = _fake_bin(tmp_path, "#!/bin/sh\necho '-- dump of' \"$1\"\n")
+    bindir = _fake_bin(tmp_path, _ARGS_AND_ENV)
     monkeypatch.setenv("PATH", bindir + os.pathsep + os.environ["PATH"])
+    monkeypatch.delenv("PGPASSWORD", raising=False)
     monkeypatch.setattr(store, "DATABASE_URL", "postgresql://u:pw@h:5432/d")
     dst = tmp_path / "out.sql.gz"
     store._pg_dump_gz(str(dst))
-    assert gzip.decompress(dst.read_bytes()) == b"-- dump of postgresql://u:pw@h:5432/d\n"
+    assert gzip.decompress(dst.read_bytes()).decode().splitlines() == [
+        "-- arg --lock-wait-timeout=60s",               # не ждать чужую блокировку бесконечно
+        "-- arg postgresql://u@h:5432/d",               # адрес без пароля
+        "-- PGPASSWORD=pw",                             # пароль — через окружение
+    ]
+
+
+def test_pg_dump_gz_password_not_in_command_line(tmp_path, monkeypatch):
+    """Командную строку процесса видит `ps` / `docker top` у любого, кто смотрит процессы: пароля БД в
+    ней быть не должно. Пароль с %-кодированием в адресе приходит в PGPASSWORD уже раскодированным."""
+    marker = tmp_path / "argv.txt"
+    bindir = _fake_bin(tmp_path, f"#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\" > '{marker}'\n"
+                                 f"printf '%s' \"$PGPASSWORD\" > '{marker}.pw'\n")
+    monkeypatch.setenv("PATH", bindir + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(store, "DATABASE_URL", "postgresql://display_user:p%40ss%3Aw0rd@postgres:5432/display_system")
+    store._pg_dump_gz(str(tmp_path / "out.sql.gz"))
+    argv = marker.read_text()
+    assert "p%40ss" not in argv and "p@ss" not in argv and "w0rd" not in argv
+    assert argv.splitlines()[1:] == ["--lock-wait-timeout=60s", "postgresql://display_user@postgres:5432/display_system"]
+    assert (tmp_path / "argv.txt.pw").read_text() == "p@ss:w0rd"
+
+
+@pytest.mark.parametrize("url", ["postgresql://u@h:5432/d", "postgresql:///d"])
+def test_pg_dump_target_without_password_is_unchanged(monkeypatch, url):
+    monkeypatch.setattr(store, "DATABASE_URL", url)
+    monkeypatch.setenv("PGPASSWORD", "from-outside")
+    target, env = store._pg_dump_target()
+    assert target == url and env["PGPASSWORD"] == "from-outside"    # своё окружение не трогаем
 
 
 def test_pg_dump_gz_failure_text_is_short_and_has_no_db_password(tmp_path, monkeypatch):
