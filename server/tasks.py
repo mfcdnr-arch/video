@@ -3,13 +3,13 @@ Celery-задачи. Воркер и beat запускаются одним пр
 (см. docker-compose: celery -A tasks.celery_app worker -B).
 
 nightly_backup — ночной дамп БД + ротация. Та же механика, что ручная
-кнопка в панели (routers/backups.py): pg_dump | gzip → BACKUP_DIR,
+кнопка в панели (routers/backups.py): db_dump.pg_dump_gz → BACKUP_DIR
+(пароль БД не в командной строке pg_dump, дамп заливается в PostgreSQL 15),
 запись в таблицы backups и audit_log (actor=celery). Старые копии
 удаляются, хранится последних BACKUP_KEEP штук.
 """
 import logging
 import os
-import subprocess
 from datetime import datetime, timezone, timedelta
 
 from celery import Celery
@@ -73,6 +73,7 @@ def ping():
 def nightly_backup():
     """Дамп БД + ротация старых копий. Возвращает имя файла или текст ошибки."""
     from sqlalchemy import create_engine, text
+    from db_dump import pg_dump_gz
 
     # DATABASE_URL приходит из окружения контейнера (docker-compose),
     # deps.py не импортируем — воркер живёт без остального кода сервера.
@@ -89,19 +90,11 @@ def nightly_backup():
     filename = f"backup_{timestamp}.sql.gz"
     filepath = os.path.join(backup_dir, filename)
 
-    with open(filepath, "wb") as f:
-        dump_proc = subprocess.Popen(["pg_dump", database_url],
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        gzip_proc = subprocess.Popen(["gzip"], stdin=dump_proc.stdout, stdout=f)
-        dump_proc.stdout.close()
-        _, dump_err = dump_proc.communicate()
-        gzip_proc.communicate()
-    if dump_proc.returncode != 0:
-        if os.path.exists(filepath):
-            os.remove(filepath)
-        err = dump_err.decode(errors="ignore")[:300]
-        log.error(f"[backup] pg_dump упал: {err}")
-        return f"error: {err}"
+    try:
+        pg_dump_gz(database_url, filepath)
+    except RuntimeError as e:          # текст короткий и без пароля БД, недописанный файл уже удалён
+        log.error(f"[backup] {e}")
+        return f"error: {e}"
 
     size = os.path.getsize(filepath)
     engine = create_engine(database_url, pool_pre_ping=True)

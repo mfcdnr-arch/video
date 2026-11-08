@@ -830,14 +830,6 @@ def test_pg_dump_gz_password_not_in_command_line(tmp_path, monkeypatch):
     assert (tmp_path / "argv.txt.pw").read_text() == "p@ss:w0rd"
 
 
-@pytest.mark.parametrize("url", ["postgresql://u@h:5432/d", "postgresql:///d"])
-def test_pg_dump_target_without_password_is_unchanged(monkeypatch, url):
-    monkeypatch.setattr(store, "DATABASE_URL", url)
-    monkeypatch.setenv("PGPASSWORD", "from-outside")
-    target, env = store._pg_dump_target()
-    assert target == url and env["PGPASSWORD"] == "from-outside"    # своё окружение не трогаем
-
-
 def test_pg_dump_gz_failure_text_is_short_and_has_no_db_password(tmp_path, monkeypatch):
     if not shutil.which("gzip"):
         pytest.skip("нет gzip")

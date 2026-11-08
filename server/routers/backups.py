@@ -1,6 +1,5 @@
-"""Резервное копирование БД (pg_dump + gzip)."""
+"""Резервное копирование БД (db_dump.pg_dump_gz: pg_dump без пароля в командной строке → gzip)."""
 import os
-import subprocess
 from datetime import datetime, timezone, timedelta
 
 # Имена бэкапов — в московском времени (вся система живёт по МСК),
@@ -12,6 +11,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from db_dump import pg_dump_gz
 from deps import get_db, get_current_admin, require_write, DATABASE_URL
 
 router = APIRouter()
@@ -30,26 +30,15 @@ def get_backups(admin: dict = Depends(get_current_admin), db: Session = Depends(
 
 @router.post("/backups/create")
 def create_backup(current_admin: dict = Depends(require_write), db: Session = Depends(get_db)):
-    """Снять дамп БД через pg_dump и сохранить сжатым в BACKUP_DIR."""
+    """Снять дамп БД и сохранить сжатым в BACKUP_DIR (как ночной: db_dump.pg_dump_gz)."""
     timestamp = datetime.now(MSK).strftime("%Y%m%d_%H%M%S")
     filename = f"backup_{timestamp}.sql.gz"
     filepath = os.path.join(BACKUP_DIR, filename)
 
     try:
-        with open(filepath, "wb") as f:
-            dump_proc = subprocess.Popen(["pg_dump", DATABASE_URL],
-                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            gzip_proc = subprocess.Popen(["gzip"], stdin=dump_proc.stdout, stdout=f)
-            dump_proc.stdout.close()
-            _, dump_err = dump_proc.communicate()
-            gzip_proc.communicate()
-        if dump_proc.returncode != 0:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-            raise HTTPException(status_code=500,
-                                 detail="Ошибка pg_dump: " + dump_err.decode(errors="ignore")[:300])
-    except FileNotFoundError:
-        raise HTTPException(status_code=500, detail="pg_dump не найден на сервере")
+        pg_dump_gz(DATABASE_URL, filepath)
+    except RuntimeError as e:          # текст короткий и без пароля БД, недописанный файл уже удалён
+        raise HTTPException(status_code=500, detail=str(e))
 
     size = os.path.getsize(filepath)
     row = db.execute(text("""
