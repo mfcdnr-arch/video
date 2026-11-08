@@ -71,6 +71,7 @@ Video_miniPC_v16.2_modular/
 │   ├── offsite_tar.py         # Копия на флешку: потоковый tar с заранее посчитанным размером
 │   ├── offsite_store.py       # SQL и сборка копии на флешку: состояние, «скачано», ролики, одноразовые ссылки (Redis)
 │   ├── offsite_restore.txt    # Шаблон ВОССТАНОВЛЕНИЕ.txt — инструкция внутри копии на флешку
+│   ├── db_dump.py             # Дамп базы для всех бэкапов: пароль не в командной строке pg_dump, заливается в PostgreSQL 15
 │   ├── reset_offsite_password.py  # Сброс пароля на копию на сервере (docker compose exec -T api python /app/reset_offsite_password.py)
 │   ├── static/                # Веб-панель (index.html, js/, css/)
 │   ├── migrations/            # SQL-миграции (001–035; 001 применяется как init при первом старте БД)
@@ -156,6 +157,11 @@ Celery `expire_tickers` (раз в минуту, запись «Бегущая �
 `GET /offsite/status`, `POST /offsite/password|copy|media`, `GET /offsite/download?t=`;
 сброс забытого пароля на копию — `reset_offsite_password.py`. Модули `offsite_rules.py`,
 `offsite_crypto.py`, `offsite_tar.py`, `offsite_store.py`, `routers/offsite.py`  
+✅ Ночной и ручной бэкап БД снимаются той же функцией, что дамп в копии на флешку
+(`db_dump.py`): пароль БД не попадает в командную строку `pg_dump` (не виден в `ps` /
+`docker top`), дамп заливается в PostgreSQL 15 с `psql -v ON_ERROR_STOP=1` без ошибок
+(строка `SET transaction_timeout = 0;` от `pg_dump` 17 вычищается); smoke сверяет версии
+`pg_dump` и сервера БД  
 ✅ Контроль часов хоста: смещение видно в самодиагностике и selfheal.sh
 (с командой лечения)  
 ✅ Контроль подключения монитора: агент читает `/sys/class/drm/*/status` и шлёт
@@ -209,7 +215,7 @@ docker exec ds_ntp chronyc sources   # NTP видит российские се�
 
 Перед релизом — три уровня проверки (подробно: `docs/Техдокументация/04_ТЕСТЫ.md`):
 ```bash
-bash run_tests.sh    # pytest: биллинг/кампании, плейлисты, показы, общий эфир, бегущая строка, обзор сети, контроль монитора, копия на флешку
+bash run_tests.sh    # pytest: биллинг/кампании, плейлисты, показы, общий эфир, бегущая строка, обзор сети, контроль монитора, копия на флешку, дамп базы
 bash smoke_test.sh   # API и цикл «экран → медиа → плейлист → расписание»
                      #   (SMOKE_ALLOW_BROADCAST=1 — ещё и шаг «Общий эфир»: на ВСЕ экраны, только на стенде)
                      #   (SMOKE_ALLOW_OFFSITE=1 — ещё и полный цикл «Копии на флешку»: сбрасывает пароль на копию,

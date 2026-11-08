@@ -13,6 +13,11 @@
   совпали), медиафайл выгружен из MinIO с совпадением md5.
 - 2026-11-07: **учения по Сценарию 0** на стенде, строго по инструкции из копии
   (подробности — в конце раздела Сценария 0).
+- 2026-11-08: на стенде свежие **ночной** (через воркер Celery) и **ручной** дампы
+  залиты во временные базы с `psql -v ON_ERROR_STOP=1` без единой ошибки (число строк
+  во всех таблицах совпало с рабочей базой); дамп, снятый до исправления, на той же
+  заливке останавливается на `transaction_timeout`. Сценарий 1 пройден на стенде
+  по командам ниже.
 
 ## Что и куда бэкапится (автоматически, Celery)
 
@@ -131,8 +136,9 @@ mc mirror ds/ds-media-backup ./offsite_media/
 Учения нашли настоящую несовместимость: `pg_dump` в образе `api` версии 17, а
 сервер БД — PostgreSQL 15, и `pg_dump` 17 пишет в шапку дампа строку
 `SET transaction_timeout = 0;`, которую PostgreSQL 15 отвергает. Теперь дамп в
-копии на флешку эту строку не содержит, поэтому заливка с `ON_ERROR_STOP` проходит
-(про ночные дампы, где строка осталась, — примечание к Сценарию 1). Версия `pg_dump`
+копии на флешку эту строку не содержит, поэтому заливка с `ON_ERROR_STOP` проходит;
+с 2026-11-08 так же снимаются ночные и ручные дампы (общая функция `server/db_dump.py`,
+про дампы старой версии сервера — примечание к Сценарию 1). Версия `pg_dump`
 приходит с базовым образом `api` и может смениться при пересборке, поэтому
 `smoke_test.sh` с `SMOKE_ALLOW_OFFSITE=1` (только стенд) на каждом прогоне заливает
 дамп из свежей копии во временную базу тем же способом, что шаг 4 инструкции, и сверяет
@@ -150,36 +156,68 @@ mc mirror ds/ds-media-backup ./offsite_media/
 ```bash
 cd Video_miniPC_v16.2_modular
 
-# 1. Выбрать дамп
+# 1. Выбрать дамп и забрать его из тома на хост, пока api работает
+#    (после шага 2 читать файлы через ds_api уже нельзя: контейнер остановлен)
 docker exec ds_api ls -t /data/backups/
+docker cp ds_api:/data/backups/ИМЯ_ДАМПА.sql.gz ./restore.sql.gz
 
 # 2. Остановить api и celery, чтобы никто не писал в базу
 docker compose stop api celery
 
-# 3. Пересоздать базу и залить дамп
-docker exec ds_postgres psql -U display_user -d postgres \
-  -c "DROP DATABASE display_system" \
-  -c "CREATE DATABASE display_system OWNER display_user"
-docker exec ds_api sh -c "gunzip -c /data/backups/ИМЯ_ДАМПА.sql.gz" \
-  | docker exec -i ds_postgres psql -U display_user -d display_system -q
+# 3. Пересоздать базу и залить дамп. ON_ERROR_STOP: на первой же ошибке psql
+#    останавливается, pipefail: ошибка gunzip тоже не проходит молча.
+#    Блок можно повторять целиком.
+docker exec ds_postgres psql -v ON_ERROR_STOP=1 -U display_user -d postgres \
+  -c "DROP DATABASE IF EXISTS display_system WITH (FORCE)" \
+  -c "CREATE DATABASE display_system OWNER display_user" && \
+(set -o pipefail; gunzip -c ./restore.sql.gz \
+  | docker exec -i ds_postgres psql -v ON_ERROR_STOP=1 -U display_user -d display_system -q >/dev/null) \
+  && echo "ДАМП ЗАЛИТ" || echo "ОШИБКА: дамп не залит — api не запускать, см. ниже"
 
 # 4. Запустить обратно и проверить
 docker compose start api celery
 docker exec ds_api curl -s http://localhost:8000/health
+
+# 5. Убрать дамп с хоста: в нём хеши паролей и токены всех экранов
+rm -f ./restore.sql.gz
 ```
 
 Имена базы/пользователя возьмите из своего `.env` (`POSTGRES_DB`,
 `POSTGRES_USER`) — выше показаны значения по умолчанию.
 
-> **Одна безвредная ошибка при заливке.** `pg_dump` в образе `api` новее сервера
-> БД (17 против PostgreSQL 15), поэтому **ночные и ручные дампы** (раздел
-> «Резервное копирование» в Настройках, том `backup_data`) начинаются со строки
-> `SET transaction_timeout = 0;`. PostgreSQL 15 её не знает и при заливке
-> печатает одну строку `ERROR:  unrecognized configuration parameter
-> "transaction_timeout"`. Это нормально: команды выше (без `ON_ERROR_STOP`) на
-> неё не останавливаются, и остальной дамп заливается целиком. Любые другие
-> ошибки игнорировать нельзя. (В дампе внутри копии на флешку этой строки нет,
-> поэтому в Сценарии 0 такой ошибки не бывает.)
+Шаг 3 должен закончиться надписью **«ДАМП ЗАЛИТ»**. Если вместо неё «ОШИБКА»,
+над ней будет строка `ERROR: …` от `psql` (или ошибка `gunzip`, если файл битый):
+база залита не целиком, `api` не запускайте. Возьмите дамп за предыдущий день
+(шаг 1) и повторите блок шага 3.
+
+После заливки в списке бэкапов (Настройки) не будет ни залитого бэкапа, ни более
+новых: записи о них появились в базе уже после снятия дампа. Их файлы остаются в
+томе (`docker exec ds_api ls -t /data/backups/`).
+
+> **Дамп старой версии сервера: строка `transaction_timeout`.** `pg_dump` в образе
+> `api` новее сервера БД (17 против PostgreSQL 15) и пишет в шапку дампа строку
+> `SET transaction_timeout = 0;`, которую PostgreSQL 15 не знает. Сервер убирает её
+> из каждого дампа — ночного, ручного и в копии на флешку (общая функция
+> `server/db_dump.py`). Но дампы, снятые **старой версией сервера** (до этого
+> исправления), её ещё содержат, и шаг 3 на них останавливается с
+> `ERROR:  unrecognized configuration parameter "transaction_timeout"`. Проверить
+> дамп заранее:
+> ```bash
+> gunzip -c ./restore.sql.gz | head -40 | grep -c '^SET transaction_timeout'   # 1 — старый, 0 — новый
+> ```
+> Старый дамп заливайте тем же блоком шага 3, вставив фильтр, который убирает
+> только первую такую строку (она в шапке), а остальной дамп пропускает как есть:
+> ```bash
+> docker exec ds_postgres psql -v ON_ERROR_STOP=1 -U display_user -d postgres \
+>   -c "DROP DATABASE IF EXISTS display_system WITH (FORCE)" \
+>   -c "CREATE DATABASE display_system OWNER display_user" && \
+> (set -o pipefail; gunzip -c ./restore.sql.gz \
+>   | sed '0,/^SET transaction_timeout = 0;$/{//d}' \
+>   | docker exec -i ds_postgres psql -v ON_ERROR_STOP=1 -U display_user -d display_system -q >/dev/null) \
+>   && echo "ДАМП ЗАЛИТ" || echo "ОШИБКА: дамп не залит — api не запускать"
+> ```
+> В томе хранятся последние 14 дампов (`BACKUP_KEEP`, ночные и ручные вместе), поэтому
+> примерно через две недели после обновления старых дампов в нём уже не будет.
 
 ## Сценарий 2: полное восстановление на новой машине
 
@@ -192,7 +230,8 @@ docker exec ds_api curl -s http://localhost:8000/health
    (или скопируйте сохранённый старый `.env` — тогда пароли и токены
    входа останутся прежними).
 3. `bash install_server.sh` — поднимет пустой рабочий стек.
-4. Восстановить БД по Сценарию 1 (дамп принести с собой / со внешней копии).
+4. Восстановить БД по Сценарию 1 (дамп принести с собой / со внешней копии:
+   положите его в папку проекта под именем `restore.sql.gz` и начните с шага 2).
    ВАЖНО: токены экранов лежат в базе, поэтому после восстановления БД
    все мини-ПК продолжат работать без перенастройки — им нужен только
    прежний IP/домен сервера (он прописан в конфиге агента).
@@ -226,16 +265,18 @@ docker exec ds_api curl -s http://localhost:8000/health
 LATEST=$(docker exec ds_postgres psql -U display_user -d display_system \
   -tAc "SELECT filename FROM backups ORDER BY created_at DESC LIMIT 1")
 docker exec ds_postgres createdb -U display_user restore_test
-docker exec ds_api sh -c "gunzip -c /data/backups/$LATEST" \
-  | docker exec -i ds_postgres psql -U display_user -d restore_test -q
+(set -o pipefail; docker exec ds_api sh -c "gunzip -c /data/backups/$LATEST" \
+  | docker exec -i ds_postgres psql -v ON_ERROR_STOP=1 -U display_user -d restore_test -q >/dev/null) \
+  && echo "ДАМП ЗАЛИВАЕТСЯ" || echo "ОШИБКА: дамп не заливается"
 docker exec ds_postgres psql -U display_user -d restore_test \
   -c "SELECT COUNT(*) AS tables FROM information_schema.tables WHERE table_schema='public'"
 docker exec ds_postgres psql -U display_user -d display_system -c "DROP DATABASE restore_test"
 ```
 
-Ожидаемо: количество таблиц такое же, как в рабочей базе, при заливке нет
-ошибок, кроме одной безвредной строки про
-`transaction_timeout` (см. примечание к Сценарию 1).
+Ожидаемо: надпись «ДАМП ЗАЛИВАЕТСЯ» и столько же таблиц, сколько в рабочей
+базе. «ОШИБКА» на дампе старой версии сервера с `ERROR: … "transaction_timeout"`
+над ней объяснена в примечании к Сценарию 1; на свежем дампе любая ошибка —
+повод разбираться ([03_RUNBOOK, §9б](Техдокументация/03_RUNBOOK_ИНЦИДЕНТЫ.md)).
 
 Копию на флешку тоже стоит проверять: раз в квартал откройте свежую
 `ds_copy_*.tar` по первым шагам Сценария 0 (распаковать, проверить `sha256sum`,
