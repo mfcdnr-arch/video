@@ -19,6 +19,7 @@ tar — в offsite_tar; здесь они только склеены.
 """
 import hmac
 import logging
+import math
 import os
 import re
 import shutil
@@ -47,6 +48,7 @@ router = APIRouter()
 CHUNK = 1 << 20                                 # кусок потока: 1 МиБ — гигабайты в память не попадают
 MEDIA_MANIFEST = "MANIFEST_media.txt"
 DOWNLOAD_URL = "/api/offsite/download?t="       # снаружи сервер виден под /api/ (nginx его срезает)
+PROXY_HEADER = "x-ds-offsite"                   # ставит nginx в location /api/offsite/ (nginx.conf)
 
 MSG_BAD_LOGIN = "Неверный пароль входа"
 MSG_BAD_CURRENT = "Неверный текущий пароль на копию"
@@ -72,6 +74,8 @@ _build_lock = threading.Lock()
 # Имя файла в заголовке Content-Disposition берётся из токена в Redis: пускаем только то, что умеют
 # выдавать наши offsite_rules (латиница, цифры, точка, дефис, подчёркивание), иначе заголовок можно сломать.
 _SAFE_FILENAME = re.compile(r"[A-Za-z0-9._-]{1,128}")
+# Текст без единой русской буквы панель показывает как «Сервер ответил ошибкой» (errText в offsite.js)
+_CYRILLIC = re.compile(r"[А-Яа-яЁё]")
 
 
 class PasswordBody(BaseModel):
@@ -101,8 +105,34 @@ def _int_or_none(value) -> Optional[int]:
     return int(value) if value is not None else None
 
 
-def _mb(size: int) -> str:
-    return f"{size / (1024 * 1024):.1f} МБ"
+_MIB = 1024 * 1024
+
+
+def _round1(x: float) -> float:
+    """Округление до десятых «половина — вверх», как Math.round в панели (round() в Python — банковское)."""
+    return math.floor(x * 10 + 0.5) / 10
+
+
+def _size_text(size) -> str:
+    """Размер словами — так же, как его пишет панель (fmtSize в views/offsite.js): меньше 0,1 МБ —
+    целые КБ (не «0,0 МБ»), дальше МБ с одним знаком, от 1024 МБ — ГБ; дробь через запятую
+    («12 КБ», «640,0 МБ», «18,6 ГБ»)."""
+    b = max(int(size or 0), 0)
+    if b < 0.1 * _MIB:
+        return f"{max(1, math.floor(b / 1024 + 0.5)) if b else 0} КБ"
+    mb = _round1(b / _MIB)
+    if mb >= 1024:
+        return f"{_round1(b / (1024 * _MIB)):.1f}".replace(".", ",") + " ГБ"
+    return f"{mb:.1f}".replace(".", ",") + " МБ"
+
+
+def _build_error_text(e: OSError) -> str:
+    """Ошибка диска или файла при сборке копии — по-русски, только из strerror и имени файла.
+    str(e) и e.args не берём: там может оказаться что угодно, а текст уходит в панель и в лог.
+    (Английский strerror панель покажет как есть: начало фразы русское.)"""
+    reason = e.strerror or type(e).__name__
+    where = f" ({e.filename})" if e.filename else ""
+    return f"Не удалось собрать копию: {reason}{where}"[:500]
 
 
 def _stored_password(state: dict) -> Optional[str]:
@@ -212,7 +242,7 @@ def _finish(mark) -> None:
 # --- статус ---------------------------------------------------------------------------------
 
 @router.get("/offsite/status")
-def offsite_status(admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
+def offsite_status(request: Request, admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
     _sweep_stale()                              # панель опрашивает статус постоянно: забытые копии уходят вовремя
     now = now_msk()
     st = store.load_state(db)
@@ -241,6 +271,11 @@ def offsite_status(admin: dict = Depends(require_superadmin), db: Session = Depe
         },
         "state": reminder_state(last_copy, totals["new_count"], now),
         "project_mounted": store.project_mounted(),
+        # Запрос пришёл через локацию /api/offsite/ в nginx (только она ставит X-DS-Offsite): конфиг
+        # nginx свежий. Со старым конфигом ответы буферизуются («скачано» раньше, чем файл дошёл) и
+        # сборка упирается в 504 — панель показывает предупреждение. Напрямую в API (smoke, curl на
+        # :8000) — false, и это не ошибка.
+        "proxy_ok": request.headers.get(PROXY_HEADER) == "1",
     }
 
 
@@ -293,14 +328,28 @@ def offsite_make_copy(body: CopyBody, request: Request, admin: dict = Depends(re
         raise HTTPException(409, MSG_BUSY)
     try:
         store.cleanup_stale()                   # забытые копии прошлых запросов: не копим на диске
+        # Проверки позади, а впереди минуты дампа: транзакцию запроса (чтение пароля и состояния)
+        # закрываем сейчас, чтобы сессия не держала её открытой всю сборку
+        db.commit()
         try:
             built = store.build_copy(db, who=who, host=request.headers.get("host"),
                                      password=password, now=now_msk())
         except store.ProjectNotMounted:
             raise HTTPException(503, MSG_NOT_MOUNTED)
-        except (RuntimeError, ValueError, OSError) as e:
-            # build_copy уже убрал за собой папку; текст ошибки очищен от пароля БД и пароля на копию
-            raise HTTPException(500, str(e)[:500] or type(e).__name__)
+        except OSError as e:
+            # диск, права, пропавший файл: build_copy уже убрал за собой папку
+            msg = _build_error_text(e)
+            log.error("Копия на флешку: %s", msg)
+            raise HTTPException(500, msg)
+        except (RuntimeError, ValueError) as e:
+            # наши русские тексты (pg_dump, «нет .env»); пароль БД и пароль на копию из них уже вычищены
+            msg = str(e)[:500] or type(e).__name__
+            log.error("Копия на флешку: сборка не удалась: %s", msg)
+            if not _CYRILLIC.search(msg):
+                # чужой английский текст панель заменила бы на «Сервер ответил ошибкой»: называем сбой
+                # по-русски, а подробности — в логе api
+                msg = f"Не удалось собрать копию: {type(e).__name__} (подробности — в логе api)"
+            raise HTTPException(500, msg)
     finally:
         _build_lock.release()
     try:
@@ -420,7 +469,7 @@ def _stream_copy(f, size: int, workdir: str, filename: str, who: str):
 
 def _mark_copy(db, who: str, filename: str, size: int) -> None:
     store.mark_copy_done(db, who, filename, size, now_msk())
-    store.audit(db, "Копия на флешку скачана", f"{filename}, {_mb(size)}", who)
+    store.audit(db, "Копия на флешку скачана", f"{filename}, {_size_text(size)}", who)
 
 
 def _cell(value) -> str:
@@ -493,7 +542,7 @@ def _mark_media(db, who: str, scope: str, after: int, upto: int, count: int, tot
                 missing: int = 0) -> None:
     store.mark_media_done(db, who, scope, upto, count, total, now_msk())
     kind = "новые" if scope == "new" else "все"
-    detail = f"{kind}, {count} шт, {_mb(total)}, id {after + 1}–{upto}"
+    detail = f"{kind}, {count} шт, {_size_text(total)}, id {after + 1}–{upto}"
     if missing:
         detail += f", нет файла: {missing}"       # потерянное не прячем: видно и в журнале, не только в манифесте
     store.audit(db, "Ролики скачаны на флешку", detail, who)

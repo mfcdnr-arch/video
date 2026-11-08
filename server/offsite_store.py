@@ -17,7 +17,8 @@ now_msk), а не NOW() Postgres: контейнер БД живёт в UTC, и 
 Ролики со status='document' — это «Документы» медиатеки (сканы договоров), а не эфирные ролики:
 в архивы роликов они не входят, их отдают отдельным списком document_rows.
 
-Функции не делают commit — транзакцией управляет вызывающий (роутер).
+Функции не делают commit — транзакцией управляет вызывающий (роутер). Исключение одно: build_copy
+закрывает транзакцию чтения сразу после контрольных чисел, чтобы не держать её открытой минуты сборки.
 """
 import gzip
 import hashlib
@@ -36,7 +37,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterator
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from sqlalchemy import text
 
@@ -281,6 +282,12 @@ class ProjectNotMounted(Exception):
     """Корень проекта не виден из контейнера api (нет .env или docker-compose.yml): сервер не обновлён."""
 
 
+# .env в папке проекта есть (_check_project смотрит сквозь симлинк), но в копию он не лёг: это симлинк
+# или не обычный файл, а _iter_files такие не берёт. Без .env на новой машине install_server.sh создаст
+# новые пароли, и база из дампа с ними не сойдётся — такая копия хуже отказа.
+MSG_NO_ENV = "В папке программы нет обычного файла .env — копия без паролей бесполезна"
+
+
 @dataclass
 class BuiltCopy:
     """Готовая копия: внешний tar лежит в workdir (его вызывающий удаляет после отдачи)."""
@@ -350,18 +357,43 @@ def _drain_stderr(pipe, box: list) -> None:
         pass
 
 
+# Сколько pg_dump ждёт блокировку таблицы. Таблицу держит долгая операция (миграция, ALTER TABLE) —
+# без предела дамп, а с ним и сборка копии (и замок «копия уже собирается») ждали бы без конца;
+# с пределом pg_dump через минуту падает с понятной ошибкой, и человек просто повторяет позже.
+PG_DUMP_LOCK_WAIT = "60s"
+
+
+def _pg_dump_target() -> tuple[str, dict]:
+    """Адрес базы для pg_dump без пароля и окружение процесса с паролем (PGPASSWORD).
+
+    Командную строку процесса видит любой, кто смотрит список процессов (`ps`, `docker top`), поэтому
+    пароль БД в неё не кладём: в argv уходит адрес без пароля, сам пароль — через окружение pg_dump
+    (его читает только владелец процесса). Нет пароля в DATABASE_URL — адрес как есть.
+    """
+    parts = urlsplit(DATABASE_URL)
+    env = dict(os.environ)
+    if parts.password is None:
+        return DATABASE_URL, env
+    userinfo, _, hostport = parts.netloc.rpartition("@")     # так же делит адрес и сам urlsplit
+    user = userinfo.partition(":")[0]
+    env["PGPASSWORD"] = unquote(parts.password)
+    return urlunsplit(parts._replace(netloc=f"{user}@{hostport}")), env
+
+
 def _pg_dump_gz(dst_path: str) -> None:
-    """Снять дамп БД в dst_path: `pg_dump "$DATABASE_URL"`, сжатый gzip (уровень 6, как у утилиты gzip),
-    без строки `SET transaction_timeout = 0;` в шапке (см. выше). Любая беда — RuntimeError с текстом
-    stderr (до 300 символов, пароль БД из адреса вычищен); недописанный файл удаляется.
+    """Снять дамп БД в dst_path: `pg_dump --lock-wait-timeout=60s <адрес без пароля>` (пароль — в
+    PGPASSWORD, см. _pg_dump_target), сжатый gzip (уровень 6, как у утилиты gzip), без строки
+    `SET transaction_timeout = 0;` в шапке (см. выше). Любая беда — RuntimeError с текстом stderr
+    (до 300 символов, пароль БД вычищен); недописанный файл удаляется.
 
     Модульная функция, а не вложенная: тесты подменяют её, чтобы не нужен был настоящий Postgres.
     """
     ok = False
     try:
+        url, env = _pg_dump_target()
         try:
-            dump = subprocess.Popen(["pg_dump", DATABASE_URL],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            dump = subprocess.Popen(["pg_dump", f"--lock-wait-timeout={PG_DUMP_LOCK_WAIT}", url],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         except FileNotFoundError:
             raise RuntimeError("pg_dump не найден на сервере")
         err_box: list = []
@@ -386,7 +418,7 @@ def _pg_dump_gz(dst_path: str) -> None:
             raise RuntimeError(f"Ошибка pg_dump: не удалось записать дамп ({reason})")
         if dump.returncode != 0:
             msg = (err_box[0] if err_box else b"").decode(errors="ignore")
-            # пароль БД стоит в адресе подключения; если pg_dump его где-то процитировал — прячем
+            # пароль БД pg_dump знает (из окружения); если он его где-то процитировал — прячем
             raw_pw = urlsplit(DATABASE_URL).password
             for secret in ({raw_pw, unquote(raw_pw)} if raw_pw else ()):
                 if secret:
@@ -611,8 +643,9 @@ def build_copy(db, *, who: str, host: str, password: str, now: datetime) -> Buil
     документы рекламодателей, «Документы» медиатеки, файлы OTA и MANIFEST.txt.
 
     Любая ошибка (pg_dump, диск, исчезнувший файл, БД) стирает папку сборки целиком: недособранная
-    копия не должна лежать на диске. Пароль в тексты исключений не попадает. Транзакцией БД управляет
-    вызывающий; здесь только чтение.
+    копия не должна лежать на диске. Пароль на копию в тексты исключений не попадает (если вдруг
+    оказался в тексте RuntimeError / ValueError — заменяется на «***»). Из БД здесь только чтение;
+    его транзакция закрывается (commit) сразу после контрольных чисел, а не через минуты сборки.
     """
     if not password:
         raise ValueError("Пароль на копию не задан")
@@ -631,6 +664,9 @@ def build_copy(db, *, who: str, host: str, password: str, now: datetime) -> Buil
         _pg_dump_gz(dump_path)
         counts = _control_numbers(db)
         doc_rows = document_rows(db)
+        # Больше из базы ничего не читаем: закрываем транзакцию сейчас. Иначе сессия простояла бы
+        # «idle in transaction» все минуты архивации и шифрования.
+        db.commit()
         migration = _last_migration()
 
         # 2. внутренний copy.tar.gz
@@ -638,10 +674,14 @@ def build_copy(db, *, who: str, host: str, password: str, now: datetime) -> Buil
         with _CopyArchive(inner_path, now) as ar:
             for section in _SECTIONS:
                 ar.add_dir(section)
+            env_added = False
             for rel, full, st in _iter_files(PROJECT_DIR, skip=is_program_excluded):
                 # .env — только владельцу, что бы ни стояло в источнике; остальным — их права
                 mode = 0o600 if rel == ".env" else (st.st_mode & 0o777)
                 ar.add_file("program/" + rel, full, st, mode)
+                env_added = env_added or rel == ".env"
+            if not env_added:
+                raise RuntimeError(MSG_NO_ENV)
             ar.add_file(f"db/backup_{now:%Y%m%d_%H%M%S}.sql.gz", dump_path, os.lstat(dump_path), 0o644)
             for rel, full, st in _iter_files(os.path.join(BACKUP_DIR, "documents")):
                 ar.add_file("documents/" + rel, full, st, 0o644)
@@ -682,8 +722,12 @@ def build_copy(db, *, who: str, host: str, password: str, now: datetime) -> Buil
         os.remove(enc_path)             # остаётся только внешний tar
         os.remove(os.path.join(workdir, BUILD_MARKER))      # собрано: дальше это обычная готовая папка
         return BuiltCopy(path=out_path, filename=filename, size=size, workdir=workdir)
-    except BaseException:
+    except BaseException as e:
         shutil.rmtree(workdir, ignore_errors=True)
+        # Текст RuntimeError / ValueError роутер показывает в панели и пишет в лог: пароль на копию в
+        # нём оказаться не должен, даже если какая-то утилита его процитировала
+        if isinstance(e, (RuntimeError, ValueError)) and password in str(e):
+            raise RuntimeError(str(e).replace(password, "***")) from None
         raise
 
 

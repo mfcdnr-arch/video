@@ -157,11 +157,12 @@ agent_updates и MANIFEST.txt. Прочитать опись:
 Вставьте блок целиком (все строки сразу). Он написан так, что после первой же
 ошибки остальные команды не выполняются: иначе дамп мог бы лечь поверх
 «чистой» базы и всё выглядело бы нормально. Блок можно повторять целиком, он
-каждый раз пересоздаёт базу заново.
+каждый раз пересоздаёт базу заново - даже если прошлый раз оборвался, когда
+старая база уже была удалена, а новая ещё не создана.
 
     cd ~/digital-signage && \
     docker compose stop api celery && \
-    docker exec ds_postgres psql -v ON_ERROR_STOP=1 -U {{pg_user}} -d postgres -c "DROP DATABASE {{pg_db}} WITH (FORCE)" -c "CREATE DATABASE {{pg_db}} OWNER {{pg_user}}" && \
+    docker exec ds_postgres psql -v ON_ERROR_STOP=1 -U {{pg_user}} -d postgres -c "DROP DATABASE IF EXISTS {{pg_db}} WITH (FORCE)" -c "CREATE DATABASE {{pg_db}} OWNER {{pg_user}}" && \
     (set -o pipefail; gunzip -c ~/ds_restore/copy/db/backup_*.sql.gz | docker exec -i ds_postgres psql -v ON_ERROR_STOP=1 -U {{pg_user}} -d {{pg_db}} -q) && \
     bash migrate.sh && \
     docker compose start api celery && \
