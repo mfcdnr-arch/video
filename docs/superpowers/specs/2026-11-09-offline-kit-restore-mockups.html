@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8"><title>Комплект и восстановление — макеты</title>
+<!-- Одобрено пользователем 09.11.2026: макеты 1 (Настройки), 2 (дашборд), 3 (терминал, чистая машина), 4 (терминал, поверх старой установки). Имена скриптов в итоге латиницей: restore.sh / rollback.sh (см. описание §12). -->
+<style>
+:root{--bg:#14161b;--bg2:#0e1014;--panel:#1b1e25;--border:#2a2e37;--border2:#343a45;--txt:#f1f3f6;--txt2:#c7ccd4;--muted:#aeb4be;--dim:#8b919c;--accent:#7fe3c4;--accent2:#12a886;--danger:#ff8a7a;--warn:#ffd34d;}
+*{box-sizing:border-box}
+body{margin:0;background:#0b0c0f;color:var(--txt);font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;padding:24px 16px 60px}
+.wrap{max-width:1000px;margin:0 auto}
+h1{font-size:20px;margin:0 0 4px} .lead{color:var(--muted);margin:0 0 26px;font-size:13px}
+.step{font-size:12px;color:var(--accent);text-transform:uppercase;letter-spacing:.5px;margin:38px 0 6px}
+h2{font-size:16px;margin:0 0 6px} .note{color:var(--muted);font-size:13px;margin:0 0 12px;max-width:780px}
+.screen{background:var(--bg);border:1px solid var(--border2);border-radius:12px;padding:18px 20px}
+.sec{font-size:13px;font-weight:500;margin:16px 0 9px}.sec:first-child{margin-top:0}
+.muted{color:var(--muted)}
+.cell{background:var(--panel);border:0.5px solid var(--border2);border-radius:10px;padding:11px 13px;margin-bottom:10px}
+.cell.new{outline:2px dashed #b8901f;outline-offset:3px}
+.banner{border-radius:11px;padding:13px 15px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.banner.warn{background:#2a2410;border:1px solid #b8901f}
+.banner.ok{background:#15241f;border:1px solid var(--accent2)}
+.dot{width:9px;height:9px;border-radius:50%;flex:none}
+.cap{font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+.btn{background:#fff;color:#111418;border:1px solid #9aa0ab;border-radius:7px;padding:7px 13px;font-size:13px;font-weight:500;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.btn.primary{border:2px solid var(--accent2)} .btn.small{padding:4px 9px;font-size:12px} .btn.off{opacity:.4}
+.row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.kv{display:grid;grid-template-columns:200px 1fr;gap:6px 14px;font-size:13px}
+.kv .k{color:var(--muted)}
+.ghost{opacity:.4}
+.w{color:var(--warn)} .g{color:var(--accent)}
+.three{display:grid;grid-template-columns:1fr;gap:16px}
+.lbl{font-size:11px;color:var(--muted);margin-bottom:8px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:14px} @media(max-width:820px){.two{grid-template-columns:1fr}.kv{grid-template-columns:1fr}}
+.term{background:#07080a;border:1px solid #2a2e37;border-radius:10px;padding:14px 16px;font:12.5px/1.55 ui-monospace,Menlo,Consolas,monospace;color:#d6dae0;white-space:pre-wrap;overflow-x:auto}
+.term .p{color:#7fe3c4} .term .y{color:#ffd34d} .term .r{color:#ff8a7a} .term .d{color:#8b919c} .term .b{font-weight:700;color:#fff} .term .in{background:#1d2a25;color:#fff}
+.q{margin-top:10px;font-size:13px;color:var(--warn)}
+</style></head><body><div class="wrap">
+
+<h1>Комплект для установки и восстановление одной командой</h1>
+<p class="lead">Макеты, а не готовый вид. Новое обведено жёлтым пунктиром. Цвета и элементы — как в панели и в одобренных макетах «Копии на флешку».</p>
+
+<div class="step">Макет 1 · Настройки → «Копия на флешку»</div>
+<h2>Третья строка блока: «Комплект для установки»</h2>
+<p class="note">Видит только суперадмин, как и весь блок. Пароль входа заново не спрашивается: в комплекте нет ни паролей, ни данных — только программа. Три состояния строки.</p>
+<div class="screen">
+  <div class="sec">Копия на флешку</div>
+  <div class="cell ghost">
+    <div class="row"><div style="font-weight:600;flex:1">Ежедневная копия</div><span class="btn primary">⤓ Скачать копию · ≈ 7 МБ</span></div>
+  </div>
+  <div class="cell ghost">
+    <div class="row"><div style="font-weight:600;flex:1">Ролики</div><span class="btn primary">⤓ Скачать новые · 3 шт, 640 МБ</span><span class="btn">⤓ Скачать все · 214 шт, 18,6 ГБ</span></div>
+  </div>
+
+  <div class="three">
+    <div>
+      <div class="lbl">А · После выкатки комплект обновился, а новый ещё не скачан</div>
+      <div class="cell new">
+        <div class="row" style="margin-bottom:10px">
+          <div style="font-weight:600;flex:1">Комплект для установки</div>
+          <span class="btn primary">⤓ Скачать комплект · 760 МБ</span>
+        </div>
+        <div class="kv">
+          <div class="k">Что внутри</div><div>готовые образы программы сервера и модуль docker compose. С ним сервер ставится за минуты, без сборки и без Docker Hub. Паролей и данных в нём нет</div>
+          <div class="k">Версия</div><div>от 08.11.2026, 14:20 (выкатка) · a1b2c3</div>
+          <div class="k">Последнее скачивание</div><div class="w">01.11.2026 · admin — прошлая версия. К нынешней программе она не подойдёт, скачайте новую</div>
+          <div class="k">На флешке</div><div>старые комплекты не удаляйте, пока там лежат старые копии: скрипт восстановления сам возьмёт подходящий</div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="lbl">Б · Эта версия уже скачана</div>
+      <div class="cell new">
+        <div class="row" style="margin-bottom:10px">
+          <div style="font-weight:600;flex:1">Комплект для установки</div>
+          <span class="btn">⤓ Скачать ещё раз · 760 МБ</span>
+        </div>
+        <div class="kv">
+          <div class="k">Версия</div><div>от 08.11.2026, 14:20 (выкатка) · a1b2c3</div>
+          <div class="k">Последнее скачивание</div><div class="g">08.11.2026, 15:02 · admin — эта версия ✓</div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="lbl">В · На сервере комплекта ещё нет (выкатки с этой функцией не было)</div>
+      <div class="cell new">
+        <div class="row" style="margin-bottom:10px">
+          <div style="font-weight:600;flex:1">Комплект для установки</div>
+          <span class="btn off">⤓ Скачать комплект</span>
+        </div>
+        <div class="kv">
+          <div class="k">Состояние</div><div class="w">Комплект ещё не сохранён. Он появится после следующей выкатки (bash install_server.sh). Без него восстановление тоже пройдёт, но соберёт программу из интернета</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="step">Макет 2 · Дашборд</div>
+<h2>Напоминание: ещё одна строка в том же жёлтом баннере</h2>
+<p class="note">Баннер жёлтый, пока не скачано что-то из трёх: сегодняшняя копия, новые ролики, комплект новой версии. Строка про комплект появляется только после выкатки, пока новый комплект не скачан.</p>
+<div class="two">
+  <div class="screen">
+    <div class="lbl">Утро после выкатки</div>
+    <div class="banner warn">
+      <span class="dot" style="background:var(--warn)"></span>
+      <div style="flex:1;min-width:220px">
+        <div class="cap w">Копия на флешку</div>
+        <div style="font-weight:600">Сегодня копию ещё не скачивали</div>
+        <div class="muted" style="font-size:12px">Последняя — вчера, 18:42 (admin) · новых роликов с тех пор: 3, 640 МБ</div>
+        <div style="font-size:12px;margin-top:4px" class="w">После выкатки 08.11 обновился комплект для установки — скачайте его (760 МБ)</div>
+      </div>
+      <span class="btn primary">⤓ Скачать копию</span>
+    </div>
+  </div>
+  <div class="screen">
+    <div class="lbl">Копию и ролики скачали, комплект — нет</div>
+    <div class="banner warn">
+      <span class="dot" style="background:var(--warn)"></span>
+      <div style="flex:1;min-width:220px">
+        <div class="cap w">Копия на флешку</div>
+        <div style="font-weight:600">Скачайте новый комплект для установки</div>
+        <div class="muted" style="font-size:12px">Копия сегодня скачана в 09:15 (admin), новые ролики тоже</div>
+      </div>
+      <span class="btn primary">⤓ Скачать комплект</span>
+    </div>
+  </div>
+</div>
+
+<div class="step">Макет 3 · Терминал: восстановление на чистой машине</div>
+<h2>Что видит человек, который поднимает систему</h2>
+<p class="note">Флешка вставлена, терминал открыт в папке флешки. Он вводит одну строку (её же печатает ВОССТАНОВЛЕНИЕ.txt и показывает панель). Дальше скрипт спрашивает только три вещи: какую копию взять, пароль sudo (если надо ставить Docker) и пароль на копию.</p>
+<div class="term"><span class="d">user@astra:/media/user/FLASH$</span> <span class="in">tar -xf ds_copy_2026-11-08_0915.tar ВОССТАНОВИТЬ.sh &amp;&amp; bash ВОССТАНОВИТЬ.sh</span>
+
+<span class="b">══ Восстановление сервера Digital Signage ══</span>
+
+<span class="p">▶ Копии на флешке</span>
+   1) 08.11.2026 09:15   <span class="d">(самая свежая)</span>
+   2) 07.11.2026 18:40
+   3) 06.11.2026 09:02
+  Какую копию восстановить? [Enter — 1]: <span class="in"> </span>
+
+<span class="p">▶ Проверка машины</span>
+  ✓ Astra Linux 1.7 · свободно 120 ГБ (нужно ≈ 25 ГБ)
+  <span class="y">⚠ Docker не установлен — ставлю из репозитория Astra</span>
+  [sudo] пароль для user: <span class="in">        </span>
+  ✓ Docker установлен · модуль docker compose — из комплекта
+  ✓ Адрес машины 10.0.119.100 совпадает с адресом старого сервера
+
+<span class="p">▶ Копия</span>
+  Пароль на копию: <span class="in">        </span>
+  ✓ Файл целый, пароль верный
+
+<span class="p">▶ Программа</span>
+  ✓ Комплект ds_kit_2026-11-08_a1b2c3 подходит — загружаю образы (без сборки, без интернета)
+  ✓ Сервер запущен: 7 контейнеров
+
+<span class="p">▶ Данные</span>
+  ✓ База: экранов 42, роликов 214, пользователей 5 — совпадает с описью
+  ✓ Документы рекламодателей, «Документы» медиатеки, файлы обновления экранов
+  ✓ Ролики: 3 архива, 214 файлов, 18,6 ГБ
+
+<span class="p">▶ Уборка</span>
+  ✓ Временные файлы с паролями удалены
+
+<span class="b g">══ ✅ ВСЁ ВОССТАНОВЛЕНО (14 мин) ══</span>
+  Панель: http://10.0.119.100/ — вход прежним логином и паролем.
+  Экраны выйдут на связь сами в течение нескольких минут.
+</div>
+
+<div class="step">Макет 4 · Терминал: восстановление поверх старой установки</div>
+<h2>Предупреждение, «ДА» и путь назад</h2>
+<p class="note">Скрипт сам нашёл работающую систему на этой машине. До ввода «ДА» он ничего не меняет. Ролики, которые уже лежат на сервере, не удаляются — поэтому вернуть «как было» можно полностью.</p>
+<div class="term"><span class="p">▶ Проверка машины</span>
+  <span class="y">⚠ На этой машине уже стоит система: /home/user/digital-signage (запущена)</span>
+
+  Восстановление ЗАМЕНИТ её данными копии от <span class="b">08.11.2026 09:15</span>.
+  Всё, что появилось позже, пропадёт из системы: новые ролики в медиатеке,
+  правки расписания и показов, журнал показов, новые пользователи.
+
+  Прежнее состояние сохраню, к нему можно будет вернуться:
+    база       → ~/ds_before_restore_2026-11-08_1420/db.sql.gz
+    программа  → ~/ds_before_restore_2026-11-08_1420/program
+  Нужно места: 3,1 ГБ · свободно: 120 ГБ
+
+  Чтобы продолжить, введите ДА: <span class="in">ДА</span>
+
+  ✓ Прежнее состояние сохранено
+  <span class="d">… дальше — как на чистой машине …</span>
+
+<span class="b g">══ ✅ ВСЁ ВОССТАНОВЛЕНО (6 мин) ══</span>
+  Панель: http://10.0.119.100/ — вход прежним логином и паролем.
+
+  Если что-то не так и нужно вернуть как было до восстановления:
+    <span class="in">bash ~/ds_before_restore_2026-11-08_1420/ВЕРНУТЬ.sh</span>
+</div>
+
+<p class="q">Вопрос к вам — в терминале: что здесь не так или чего не хватает?</p>
+
+</div></body></html>
